@@ -1,0 +1,9 @@
+{
+  "sanctions-screening-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/sanctions-screening-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}

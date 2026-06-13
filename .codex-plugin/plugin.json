@@ -1,0 +1,38 @@
+{
+  "name": "sanctions-screening-mcp-server",
+  "version": "0.1.0",
+  "description": "Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, fuzzy-matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/sanctions-screening-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/sanctions-screening-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "sanctions",
+    "sanctions-screening",
+    "ofac",
+    "aml",
+    "kyc",
+    "compliance",
+    "watchlist",
+    "gleif",
+    "lei",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol"
+  ],
+  "mcpServers": "./.codex-plugin/mcp.json",
+  "interface": {
+    "displayName": "sanctions-screening-mcp-server",
+    "shortDescription": "Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, fuzzy-matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.",
+    "longDescription": "Entity screening and resolution over the world's open sanctions data plus the global legal-entity registry, served offline from a local SQLite + FTS5 mirror. Screens a name against the consolidated OFAC (SDN + Consolidated), EU, UK (UKSL), and UN sanctions lists at once, alias- and fuzzy-aware, and resolves legal entities against the GLEIF LEI database with corporate-ownership tracing for beneficial-ownership screening. Match signal is the raw Jaro-Winkler similarity, never a fabricated confidence score. A screening aid that feeds a compliance process — not a compliance determination; a hit is a candidate to verify and an empty result is not a clearance.",
+    "developerName": "cyanheads",
+    "category": "compliance",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/cyanheads/sanctions-screening-mcp-server",
+    "defaultPrompt": []
+  }
+}
