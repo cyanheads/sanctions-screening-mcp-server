@@ -11,8 +11,11 @@ WORKDIR /usr/src/app
 # Copy dependency manifests for optimized layer caching
 COPY package.json bun.lock ./
 
-# Install all dependencies (including dev dependencies for building)
-RUN bun install --frozen-lockfile
+# Install all dependencies (including dev dependencies for building).
+# --ignore-scripts skips better-sqlite3's node-gyp native build: the image runs
+# under Bun and the mirror uses bun:sqlite, so the compiled binding is never used,
+# and the TypeScript build only needs the package's type declarations.
+RUN bun install --frozen-lockfile --ignore-scripts
 
 # Copy the rest of the source code
 COPY . .
