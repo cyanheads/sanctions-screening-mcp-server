@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-06-13 16:44:27
+Generated on: 2026-06-15 17:44:23
 
 ```text
 sanctions-screening-mcp-server/
@@ -23,8 +23,7 @@ sanctions-screening-mcp-server/
 │   └── template.md
 ├── data/
 ├── docs/
-│   ├── design.md
-│   └── idea.md
+│   └── design.md
 ├── scripts/
 │   ├── _mirror-context.ts
 │   ├── build-changelog.ts
