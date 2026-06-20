@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-06-19
+
+Adopt @cyanheads/mcp-ts-core ^0.10.8 — ctx.content media collector, canvas invalid_sql classification, DuckdbProvider.describe() filter fix, fresh-scaffold devcheck guards; @types/node 26 + dependency refresh
+
 ## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-19
 
 Fixes: uniform minScore floor in fuzzy screening, mirror-script logger output, screenNodes doc correction

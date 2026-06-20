@@ -1,9 +1,10 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-06-15 17:44:23
+Generated on: 2026-06-20 05:33:48
 
 ```text
 sanctions-screening-mcp-server/
+├── .agents/
 ├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json

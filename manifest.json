@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "sanctions-screening-mcp-server",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, fuzzy-matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.",
   "author": { "name": "cyanheads" },
   "server": {
