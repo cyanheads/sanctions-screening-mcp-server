@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-06-19
+
+Fixes: uniform minScore floor in fuzzy screening, mirror-script logger output, screenNodes doc correction
+
 ## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-06-15
 
 Public hosted endpoint at https://sanctions-screening.caseyjhand.com/mcp

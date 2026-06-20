@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** sanctions-screening-mcp-server
-**Version:** 0.1.2
+**Version:** 0.1.3
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.10.6`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -136,7 +136,7 @@ export const vetCounterpartyPrompt = prompt('sanctions_vet_counterparty', {
     jurisdiction: z.string().optional().describe('Optional ISO 3166-1 alpha-2 jurisdiction to disambiguate (e.g. "US").'),
   }),
   generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Run a counterparty due-diligence pass on "${args.name}". Screen the name, resolve it to an LEI, trace ownership with screen_nodes:true, then summarize every potential match as a candidate to verify — never a determination.` } },
+    { role: 'user', content: { type: 'text', text: `Run a counterparty due-diligence pass on "${args.name}". Screen the name, resolve it to an LEI, trace ownership with screenNodes:true, then summarize every potential match as a candidate to verify — never a determination.` } },
   ],
 });
 ```
