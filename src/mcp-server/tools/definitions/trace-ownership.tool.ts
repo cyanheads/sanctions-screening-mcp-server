@@ -84,7 +84,7 @@ async function traverse(
 export const traceOwnershipTool = tool('sanctions_trace_ownership', {
   title: 'sanctions-screening-mcp-server: trace ownership',
   description:
-    'Trace the GLEIF Level 2 corporate-ownership graph for an LEI: direct and ultimate parents and/or children, traversed breadth-first to a bounded depth, with relationship type for each edge. Set screen_nodes to also screen every entity in the graph against all loaded watchlists — beneficial-ownership screening that resolves "is anyone in this ownership chain sanctioned." Each per-node screen is a screening AID: hits are candidates to verify, and an empty result for a node is not a clearance of that node. Requires a valid 20-character LEI (use sanctions_resolve_entity to obtain one).',
+    'Trace the GLEIF Level 2 corporate-ownership graph for an LEI: direct and ultimate parents and/or children, traversed breadth-first to a bounded depth, with relationship type for each edge. Set screenNodes to also screen every entity in the graph against all loaded watchlists — beneficial-ownership screening that resolves "is anyone in this ownership chain sanctioned." Each per-node screen is a screening AID: hits are candidates to verify, and an empty result for a node is not a clearance of that node. Requires a valid 20-character LEI (use sanctions_resolve_entity to obtain one).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     lei: z
@@ -149,7 +149,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
                   .describe('A potential watchlist match on this node — verify, do not assume.'),
               )
               .optional()
-              .describe('Per-node screening results, present only when screen_nodes is true.'),
+              .describe('Per-node screening results, present only when screenNodes is true.'),
           })
           .describe('One entity in the ownership graph.'),
       )
@@ -173,7 +173,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       .describe('Directed ownership edges between the nodes.'),
     screenedNodeCount: z
       .number()
-      .describe('How many nodes were screened (0 when screen_nodes is false).'),
+      .describe('How many nodes were screened (0 when screenNodes is false).'),
     flaggedNodeCount: z
       .number()
       .describe('How many screened nodes had at least one potential watchlist match.'),

@@ -16,7 +16,7 @@ Entity screening and resolution as one workflow over the world's open sanctions 
 | `sanctions_get_designation` | Full record for one sanctions entry by source list + entry ID. All aliases, identifiers (passport/national-ID/tax), addresses, dates/places of birth, nationalities, sanctioning program, legal basis, and designation date. The drill-in after `sanctions_screen_name` surfaces a candidate. | `source` (enum: ofac_sdn/ofac_consolidated/eu/uk/un), `entry_id` (string) | `readOnlyHint`, `openWorldHint: false` |
 | `sanctions_resolve_entity` | Resolves a company/organization name (+ optional jurisdiction) to candidate GLEIF LEIs, ranked. Name → canonical global identifier. The bridge from a free-text counterparty name to a stable LEI other tools key off. | `name` (string), `jurisdiction` (ISO 3166-1 alpha-2, optional), `match_mode` (enum: strict/fuzzy, default strict), `status` (enum: any/issued/lapsed, default issued), `limit` (default 10) | `readOnlyHint`, `openWorldHint: false` |
 | `sanctions_get_entity` | Full GLEIF Level 1 record for one LEI: legal name, other/trading names, legal + headquarters address, registration status, jurisdiction, registration authority and ID, last-update date — plus any sanctions hits screened against the same name. | `lei` (20-char LEI, regex-validated) | `readOnlyHint`, `openWorldHint: false` |
-| `sanctions_trace_ownership` | GLEIF Level 2 ownership graph for an LEI: direct and ultimate parents and children, with relationship type and accounting basis. Optionally screens every node against the watchlists — beneficial-ownership screening that single-list tools can't do. | `lei` (20-char LEI), `direction` (enum: parents/children/both, default both), `depth` (1–5, default 3), `screen_nodes` (boolean, default false) | `readOnlyHint`, `openWorldHint: false` |
+| `sanctions_trace_ownership` | GLEIF Level 2 ownership graph for an LEI: direct and ultimate parents and children, with relationship type and accounting basis. Optionally screens every node against the watchlists — beneficial-ownership screening that single-list tools can't do. | `lei` (20-char LEI), `direction` (enum: parents/children/both, default both), `depth` (1–5, default 3), `screenNodes` (boolean, default false) | `readOnlyHint`, `openWorldHint: false` |
 | `sanctions_list_sources` | The watchlists and GLEIF datasets currently loaded, each with record count, source URL, and as-of / last-refresh timestamp, plus mirror readiness. Provenance and freshness for any result. | *(none)* | `readOnlyHint`, `openWorldHint: false` |
 
 Six tools. No write tools (the corpus is upstream-owned and read-only), no app tools, no catastrophically-irreversible operations.
@@ -167,9 +167,9 @@ Two tools make multiple internal calls; the rest are single mirror reads.
 | 1 | `lei_entity` lookup | Resolve root entity, confirm LEI exists | always |
 | 2 | `lei_relationship` traversal (BFS to `depth`) | Walk parents and/or children | `direction` |
 | 3 | `lei_entity` batch (`getByIds`) | Hydrate each node's name/jurisdiction | always |
-| 4 | `name` FTS match per node | Screen each owner against the watchlists | `screen_nodes: true` |
+| 4 | `name` FTS match per node | Screen each owner against the watchlists | `screenNodes: true` |
 
-`sanctions_vet_counterparty` prompt → orchestrates `resolve_entity` → `trace_ownership(screen_nodes: true)` → `screen_name` on the root → summary. No new upstream calls; it sequences existing tools.
+`sanctions_vet_counterparty` prompt → orchestrates `resolve_entity` → `trace_ownership(screenNodes: true)` → `screen_name` on the root → summary. No new upstream calls; it sequences existing tools.
 
 The matching engine inside `screen_name` / `resolve_entity`:
 
@@ -199,7 +199,7 @@ Steps 1–2 are the ~90% path and need no fuzzy library. Step 3 fires only when 
 
 - **No DataCanvas.** Screening is match-and-drill-in over categorical records (names, IDs, programs), not analytical rows an agent runs SQL over. The MirrorService FTS index is the backend; matches return inline with scores. (Per the design skill, a discovery/search surface of categorical metadata doesn't earn a canvas regardless of row count.)
 
-- **LEI as the entity backbone is why sanctions and GLEIF share one server.** Resolving to an LEI disambiguates "Acme Corp" across jurisdictions and unlocks ownership tracing — and AML requires screening *beneficial owners*, not just the named counterparty. `sanctions_trace_ownership` with `screen_nodes: true` is the cross-source workflow that justifies one server over two separate ones.
+- **LEI as the entity backbone is why sanctions and GLEIF share one server.** Resolving to an LEI disambiguates "Acme Corp" across jurisdictions and unlocks ownership tracing — and AML requires screening *beneficial owners*, not just the named counterparty. `sanctions_trace_ownership` with `screenNodes: true` is the cross-source workflow that justifies one server over two separate ones.
 
 - **Six tools, no writes, no app tools.** The corpus is upstream-owned and read-only, so there are no mutators and no catastrophically-irreversible operations to keep out of the surface. No human-in-the-loop real-time UI need, so no app tools. The one prompt (`sanctions_vet_counterparty`) reuses existing tools rather than adding capability.
 
