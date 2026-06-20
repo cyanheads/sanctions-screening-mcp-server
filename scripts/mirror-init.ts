@@ -18,7 +18,7 @@ import {
 import { bootstrap, longRunSignal } from './_mirror-context.js';
 
 async function main(): Promise<void> {
-  const { service, log } = bootstrap();
+  const { service, log } = await bootstrap();
   const signal = longRunSignal(8);
 
   log.info('mirror:init — harvesting sanctions lists (full)');

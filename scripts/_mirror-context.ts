@@ -7,11 +7,20 @@
  * @module scripts/_mirror-context
  */
 
+import { config } from '@cyanheads/mcp-ts-core/config';
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { buildScreeningService } from '@/services/screening/screening-service.js';
 
-/** Build a fresh, standalone screening service for a lifecycle script. */
-export function bootstrap() {
+/**
+ * Build a fresh, standalone screening service for a lifecycle script and
+ * initialize the framework logger. The logger's `log()` calls are silently
+ * dropped until `initialize()` has run — `createApp()` does this on the server
+ * path, but the lifecycle scripts bypass `createApp()`, so it must happen here.
+ * Honors `MCP_LOG_LEVEL` via the framework config; classifies as stdio (logs to
+ * stderr, the honest transport for a CLI run).
+ */
+export async function bootstrap() {
+  await logger.initialize(config.logLevel, 'stdio');
   return { service: buildScreeningService(), log: logger };
 }
 

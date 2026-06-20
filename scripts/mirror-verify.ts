@@ -10,7 +10,7 @@
 import { bootstrap } from './_mirror-context.js';
 
 async function main(): Promise<void> {
-  const { service, log } = bootstrap();
+  const { service, log } = await bootstrap();
   const [counts, sanctions, lei] = await Promise.all([
     service.sourceCounts(),
     service.sanctionsReadiness(),

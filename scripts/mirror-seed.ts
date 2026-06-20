@@ -16,7 +16,7 @@ import {
 import { bootstrap } from './_mirror-context.js';
 
 async function main(): Promise<void> {
-  const { service, log } = bootstrap();
+  const { service, log } = await bootstrap();
   await service.seedFixtures({
     designations: FIXTURE_DESIGNATIONS,
     leiEntities: FIXTURE_LEI_ENTITIES,
