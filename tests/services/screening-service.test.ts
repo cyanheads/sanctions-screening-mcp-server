@@ -75,9 +75,12 @@ describe('screenName — fuzzy fallback', () => {
     expect(hit!.score!).toBeLessThanOrEqual(1);
   });
 
-  it('catches transliteration-class variants via the phonetic key', async () => {
+  it('catches transliteration-class variants at the default floor', async () => {
     // "Muhammad" phonetically collides with the published "Mohammed" (DM key MHMT),
-    // even though their Jaro-Winkler similarity is below the fuzzy floor.
+    // which seeds "Mohammed Al-Testi" into the candidate pool. The shared exact
+    // tokens "al"/"testi" then drive bestTokenScore to 1.0, so it clears the
+    // default fuzzy floor (0.85) without any floor exemption — default-floor recall
+    // for transliteration variants is preserved.
     const res = await svc.screenName(
       { ...screenDefaults, query: 'Muhammad Al-Testi', matchMode: 'fuzzy' },
       ctx,
@@ -93,6 +96,44 @@ describe('screenName — fuzzy fallback', () => {
       ctx,
     );
     expect(res.hits).toHaveLength(0);
+  });
+});
+
+describe('screenName — minScore floor enforced uniformly (issue #1)', () => {
+  // The floor binds every fuzzy candidate, regardless of match strategy
+  // (exact-normalized / token / phonetic). A phonetic-key candidate is seeded into
+  // the pool but admitted ONLY when its computed score clears the floor — there is
+  // no phonetic bypass. Before the fix, `score >= minScore || phoneticHit` admitted
+  // a sub-floor phonetic-only hit, so a caller asking minScore:0.99 still saw a hit
+  // scored e.g. 0.78. FX-7007 ("Catherine Pyotrov") is a purpose-built case: the
+  // query "Katharina Petrov" shares its whole phonetic key (K0RN PTRF) but no exact
+  // token, so its score (~0.78) is sub-floor — it reaches the pool only via the
+  // phonetic key.
+  const PHONETIC_QUERY = 'Katharina Petrov';
+
+  it('excludes a phonetic-only hit whose score is below an explicit high minScore', async () => {
+    const res = await svc.screenName(
+      { ...screenDefaults, query: PHONETIC_QUERY, matchMode: 'fuzzy', minScore: 0.99 },
+      ctx,
+    );
+    expect(res.hits.find((h) => h.sourceEntryId === 'FX-7007')).toBeUndefined();
+    // No returned hit may sit below the requested floor — the bypass is gone.
+    for (const hit of res.hits) {
+      if (hit.score !== undefined) expect(hit.score).toBeGreaterThanOrEqual(0.99);
+    }
+  });
+
+  it('also excludes that phonetic-only sub-floor hit at the default floor', async () => {
+    // The same candidate scores ~0.78 — below the default floor (0.85) too. Under
+    // the old bypass it surfaced regardless; now it is correctly withheld. This is
+    // the intended fix, not a recall loss: a genuine variant that scores ABOVE the
+    // floor still surfaces (covered by the transliteration test above, which lands
+    // at 1.0 via shared exact tokens).
+    const res = await svc.screenName(
+      { ...screenDefaults, query: PHONETIC_QUERY, matchMode: 'fuzzy' },
+      ctx,
+    );
+    expect(res.hits.find((h) => h.sourceEntryId === 'FX-7007')).toBeUndefined();
   });
 });
 

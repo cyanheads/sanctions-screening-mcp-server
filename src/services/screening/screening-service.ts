@@ -563,8 +563,10 @@ export class ScreeningService {
 
     // Candidate pool from two blocking strategies, each query SEPARATELY so no
     // one strategy starves the others under the row cap:
-    //  (a) phonetic-key equality — catches transliteration-class variants whose
-    //      Jaro-Winkler similarity is below the floor (e.g. Mohammed/Muhammad).
+    //  (a) phonetic-key equality — seeds the pool with transliteration-class
+    //      variants (e.g. Mohammed/Muhammad share DM key MHMT) whose whole-string
+    //      Jaro-Winkler is low; they still face the uniform `minScore` floor below,
+    //      where `bestTokenScore` (the max over token pairs) typically clears it.
     //  (b) a leading-trigram prefix shared with any query token — pulls the
     //      JW-near candidates whose phonetic key differs (e.g. Volkov/Volkow).
     // A single OR'd query with one shared LIMIT let the first clause (e.g. a
@@ -611,16 +613,21 @@ export class ScreeningService {
     if (byRowid.size === 0) return [];
     const rows = [...byRowid.values()];
 
-    const phoneticSet = new Set(phoneticKeys);
+    // The phonetic-key SQL above *seeds the candidate pool* with transliteration-
+    // class variants (e.g. Mohammed/Muhammad share DM key MHMT) whose whole-string
+    // Jaro-Winkler is low. Admission, however, is the SAME floor for every
+    // candidate: `score >= minScore`. `bestTokenScore` is the max over token pairs,
+    // so shared exact tokens still pin those variants at/above the default floor;
+    // only a high explicit `minScore` (the caller's intent) drops a sub-floor
+    // phonetic-only hit. The floor means what it says for all match strategies.
     const scored: ScreeningHit[] = [];
     for (const row of rows) {
       const candidateTokens = tokenize(row.normalized);
       const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
       const wholeScore = jaroWinkler(args.normalizedQuery, row.normalized);
       const score = Math.max(tokenScore, wholeScore);
-      const phoneticHit = row.phonetic.split(/\s+/).some((k) => k && phoneticSet.has(k));
 
-      if (score >= args.minScore || phoneticHit) {
+      if (score >= args.minScore) {
         const hit = this.rowToHit(row, 'approximate');
         hit.score = Number(score.toFixed(4));
         scored.push(hit);

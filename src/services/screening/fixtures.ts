@@ -109,6 +109,29 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
     },
   },
   {
+    // Phonetic-only transliteration case for the minScore-floor regression:
+    // the query "Katharina Petrov" shares this entry's whole Double-Metaphone
+    // column ("K0RN PTRF") but no exact token, so its best score (~0.78) sits
+    // below the default fuzzy floor. It is seeded into the candidate pool by the
+    // phonetic key, then admitted ONLY when it clears `minScore` — before the
+    // floor was enforced uniformly, the phonetic bypass surfaced it regardless.
+    id: 'un:FX-7007',
+    source: 'un',
+    sourceEntryId: 'FX-7007',
+    entityType: 'person',
+    primaryName: 'Catherine Pyotrov',
+    program: 'UN-TEST-1267',
+    designationDate: '2018-08-08',
+    payload: {
+      aliases: [],
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [{ date: '1980-03-03' }],
+      nationalities: ['Testland'],
+      remarks: 'Synthetic transliteration-class test entry — not a real person.',
+    },
+  },
+  {
     id: 'un:FX-5005',
     source: 'un',
     sourceEntryId: 'FX-5005',

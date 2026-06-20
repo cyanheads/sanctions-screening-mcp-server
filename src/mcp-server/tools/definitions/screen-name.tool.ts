@@ -79,7 +79,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .max(1)
       .optional()
       .describe(
-        "Jaro-Winkler similarity floor for fuzzy hits (0–1). Applies to fuzzy mode only; defaults to the server's configured floor.",
+        "Score floor for fuzzy hits (0–1), applied uniformly to every fuzzy candidate regardless of how it was matched (Jaro-Winkler, token, or phonetic). No hit below this score is returned. Applies to fuzzy mode only; defaults to the server's configured floor.",
       ),
     sources: z
       .array(SOURCE_ENUM)
