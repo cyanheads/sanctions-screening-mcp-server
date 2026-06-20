@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/sanctions-screening-mcp-server",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "mcpName": "io.github.cyanheads/sanctions-screening-mcp-server",
   "description": "Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, fuzzy-matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.",
   "type": "module",
@@ -101,7 +101,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.10.8",
+    "@cyanheads/mcp-ts-core": "^0.10.9",
     "better-sqlite3": "^12.11.1",
     "fast-xml-parser": "^5.9.3",
     "pino-pretty": "^13.1.3",

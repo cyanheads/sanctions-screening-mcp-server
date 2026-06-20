@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-20
+
+Adopt @cyanheads/mcp-ts-core ^0.10.9 — re-synced scripts/ guards add a dependency-specifier check that rejects floating specifiers (latest/*/dist-tags) in package.json + bun.lock, and the packaging lint now validates the Codex/Claude plugin marketplace manifests
+
 ## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-06-19
 
 Adopt @cyanheads/mcp-ts-core ^0.10.8 — ctx.content media collector, canvas invalid_sql classification, DuckdbProvider.describe() filter fix, fresh-scaffold devcheck guards; @types/node 26 + dependency refresh
