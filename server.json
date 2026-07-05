@@ -125,7 +125,7 @@
         },
         {
           "name": "SANCTIONS_REFRESH_CRON",
-          "description": "Cron for the scheduled refresh of sanctions lists + GLEIF deltas (HTTP transport only).",
+          "description": "Cron for the scheduled refresh of the sanctions lists + name index (HTTP transport only). GLEIF deltas are refreshed manually via mirror:refresh.",
           "format": "string",
           "isRequired": false,
           "default": "0 4 * * *"
