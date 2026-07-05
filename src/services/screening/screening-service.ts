@@ -38,6 +38,7 @@ import {
   doubleMetaphone,
   fold,
   jaroWinkler,
+  lengthRatio,
   tokenCoverage,
   tokenize,
 } from '@/services/screening/text-matching.js';
@@ -156,6 +157,20 @@ interface LeiCandidateRow {
   other_names: string;
   status: string | null;
 }
+
+/**
+ * Minimum folded-length ratio (shorter / longer) for a candidate to be admitted on
+ * WHOLE-STRING Jaro-Winkler similarity alone — see {@link ScreeningService.admitFuzzy}.
+ * Jaro-Winkler's shared-prefix boost inflates a short string that is a bare
+ * (near-)prefix of a much longer one, so whole-string similarity is trustworthy on
+ * its own only when the two strings are of comparable length. Grounded in the live
+ * mirror: prefix-inflation false positives sit at ratio ≤ 0.375, genuine spacing/
+ * concatenation variants (the recall the whole-string arm exists for) at ≥ 0.83 —
+ * 0.5 sits in that gap with wide margin on both sides. A structural property of the
+ * metric, not a per-deployment tuning surface, so it is a documented constant rather
+ * than a config knob.
+ */
+const WHOLE_STRING_MIN_LENGTH_RATIO = 0.5;
 
 /**
  * The screening service. Holds both mirrors and the matching engine. Initialized
@@ -681,7 +696,15 @@ export class ScreeningService {
       const wholeScore = jaroWinkler(args.normalizedQuery, row.normalized);
 
       if (
-        this.admitFuzzy(args.queryTokens, candidateTokens, wholeScore, tokenScore, args.minScore)
+        this.admitFuzzy(
+          args.normalizedQuery,
+          row.normalized,
+          args.queryTokens,
+          candidateTokens,
+          wholeScore,
+          tokenScore,
+          args.minScore,
+        )
       ) {
         const hit = this.rowToHit(row, 'approximate');
         hit.score = Number(Math.max(tokenScore, wholeScore).toFixed(4));
@@ -703,30 +726,51 @@ export class ScreeningService {
   }
 
   /**
-   * Fuzzy admission gate, shared by {@link runFuzzy} and {@link runLeiFuzzy} so
-   * both paths admit on one consistent rule. This is a SEPARATE predicate from the
+   * Fuzzy admission gate, shared by {@link runFuzzy} and {@link runLeiFuzzy} so both
+   * paths admit on one consistent rule. This is a SEPARATE predicate from the
    * surfaced score, which stays the raw Jaro-Winkler max of the whole-string and
    * best token-pair measurements (never a composite). A candidate is admitted when
-   * it explains enough of the query, not merely one fragment of it:
+   * it explains enough of the query, not merely one fragment of it — via either arm:
    *
-   *  - the whole-string score clears `minScore` (the candidate matches as a whole —
-   *    covers near-identical strings and word-order swaps), OR
-   *  - the best token pair clears `minScore` AND at least half the query tokens each
-   *    individually clear it (coverage) — so one strong token pair can't carry an
-   *    otherwise-unrelated multi-token query (the single-token false positive).
+   *  - WHOLE-STRING arm: the whole-string score clears `minScore` AND the two folded
+   *    strings are of comparable length (ratio ≥ {@link WHOLE_STRING_MIN_LENGTH_RATIO}).
+   *    This arm exists for matches token-pair scoring cannot see — spacing /
+   *    concatenation variants ("van den berg" vs "vandenberg") and whole-name near-
+   *    misses. The length guard is issue #8: Jaro-Winkler's shared-prefix boost
+   *    inflates a short string that is a bare (near-)prefix of a much longer one
+   *    (`jaroWinkler('nicolas maduroo moros', 'nicolas')` = 0.8667 ≥ the 0.85 floor
+   *    at token coverage 1/3), so without the guard a short single-token alias clears
+   *    admission against a long multi-token query on whole-string similarity alone.
+   *    Real spacing/concatenation variants keep near-equal lengths (measured ratio ≥
+   *    0.83 across the live mirror) — far above the prefix-inflation failures (≤ 0.375)
+   *    — so the guard drops the false positive while preserving that recall. OR
    *
-   * By construction this only tightens queries of three or more tokens: for a one-
-   * or two-token query a passing token score already means half-or-more of the
-   * tokens are covered, so the `minScore` floor alone governs, exactly as before.
+   *  - TOKEN-PAIR + coverage arm (issue #4): the best token pair clears `minScore` AND
+   *    at least half the query tokens each individually clear it (coverage) — so one
+   *    strong token pair can't carry an otherwise-unrelated multi-token query.
+   *
+   * A candidate that fails the whole-string arm's length guard still admits through
+   * the token arm when it genuinely covers the query. By construction the length
+   * guard removes only whole-string-ONLY admissions where the two strings' lengths
+   * diverge sharply, and the coverage arm only tightens queries of three or more
+   * tokens (a one- or two-token query with a passing token score already has half-
+   * or-more coverage, so the `minScore` floor alone governs, exactly as before).
    */
   private admitFuzzy(
+    normalizedQuery: string,
+    candidateNormalized: string,
     queryTokens: string[],
     candidateTokens: string[],
     wholeScore: number,
     tokenScore: number,
     minScore: number,
   ): boolean {
-    if (wholeScore >= minScore) return true;
+    if (
+      wholeScore >= minScore &&
+      lengthRatio(normalizedQuery, candidateNormalized) >= WHOLE_STRING_MIN_LENGTH_RATIO
+    ) {
+      return true;
+    }
     if (tokenScore < minScore) return false;
     const covered = tokenCoverage(queryTokens, candidateTokens, minScore);
     return covered * 2 >= queryTokens.length;
@@ -900,7 +944,15 @@ export class ScreeningService {
         const wholeScore = jaroWinkler(args.normalizedQuery, folded);
         const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
         if (
-          !this.admitFuzzy(args.queryTokens, candidateTokens, wholeScore, tokenScore, args.minScore)
+          !this.admitFuzzy(
+            args.normalizedQuery,
+            folded,
+            args.queryTokens,
+            candidateTokens,
+            wholeScore,
+            tokenScore,
+            args.minScore,
+          )
         ) {
           continue;
         }

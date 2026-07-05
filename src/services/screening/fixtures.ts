@@ -175,6 +175,60 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
       remarks: 'Synthetic single-token false-positive test entry — not a real person.',
     },
   },
+  {
+    // Whole-string prefix-inflation guard (issue #8). A SHORT single-token
+    // low-quality-aka ("Ferdinand") that is a bare prefix of a longer, unrelated
+    // multi-token query. Jaro-Winkler's shared-prefix boost inflates the
+    // whole-string similarity of "ferdinand aquino delgado" vs "ferdinand" to
+    // 0.875 — above the 0.85 floor — even though token coverage is 1/3 and the
+    // strings' length ratio is only 0.375. Mirrors the live OFAC first-name
+    // low-quality-aka pattern (a bare "Nicolas" alias). The regression: such a
+    // query must NOT admit this entry on the inflated whole-string score alone;
+    // the length-ratio guard on the whole-string arm blocks it (0.375 < 0.5),
+    // while the token arm rejects it for coverage 1/3. The primary name shares no
+    // whole-string or ≥half-coverage support with the query, so the entry is
+    // absent entirely.
+    id: 'eu:FX-9009',
+    source: 'eu',
+    sourceEntryId: 'FX-9009',
+    entityType: 'person',
+    primaryName: 'Aurelio Ferdinand Castellanos',
+    program: 'EU-TEST-REGIME',
+    designationDate: '2023-07-19',
+    payload: {
+      aliases: [{ name: 'Ferdinand', nameType: 'low-quality-aka' }],
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+      remarks: 'Synthetic whole-string prefix-inflation test entry — not a real person.',
+    },
+  },
+  {
+    // Spacing/concatenation recall the whole-string arm exists for (issue #8). The
+    // folded name "van der berg shipping" queried as its space-stripped
+    // concatenation "vanderbergshipping" scores 0.9667 whole-string but only 0.806
+    // on the best token pair (no candidate token clears the floor against the
+    // single concatenated query token), so the TOKEN arm cannot admit it — only the
+    // whole-string arm can. The two strings keep near-equal length (ratio 0.857 ≥
+    // 0.5), so the issue #8 length guard preserves this recall: a concatenated form
+    // of a real multi-word name still admits.
+    id: 'uk:FX-1010',
+    source: 'uk',
+    sourceEntryId: 'FX-1010',
+    entityType: 'organization',
+    primaryName: 'Van Der Berg Shipping',
+    program: 'UK-TEST-SHIPPING',
+    designationDate: '2024-04-02',
+    payload: {
+      aliases: [],
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+      remarks: 'Synthetic spacing/concatenation recall test entry — not a real organization.',
+    },
+  },
 ];
 
 /** Two invented GLEIF entities — a parent and a subsidiary — for resolution + tracing. */

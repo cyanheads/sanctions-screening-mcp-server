@@ -13,6 +13,7 @@ import {
   fold,
   jaro,
   jaroWinkler,
+  lengthRatio,
   tokenCoverage,
   tokenize,
 } from '@/services/screening/text-matching.js';
@@ -113,6 +114,36 @@ describe('tokenCoverage', () => {
     const q = tokenize(fold('Zzqxwv Qqpzm'));
     const c = tokenize(fold('Noni'));
     expect(tokenCoverage(q, c, 0.85)).toBe(0);
+  });
+});
+
+describe('lengthRatio', () => {
+  it('is 1 for equal-length strings and for two empty strings', () => {
+    expect(lengthRatio('volkov', 'moros!')).toBe(1); // both 6 chars
+    expect(lengthRatio('', '')).toBe(1);
+  });
+
+  it('is 0 when one string is empty and the other is not', () => {
+    expect(lengthRatio('', 'volkov')).toBe(0);
+  });
+
+  it('is the shorter length over the longer, order-independent', () => {
+    // "nicolas" (7) vs "nicolas maduroo moros" (21) → 7/21, either way round.
+    expect(lengthRatio('nicolas', 'nicolas maduroo moros')).toBeCloseTo(7 / 21, 6);
+    expect(lengthRatio('nicolas maduroo moros', 'nicolas')).toBeCloseTo(7 / 21, 6);
+  });
+
+  it('drops below the whole-string guard when a short token merely prefixes a long query', () => {
+    // The issue #8 shape: Jaro-Winkler inflates this pair to 0.8667, but the length
+    // ratio exposes that the candidate is a fragment of the query.
+    expect(jaroWinkler('nicolas maduroo moros', 'nicolas')).toBeGreaterThan(0.85);
+    expect(lengthRatio('nicolas maduroo moros', 'nicolas')).toBeLessThan(0.5);
+  });
+
+  it('stays high for spacing/concatenation variants (near-equal length)', () => {
+    // The recall the whole-string arm exists for — the guard must not block these.
+    expect(lengthRatio('van den berg', 'vandenberg')).toBeGreaterThan(0.8);
+    expect(lengthRatio('vanderbergshipping', 'van der berg shipping')).toBeGreaterThan(0.8);
   });
 });
 

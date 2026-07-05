@@ -151,6 +151,40 @@ describe('screenName — single-token false-positive gate (issue #4)', () => {
   });
 });
 
+describe('screenName — whole-string prefix-inflation gate (issue #8)', () => {
+  // The whole-string admission arm must not admit a SHORT candidate that is merely a
+  // (near-)prefix of a much LONGER multi-token query. Jaro-Winkler's shared-prefix
+  // boost inflates such pairs above the floor; a folded-length-ratio guard on the
+  // whole-string arm blocks them without touching the spacing/concatenation recall
+  // that arm exists for.
+  it('rejects a bare short alias that only prefixes a longer multi-token query', async () => {
+    // FX-9009 ("Aurelio Ferdinand Castellanos") carries the bare low-quality-aka
+    // "Ferdinand". Against "Ferdinand Aquino Delgado", the whole-string JW of
+    // "ferdinand aquino delgado" vs "ferdinand" is 0.875 — above the 0.85 floor — but
+    // the length ratio is 0.375 (< 0.5) and token coverage is 1/3. Before the guard,
+    // the inflated whole-string score admitted it; now it must not surface.
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'Ferdinand Aquino Delgado', matchMode: 'fuzzy' },
+      ctx,
+    );
+    expect(res.hits.find((h) => h.sourceEntryId === 'FX-9009')).toBeUndefined();
+  });
+
+  it('still admits a spacing/concatenation variant via the whole-string arm', async () => {
+    // FX-1010 ("Van Der Berg Shipping") queried as its space-stripped concatenation
+    // "vanderbergshipping": whole-string JW is 0.9667 but the best token pair is only
+    // 0.806, so the token arm cannot admit it — ONLY the whole-string arm can. The
+    // length ratio (0.857) clears the guard, so this concatenation recall survives.
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'vanderbergshipping', matchMode: 'fuzzy' },
+      ctx,
+    );
+    const hit = res.hits.find((h) => h.sourceEntryId === 'FX-1010');
+    expect(hit).toBeDefined();
+    expect(hit?.matchType).toBe('approximate');
+  });
+});
+
 describe('screenName — minScore floor enforced uniformly (issue #1)', () => {
   // The floor binds every fuzzy candidate, regardless of match strategy
   // (exact-normalized / token / phonetic). A phonetic-key candidate is seeded into

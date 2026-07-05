@@ -142,6 +142,24 @@ export function tokenCoverage(
   return covered;
 }
 
+/**
+ * Length ratio of two strings — the shorter length over the longer, in [0, 1].
+ * 1.0 means equal-length strings; a small value means one is far shorter than the
+ * other. Two empty strings score 1 (identical); empty-vs-nonempty scores 0.
+ *
+ * This guards whole-string Jaro-Winkler admission. Jaro-Winkler's shared-prefix
+ * boost inflates similarity when a short string is a bare (near-)prefix of a much
+ * longer one — `jaroWinkler('nicolas maduroo moros', 'nicolas')` is 0.8667, above
+ * a 0.85 floor, on one shared word out of three. A whole-string score is therefore
+ * trustworthy on its own only when the two strings are of comparable length; the
+ * ratio measures exactly that.
+ */
+export function lengthRatio(a: string, b: string): number {
+  const longer = Math.max(a.length, b.length);
+  if (longer === 0) return 1;
+  return Math.min(a.length, b.length) / longer;
+}
+
 // ─── Double Metaphone (single primary key) ─────────────────────────────────────
 
 /**
