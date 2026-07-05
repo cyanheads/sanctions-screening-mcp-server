@@ -10,7 +10,7 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
-import { type SeededService, seededService } from './_helpers.js';
+import { freshService, type SeededService, seededService } from './_helpers.js';
 
 let seeded: SeededService;
 let svc: ScreeningService;
@@ -91,11 +91,63 @@ describe('screenName — fuzzy fallback', () => {
   });
 
   it('returns an empty result (not a guess) for a name nothing resembles', async () => {
+    // The fixture now carries FX-8008, whose short low-quality-aka "Noni" scores
+    // 0.8515 against "nonexistent" (above the 0.85 floor). This query must still
+    // return nothing: the coverage gate rejects a candidate that explains only 1 of
+    // 3 query tokens (issue #4). Before the gate, that single token pair leaked.
     const res = await svc.screenName(
       { ...screenDefaults, query: 'Zzqxwv Nonexistent Qqpzm', matchMode: 'fuzzy' },
       ctx,
     );
     expect(res.hits).toHaveLength(0);
+  });
+});
+
+describe('screenName — single-token false-positive gate (issue #4)', () => {
+  // A multi-token query must not be carried by ONE token pair that clears the fuzzy
+  // floor. FX-8008 ("Mateo Restrepo Cardoza") has the short low-quality-aka "Noni";
+  // "nonexistent" scores 0.8515 against "noni" — above the 0.85 floor — yet the
+  // whole 3-token nonsense query is otherwise unrelated (coverage 1/3).
+  it('rejects a candidate that clears the floor on a single query token (coverage 1/3)', async () => {
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'Zzqxwv Nonexistent Qqpzm', matchMode: 'fuzzy' },
+      ctx,
+    );
+    expect(res.hits.find((h) => h.sourceEntryId === 'FX-8008')).toBeUndefined();
+  });
+
+  it('still admits a legitimate partial match that covers 2 of 3 query tokens', async () => {
+    // "Ivan" + "Volkov" both match FX-1001 exactly (coverage 2/3); the trailing
+    // "Qqzzxw" is noise. Enough of the query is explained → the candidate admits.
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'Ivan Volkov Qqzzxw', matchMode: 'fuzzy' },
+      ctx,
+    );
+    const hit = res.hits.find((h) => h.sourceEntryId === 'FX-1001');
+    expect(hit).toBeDefined();
+    expect(hit?.matchType).toBe('approximate');
+  });
+
+  it('leaves single-token queries unchanged — the floor alone governs', async () => {
+    // One token, coverage is trivially the whole query; a near-miss above the floor
+    // still surfaces (the gate only tightens 3+-token queries).
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'Volkow', matchMode: 'fuzzy' },
+      ctx,
+    );
+    const hit = res.hits.find((h) => h.sourceEntryId === 'FX-1001');
+    expect(hit?.matchType).toBe('approximate');
+    expect(hit!.score!).toBeGreaterThanOrEqual(0.85);
+  });
+
+  it('still admits a fuzzy word-order swap with a near-miss token', async () => {
+    // "Volkow Ivan" — swapped order, "Volkow" ≈ "Volkov"; both tokens covered.
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'Volkow Ivan', matchMode: 'fuzzy' },
+      ctx,
+    );
+    const hit = res.hits.find((h) => h.sourceEntryId === 'FX-1001');
+    expect(hit?.matchType).toBe('approximate');
   });
 });
 
@@ -256,6 +308,33 @@ describe('resolveEntity', () => {
   });
 });
 
+describe('resolveEntity — single-token false-positive gate (issue #4)', () => {
+  // runLeiFuzzy shares runFuzzy's admission gate: a legal/trading name must explain
+  // enough of the query, not be carried by one strong token pair. "Testland
+  // Holdings PLC" is pooled by any query token whose prefix matches its legal name.
+  it('rejects an LEI whose legal name matches only one of three query tokens', async () => {
+    // "Testlandia" ≈ "Testland" (JW ~0.96, above the floor); "Xyzzy"/"Qqpzm" are
+    // noise. Coverage 1/3 → not admitted, even though the one pair clears the floor.
+    const res = await svc.resolveEntity(
+      { query: 'Testlandia Xyzzy Qqpzm', matchMode: 'fuzzy', status: 'any', limit: 10 },
+      ctx,
+    );
+    expect(res.matches.find((m) => m.lei === '529900T8BM49AURSDO55')).toBeUndefined();
+  });
+
+  it('still admits an LEI when 2 of 3 query tokens are covered', async () => {
+    // "Testland" + "Holdings" both match the legal name exactly (coverage 2/3);
+    // "Qqzz" is noise. Enough of the query is explained → admitted.
+    const res = await svc.resolveEntity(
+      { query: 'Testland Holdings Qqzz', matchMode: 'fuzzy', status: 'any', limit: 10 },
+      ctx,
+    );
+    const match = res.matches.find((m) => m.lei === '529900T8BM49AURSDO55');
+    expect(match).toBeDefined();
+    expect(match?.matchType).toBe('approximate');
+  });
+});
+
 describe('ownership', () => {
   it('returns the direct parent relationship for a child LEI', async () => {
     const rels = await svc.getRelationships('5493001KJTIIGC8Y1R12', 'parents');
@@ -274,8 +353,101 @@ describe('ownership', () => {
 describe('sources + readiness', () => {
   it('reports per-source counts and readiness', async () => {
     const counts = await svc.sourceCounts();
-    expect(counts.find((c) => c.code === 'ofac_sdn')?.recordCount).toBe(1);
+    // FX-1001 (Ivan Testovich Volkov) + FX-8008 (the single-token false-positive guard).
+    expect(counts.find((c) => c.code === 'ofac_sdn')?.recordCount).toBe(2);
     expect(await svc.sanctionsReady()).toBe(true);
     expect(await svc.leiReady()).toBe(true);
+  });
+});
+
+describe('ingestLeiRelationships — batch semantics (issue #6)', () => {
+  const CHILD = '5493001KJTIIGC8Y1R12';
+  const relA = {
+    childLei: CHILD,
+    parentLei: 'PARENTAAAAAAAAAAAAA1',
+    relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+  };
+  const relB = {
+    childLei: CHILD,
+    parentLei: 'PARENTBBBBBBBBBBBBB1',
+    relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
+  };
+
+  it('init insert-only path keeps a child whose relationships span a batch boundary', async () => {
+    // The streaming golden-copy hazard: one child's relationships arrive in two
+    // separate batches. clearLeiRelationships() wipes once up front, then each
+    // batch is insert-only — so batch 2 must NOT delete batch 1's rows.
+    await svc.clearLeiRelationships();
+    await svc.ingestLeiRelationships([relA], { replaceByChild: false });
+    await svc.ingestLeiRelationships([relB], { replaceByChild: false });
+    const rels = await svc.getRelationships(CHILD, 'parents');
+    expect(rels).toHaveLength(2);
+    expect(new Set(rels.map((r) => r.parentLei))).toEqual(
+      new Set([relA.parentLei, relB.parentLei]),
+    );
+  });
+
+  it('delta replace-by-child (default) restates a child per call', async () => {
+    // The delta path keeps replace-by-child semantics: a later call re-stating the
+    // same child replaces its rows (correct only when a child's full set is one call).
+    await svc.clearLeiRelationships();
+    await svc.ingestLeiRelationships([relA]);
+    await svc.ingestLeiRelationships([relB]);
+    const rels = await svc.getRelationships(CHILD, 'parents');
+    expect(rels).toHaveLength(1);
+    expect(rels[0]?.parentLei).toBe(relB.parentLei);
+  });
+
+  it('clearLeiRelationships wipes the table', async () => {
+    await svc.clearLeiRelationships();
+    expect(await svc.getRelationships(CHILD, 'parents')).toHaveLength(0);
+    expect((await svc.leiReadiness()).relationshipCount).toBe(0);
+  });
+});
+
+describe('advanceLeiFreshnessIfReady — GLEIF delta freshness (issue #5)', () => {
+  it('advances completedAt + total to the LIVE entity count on a ready mirror', async () => {
+    const before = await svc.leiReadiness();
+    expect(before.ready).toBe(true);
+    expect(before.total).toBe(2); // seeded L1 entity count
+    expect(before.completedAt).toBeDefined();
+
+    // Simulate a delta apply: one new LEI entity ingested (batch size 1).
+    await svc.ingestLeiEntities([
+      { lei: '5493001KJTIIGC8Y1R99', legalName: 'Delta Added Co', otherNames: [] },
+    ]);
+
+    const result = await svc.advanceLeiFreshnessIfReady();
+    expect(result.advanced).toBe(true);
+    // total is the live mirror count (3), NEVER the delta batch size (1).
+    expect(result.entityCount).toBe(3);
+
+    const after = await svc.leiReadiness();
+    expect(after.ready).toBe(true);
+    expect(after.total).toBe(3);
+    expect(after.completedAt).toBeDefined();
+    expect(after.completedAt! >= before.completedAt!).toBe(true);
+  });
+
+  it('does NOT flip a never-initialized mirror to ready (delta on empty is not completion)', async () => {
+    const fresh = await freshService();
+    try {
+      const svc2 = fresh.service;
+      expect(await svc2.leiReady()).toBe(false);
+
+      // A delta lands rows on a mirror that never completed an init.
+      await svc2.ingestLeiEntities([
+        { lei: '5493001KJTIIGC8Y1R12', legalName: 'Orphan Delta Co', otherNames: [] },
+      ]);
+
+      const result = await svc2.advanceLeiFreshnessIfReady();
+      expect(result.advanced).toBe(false);
+      expect(result.entityCount).toBe(1); // reports the live count but does not mark ready
+
+      expect(await svc2.leiReady()).toBe(false); // still not ready — run mirror:init
+      expect((await svc2.leiReadiness()).completedAt).toBeUndefined(); // freshness left unset
+    } finally {
+      await fresh.cleanup();
+    }
   });
 });

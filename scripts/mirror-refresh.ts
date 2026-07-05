@@ -45,6 +45,19 @@ async function main(): Promise<void> {
     relationships: relationships.length,
   });
 
+  // Advance GLEIF freshness so sanctions_list_sources reports the data just loaded.
+  // Guarded: a delta on a never-initialized mirror is not completion, so freshness
+  // advances only when the mirror is already ready — otherwise run mirror:init.
+  const freshness = await service.advanceLeiFreshnessIfReady();
+  if (freshness.advanced) {
+    log.info('mirror:refresh — GLEIF freshness advanced', { leiEntities: freshness.entityCount });
+  } else {
+    log.notice(
+      'mirror:refresh — GLEIF mirror not yet initialized; applied deltas but left freshness unset. Run mirror:init to complete the initial GLEIF load.',
+      { leiEntities: freshness.entityCount },
+    );
+  }
+
   log.info('mirror:refresh — complete');
   await service.close();
 }

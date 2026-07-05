@@ -11,11 +11,14 @@
  */
 
 import {
-  harvestLeiLevel1,
-  harvestLeiLevel2,
   resolveGleifFileUrl,
+  streamLeiLevel1,
+  streamLeiLevel2,
 } from '@/services/screening/gleif-ingest.js';
-import { bootstrap, longRunSignal } from './_mirror-context.js';
+import { bootstrap, ingestInBatches, longRunSignal } from './_mirror-context.js';
+
+/** Records per ingest batch for the streaming golden-copy load. */
+const GLEIF_INGEST_BATCH = 10_000;
 
 async function main(): Promise<void> {
   const { service, log } = await bootstrap();
@@ -44,17 +47,32 @@ async function main(): Promise<void> {
     resolveGleifFileUrl('rr-full', signal),
   ]);
 
+  // Stream both golden copies: decompress + scan + normalize incrementally and
+  // ingest in bounded batches, so the ~892 MB compressed L1 file never has to be
+  // held decompressed in memory. L1 entities upsert by LEI (idempotent per batch).
   log.info('mirror:init — streaming GLEIF Level 1 (who-is-who, ~3.3M records)');
-  const entities = await harvestLeiLevel1(l1Url, signal);
-  await service.ingestLeiEntities(entities);
-  log.info('mirror:init — GLEIF Level 1 loaded', { entities: entities.length });
+  const entityCount = await ingestInBatches(
+    streamLeiLevel1(l1Url, signal),
+    GLEIF_INGEST_BATCH,
+    (batch) => service.ingestLeiEntities(batch),
+    (total) => log.info('mirror:init — GLEIF Level 1 ingest progress', { entities: total }),
+  );
+  log.info('mirror:init — GLEIF Level 1 loaded', { entities: entityCount });
 
+  // L2 is a full replace: wipe the relationship table ONCE, then insert-only
+  // batches (no per-child delete) so a child whose relationships straddle a batch
+  // boundary keeps every row.
   log.info('mirror:init — streaming GLEIF Level 2 (who-owns-whom)');
-  const relationships = await harvestLeiLevel2(l2Url, signal);
-  await service.ingestLeiRelationships(relationships);
-  log.info('mirror:init — GLEIF Level 2 loaded', { relationships: relationships.length });
+  await service.clearLeiRelationships();
+  const relationshipCount = await ingestInBatches(
+    streamLeiLevel2(l2Url, signal),
+    GLEIF_INGEST_BATCH,
+    (batch) => service.ingestLeiRelationships(batch, { replaceByChild: false }),
+    (total) => log.info('mirror:init — GLEIF Level 2 ingest progress', { relationships: total }),
+  );
+  log.info('mirror:init — GLEIF Level 2 loaded', { relationships: relationshipCount });
 
-  await service.markLeiReady(entities.length);
+  await service.markLeiReady(entityCount);
   log.info('mirror:init — complete');
   await service.close();
 }

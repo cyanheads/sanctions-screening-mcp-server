@@ -28,3 +28,34 @@ export async function bootstrap() {
 export function longRunSignal(hours = 6): AbortSignal {
   return AbortSignal.timeout(hours * 60 * 60 * 1000);
 }
+
+/**
+ * Drain an async source into a sink in fixed-size batches, returning the total
+ * count. Keeps peak memory bounded during a streaming golden-copy ingest — only
+ * one batch is resident at a time. `onBatch(total)` reports cumulative progress
+ * after each flush for progress logging.
+ */
+export async function ingestInBatches<T>(
+  source: AsyncIterable<T>,
+  batchSize: number,
+  sink: (batch: T[]) => Promise<void>,
+  onBatch?: (total: number) => void,
+): Promise<number> {
+  let total = 0;
+  let batch: T[] = [];
+  for await (const item of source) {
+    batch.push(item);
+    if (batch.length >= batchSize) {
+      await sink(batch);
+      total += batch.length;
+      onBatch?.(total);
+      batch = [];
+    }
+  }
+  if (batch.length > 0) {
+    await sink(batch);
+    total += batch.length;
+    onBatch?.(total);
+  }
+  return total;
+}

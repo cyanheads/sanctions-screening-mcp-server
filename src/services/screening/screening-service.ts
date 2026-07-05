@@ -38,6 +38,7 @@ import {
   doubleMetaphone,
   fold,
   jaroWinkler,
+  tokenCoverage,
   tokenize,
 } from '@/services/screening/text-matching.js';
 import type {
@@ -347,18 +348,32 @@ export class ScreeningService {
   }
 
   /**
-   * Apply a batch of GLEIF Level 2 relationships. Replaces all rows for each
-   * child LEI present in the batch (so a refresh that re-states a child's
-   * relationships is idempotent).
+   * Apply a batch of GLEIF Level 2 relationships. Two modes:
+   *
+   * - `replaceByChild` (default — the delta-refresh path): replaces all rows for
+   *   each child LEI present in the batch, so re-stating a child's relationships is
+   *   idempotent. Correct only when a child's FULL relationship set is contained in
+   *   one call, which holds for a whole-delta harvest ingested in a single batch.
+   * - `replaceByChild: false` (the streaming golden-copy init path): pure
+   *   INSERT-OR-REPLACE with no per-child delete. The init orchestration clears the
+   *   whole table ONCE up front ({@link clearLeiRelationships}) and then streams
+   *   batches through this path — so a child whose relationships straddle a batch
+   *   boundary keeps every row. A per-child delete on the second batch would
+   *   otherwise wipe the first batch's rows for that child.
    */
-  async ingestLeiRelationships(relationships: NormalizedLeiRelationship[]): Promise<void> {
+  async ingestLeiRelationships(
+    relationships: NormalizedLeiRelationship[],
+    opts?: { replaceByChild?: boolean },
+  ): Promise<void> {
     if (relationships.length === 0) return;
     const handle = await this.leiHandle();
-    const children = [...new Set(relationships.map((r) => r.childLei))];
+    const replaceByChild = opts?.replaceByChild ?? true;
 
     handle.transaction(() => {
-      const clear = handle.prepare(`DELETE FROM ${LEI_RELATIONSHIP_TABLE} WHERE child_lei = ?`);
-      for (const child of children) clear.run(child);
+      if (replaceByChild) {
+        const clear = handle.prepare(`DELETE FROM ${LEI_RELATIONSHIP_TABLE} WHERE child_lei = ?`);
+        for (const child of new Set(relationships.map((r) => r.childLei))) clear.run(child);
+      }
       const insert = handle.prepare(
         `INSERT OR REPLACE INTO ${LEI_RELATIONSHIP_TABLE}
            (child_lei, parent_lei, relationship_type, relationship_status, relationship_period)
@@ -374,6 +389,16 @@ export class ScreeningService {
         );
       }
     });
+  }
+
+  /**
+   * Wipe every GLEIF Level 2 relationship. The single up-front clear before a full
+   * golden-copy (init) reload, which then inserts in batches without per-child
+   * deletes (see {@link ingestLeiRelationships}, `replaceByChild: false`).
+   */
+  async clearLeiRelationships(): Promise<void> {
+    const handle = await this.leiHandle();
+    handle.exec(`DELETE FROM ${LEI_RELATIONSHIP_TABLE}`);
   }
 
   /** Primary name + aliases as one list, primary first. */
@@ -402,6 +427,28 @@ export class ScreeningService {
       completedAt: new Date().toISOString(),
       total,
     });
+  }
+
+  /**
+   * After a GLEIF delta apply, advance the LEI mirror's freshness — a fresh
+   * `completedAt` and the resulting live entity count as `total` — so
+   * `sanctions_list_sources` / `sanctions://sources` report the data actually
+   * loaded, not the last init's timestamp.
+   *
+   * Guarded: freshness advances ONLY when the mirror is already ready (a full sync
+   * has completed). Applying a small delta to a never-initialized mirror is not
+   * completion, so a delta must never flip an empty GLEIF mirror to ready — the
+   * caller logs a notice and leaves it for `mirror:init`. `total` is the live
+   * entity count from {@link leiReadiness}, never the size of the delta batch just
+   * applied. `writeState` preserves `completedAt`/`total` when omitted, so
+   * {@link markLeiReady} passes all three (`status`, `completedAt`, `total`)
+   * explicitly to actually move them.
+   */
+  async advanceLeiFreshnessIfReady(): Promise<{ advanced: boolean; entityCount: number }> {
+    const readiness = await this.leiReadiness();
+    if (!readiness.ready) return { advanced: false, entityCount: readiness.entityCount };
+    await this.markLeiReady(readiness.entityCount);
+    return { advanced: true, entityCount: readiness.entityCount };
   }
 
   /**
@@ -565,8 +612,8 @@ export class ScreeningService {
     // one strategy starves the others under the row cap:
     //  (a) phonetic-key equality — seeds the pool with transliteration-class
     //      variants (e.g. Mohammed/Muhammad share DM key MHMT) whose whole-string
-    //      Jaro-Winkler is low; they still face the uniform `minScore` floor below,
-    //      where `bestTokenScore` (the max over token pairs) typically clears it.
+    //      Jaro-Winkler is low; they still face the admission gate below, which
+    //      their high-scoring significant token pairs (with coverage) clear.
     //  (b) a leading-trigram prefix shared with any query token — pulls the
     //      JW-near candidates whose phonetic key differs (e.g. Volkov/Volkow).
     // A single OR'd query with one shared LIMIT let the first clause (e.g. a
@@ -613,23 +660,31 @@ export class ScreeningService {
     if (byRowid.size === 0) return [];
     const rows = [...byRowid.values()];
 
-    // The phonetic-key SQL above *seeds the candidate pool* with transliteration-
-    // class variants (e.g. Mohammed/Muhammad share DM key MHMT) whose whole-string
-    // Jaro-Winkler is low. Admission, however, is the SAME floor for every
-    // candidate: `score >= minScore`. `bestTokenScore` is the max over token pairs,
-    // so shared exact tokens still pin those variants at/above the default floor;
-    // only a high explicit `minScore` (the caller's intent) drops a sub-floor
-    // phonetic-only hit. The floor means what it says for all match strategies.
+    // The blocking SQL above *seeds the candidate pool* — phonetic-key equality
+    // pulls transliteration-class variants (e.g. Mohammed/Muhammad share DM key
+    // MHMT) whose whole-string Jaro-Winkler is low, the trigram prefix pulls the
+    // JW-near variants. Both are only candidates; admission is decided here.
+    //
+    // The surfaced `score` stays a RAW Jaro-Winkler measurement — the max of the
+    // whole-string similarity and the single best token-pair similarity — never a
+    // blended/averaged composite. Admission is a SEPARATE gate (`admitFuzzy`): the
+    // raw score must clear `minScore` AND the candidate must explain enough of the
+    // query, so one strong token pair (e.g. `nonexistent` ~ a short `Noni` alias)
+    // can't carry an otherwise-unrelated multi-token query. Transliteration
+    // variants (their significant tokens each score high) and word-order swaps (all
+    // tokens present) stay admitted; a high explicit `minScore` still suppresses
+    // uniformly; single-token queries are unchanged (the floor alone governs).
     const scored: ScreeningHit[] = [];
     for (const row of rows) {
       const candidateTokens = tokenize(row.normalized);
       const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
       const wholeScore = jaroWinkler(args.normalizedQuery, row.normalized);
-      const score = Math.max(tokenScore, wholeScore);
 
-      if (score >= args.minScore) {
+      if (
+        this.admitFuzzy(args.queryTokens, candidateTokens, wholeScore, tokenScore, args.minScore)
+      ) {
         const hit = this.rowToHit(row, 'approximate');
-        hit.score = Number(score.toFixed(4));
+        hit.score = Number(Math.max(tokenScore, wholeScore).toFixed(4));
         scored.push(hit);
       }
     }
@@ -645,6 +700,36 @@ export class ScreeningService {
     return [...byDesignation.values()]
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
       .slice(0, args.cap);
+  }
+
+  /**
+   * Fuzzy admission gate, shared by {@link runFuzzy} and {@link runLeiFuzzy} so
+   * both paths admit on one consistent rule. This is a SEPARATE predicate from the
+   * surfaced score, which stays the raw Jaro-Winkler max of the whole-string and
+   * best token-pair measurements (never a composite). A candidate is admitted when
+   * it explains enough of the query, not merely one fragment of it:
+   *
+   *  - the whole-string score clears `minScore` (the candidate matches as a whole —
+   *    covers near-identical strings and word-order swaps), OR
+   *  - the best token pair clears `minScore` AND at least half the query tokens each
+   *    individually clear it (coverage) — so one strong token pair can't carry an
+   *    otherwise-unrelated multi-token query (the single-token false positive).
+   *
+   * By construction this only tightens queries of three or more tokens: for a one-
+   * or two-token query a passing token score already means half-or-more of the
+   * tokens are covered, so the `minScore` floor alone governs, exactly as before.
+   */
+  private admitFuzzy(
+    queryTokens: string[],
+    candidateTokens: string[],
+    wholeScore: number,
+    tokenScore: number,
+    minScore: number,
+  ): boolean {
+    if (wholeScore >= minScore) return true;
+    if (tokenScore < minScore) return false;
+    const covered = tokenCoverage(queryTokens, candidateTokens, minScore);
+    return covered * 2 >= queryTokens.length;
   }
 
   private mergeHits(strict: ScreeningHit[], fuzzy: ScreeningHit[]): ScreeningHit[] {
@@ -801,20 +886,32 @@ export class ScreeningService {
     const scored: LeiMatch[] = [];
     for (const row of rows) {
       const names = [row.legal_name, ...(JSON.parse(row.other_names || '[]') as string[])];
+      // Same admission gate as runFuzzy, applied per candidate name: a name is
+      // eligible only when it explains enough of the query (the whole string clears
+      // the floor, or at least half the query tokens do), so one strong token pair
+      // can't carry an unrelated multi-token query on a short legal/trading name.
+      // The surfaced score stays the raw Jaro-Winkler max of the best ELIGIBLE name.
       let best = 0;
       let bestName = row.legal_name;
+      let admitted = false;
       for (const name of names) {
         const folded = fold(name);
-        const s = Math.max(
-          jaroWinkler(args.normalizedQuery, folded),
-          bestTokenScore(args.queryTokens, tokenize(folded)),
-        );
+        const candidateTokens = tokenize(folded);
+        const wholeScore = jaroWinkler(args.normalizedQuery, folded);
+        const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
+        if (
+          !this.admitFuzzy(args.queryTokens, candidateTokens, wholeScore, tokenScore, args.minScore)
+        ) {
+          continue;
+        }
+        admitted = true;
+        const s = Math.max(wholeScore, tokenScore);
         if (s > best) {
           best = s;
           bestName = name;
         }
       }
-      if (best >= args.minScore) {
+      if (admitted) {
         const m = this.leiRowToMatch(row, 'approximate', bestName);
         m.score = Number(best.toFixed(4));
         scored.push(m);

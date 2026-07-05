@@ -10,11 +10,16 @@
  * @module tests/services/ingest-parsers.test
  */
 
+import { deflateRawSync, gzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import {
   decompressGleifBuffer,
   parseLeiLevel1,
   parseLeiLevel2,
+  streamLeiLevel1FromBytes,
+  streamLeiLevel1FromText,
+  streamLeiLevel2FromBytes,
+  streamLeiLevel2FromText,
 } from '@/services/screening/gleif-ingest.js';
 import { parseEu, parseOfac, parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
 import { parseXml } from '@/services/screening/xml.js';
@@ -336,6 +341,155 @@ describe('GLEIF Level 2 parser', () => {
   });
 });
 
+// ─── GLEIF namespace-prefixed real-corpus shape (issue #7) ──────────────────────
+//
+// Real GLEIF golden-copy and delta files are namespace-prefixed on EVERY element —
+// `lei:` (LEI-CDF) / `rr:` (RR-CDF), inner fields included — unlike the synthetic
+// fixtures above. `removeNSPrefix: true` on the shared parser strips the prefix at
+// parse time so the unprefixed reads in parseOneLei / parseOneRelationship still
+// resolve. Before the fix these documents parsed to zero records, "Unknown" legal
+// names, and dropped relationships. The fixtures are prefixed throughout, including
+// `xml:lang` on the name/address elements (which removeNSPrefix folds to `lang`).
+
+const LEI_L1_FULLY_PREFIXED_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<lei:LEIData xmlns:lei="http://www.gleif.org/data/schema/leidata/2016">
+  <lei:LEIRecords>
+    <lei:LEIRecord>
+      <lei:LEI>5493001KJTIIGC8Y1R12</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="en">Fictional Trading Company LLC</lei:LegalName>
+        <lei:OtherEntityNames>
+          <lei:OtherEntityName xml:lang="en" type="PREVIOUS_LEGAL_NAME">Fictional Trading Co</lei:OtherEntityName>
+          <lei:OtherEntityName xml:lang="en" type="TRADING_OR_OPERATING_NAME">FTC LLC</lei:OtherEntityName>
+        </lei:OtherEntityNames>
+        <lei:LegalAddress xml:lang="en">
+          <lei:FirstAddressLine>99 Commerce Way</lei:FirstAddressLine>
+          <lei:City>Testopolis</lei:City>
+          <lei:Region>US-NY</lei:Region>
+          <lei:Country>US</lei:Country>
+          <lei:PostalCode>10001</lei:PostalCode>
+        </lei:LegalAddress>
+        <lei:HeadquartersAddress xml:lang="en">
+          <lei:FirstAddressLine>1 HQ Plaza</lei:FirstAddressLine>
+          <lei:City>Testopolis</lei:City>
+          <lei:Country>US</lei:Country>
+        </lei:HeadquartersAddress>
+        <lei:RegistrationAuthority>
+          <lei:RegistrationAuthorityID>RA000665</lei:RegistrationAuthorityID>
+          <lei:RegistrationAuthorityEntityID>FTC-REG-1</lei:RegistrationAuthorityEntityID>
+        </lei:RegistrationAuthority>
+        <lei:LegalJurisdiction>US</lei:LegalJurisdiction>
+        <lei:EntityStatus>ACTIVE</lei:EntityStatus>
+      </lei:Entity>
+      <lei:Registration>
+        <lei:LastUpdateDate>2026-01-15T10:00:00Z</lei:LastUpdateDate>
+        <lei:RegistrationStatus>ISSUED</lei:RegistrationStatus>
+      </lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>529900T8BM49AURSDO55</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="fr">Société Générale Placement SA</lei:LegalName>
+        <lei:LegalAddress xml:lang="fr">
+          <lei:FirstAddressLine>29 Boulevard Haussmann</lei:FirstAddressLine>
+          <lei:City>Paris</lei:City>
+          <lei:Country>FR</lei:Country>
+          <lei:PostalCode>75009</lei:PostalCode>
+        </lei:LegalAddress>
+        <lei:LegalJurisdiction>FR</lei:LegalJurisdiction>
+        <lei:EntityStatus>ACTIVE</lei:EntityStatus>
+      </lei:Entity>
+      <lei:Registration>
+        <lei:LastUpdateDate>2026-02-01T08:00:00Z</lei:LastUpdateDate>
+        <lei:RegistrationStatus>ISSUED</lei:RegistrationStatus>
+      </lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>213800MINIMAL00000X1</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="en">Minimal Holdings Ltd</lei:LegalName>
+        <lei:LegalJurisdiction>GB</lei:LegalJurisdiction>
+        <lei:EntityStatus>ACTIVE</lei:EntityStatus>
+      </lei:Entity>
+    </lei:LEIRecord>
+  </lei:LEIRecords>
+</lei:LEIData>`;
+
+const RR_L2_FULLY_PREFIXED_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<rr:RelationshipData xmlns:rr="http://www.gleif.org/data/schema/rr/2016">
+  <rr:RelationshipRecords>
+    <rr:RelationshipRecord>
+      <rr:Relationship>
+        <rr:StartNode><rr:NodeID>5493001KJTIIGC8Y1R12</rr:NodeID><rr:NodeIDType>LEI</rr:NodeIDType></rr:StartNode>
+        <rr:EndNode><rr:NodeID>529900T8BM49AURSDO55</rr:NodeID><rr:NodeIDType>LEI</rr:NodeIDType></rr:EndNode>
+        <rr:RelationshipType>IS_ULTIMATELY_CONSOLIDATED_BY</rr:RelationshipType>
+        <rr:RelationshipPeriods><rr:RelationshipPeriod><rr:StartDate>2020-01-01T00:00:00Z</rr:StartDate><rr:PeriodType>RELATIONSHIP_PERIOD</rr:PeriodType></rr:RelationshipPeriod></rr:RelationshipPeriods>
+        <rr:RelationshipStatus>ACTIVE</rr:RelationshipStatus>
+      </rr:Relationship>
+    </rr:RelationshipRecord>
+    <rr:RelationshipRecord>
+      <rr:Relationship>
+        <rr:StartNode><rr:NodeID>213800MINIMAL00000X1</rr:NodeID><rr:NodeIDType>LEI</rr:NodeIDType></rr:StartNode>
+        <rr:EndNode><rr:NodeID>529900T8BM49AURSDO55</rr:NodeID><rr:NodeIDType>LEI</rr:NodeIDType></rr:EndNode>
+        <rr:RelationshipType>IS_DIRECTLY_CONSOLIDATED_BY</rr:RelationshipType>
+        <rr:RelationshipStatus>ACTIVE</rr:RelationshipStatus>
+      </rr:Relationship>
+    </rr:RelationshipRecord>
+  </rr:RelationshipRecords>
+</rr:RelationshipData>`;
+
+describe('GLEIF namespace-prefixed corpus (issue #7)', () => {
+  it('DOM parseLeiLevel1 yields complete records with real legal names (never "Unknown")', () => {
+    const entities = parseLeiLevel1(parseXml(LEI_L1_FULLY_PREFIXED_XML));
+    expect(entities).toHaveLength(3);
+    expect(entities.every((e) => e.legalName !== 'Unknown')).toBe(true);
+
+    const full = entities.find((e) => e.lei === '5493001KJTIIGC8Y1R12')!;
+    expect(full.legalName).toBe('Fictional Trading Company LLC');
+    expect(full.otherNames).toEqual(['Fictional Trading Co', 'FTC LLC']);
+    expect(full.jurisdiction).toBe('US');
+    expect(full.status).toBe('ISSUED');
+    expect(full.legalAddress).toContain('99 Commerce Way');
+    expect(full.headquartersAddress).toContain('1 HQ Plaza');
+    expect(full.registrationAuthorityId).toBe('RA000665');
+    expect(full.lastUpdate).toBe('2026-01-15T10:00:00Z');
+
+    // xml:lang on the name element (folded to `lang` by removeNSPrefix) doesn't
+    // disturb the multibyte legal-name text read.
+    expect(entities.find((e) => e.lei === '529900T8BM49AURSDO55')?.legalName).toBe(
+      'Société Générale Placement SA',
+    );
+    // Sparse record: status falls back to EntityStatus when Registration is absent.
+    expect(entities.find((e) => e.lei === '213800MINIMAL00000X1')?.status).toBe('ACTIVE');
+  });
+
+  it('DOM parseLeiLevel2 retains relationships with correct child/parent LEIs', () => {
+    const rels = parseLeiLevel2(parseXml(RR_L2_FULLY_PREFIXED_XML));
+    expect(rels).toHaveLength(2);
+
+    const ultimate = rels.find((r) => r.relationshipType === 'IS_ULTIMATELY_CONSOLIDATED_BY')!;
+    expect(ultimate.childLei).toBe('5493001KJTIIGC8Y1R12');
+    expect(ultimate.parentLei).toBe('529900T8BM49AURSDO55');
+    expect(ultimate.relationshipStatus).toBe('ACTIVE');
+    expect(ultimate.relationshipPeriod).toBe('2020-01-01T00:00:00Z');
+
+    const direct = rels.find((r) => r.relationshipType === 'IS_DIRECTLY_CONSOLIDATED_BY')!;
+    expect(direct.childLei).toBe('213800MINIMAL00000X1');
+    expect(direct.parentLei).toBe('529900T8BM49AURSDO55');
+  });
+
+  it('parses to ZERO records when namespace prefixes are preserved (the pre-fix failure mode)', () => {
+    // The GLEIF counterpart to the OFAC/EU attribute guards above: with prefixes
+    // preserved, every element key stays `lei:`/`rr:`-prefixed, so the unprefixed
+    // reads reach nothing and the record lists come back empty — exactly the bug
+    // that `removeNSPrefix` fixes.
+    const { XMLParser } = require('fast-xml-parser');
+    const nsPreserved = new XMLParser({ ignoreAttributes: false, processEntities: false });
+    expect(parseLeiLevel1(nsPreserved.parse(LEI_L1_FULLY_PREFIXED_XML))).toHaveLength(0);
+    expect(parseLeiLevel2(nsPreserved.parse(RR_L2_FULLY_PREFIXED_XML))).toHaveLength(0);
+  });
+});
+
 // ─── GLEIF download decompression (ZIP / gzip / plain) ──────────────────────────
 
 describe('decompressGleifBuffer', () => {
@@ -359,5 +513,217 @@ describe('decompressGleifBuffer', () => {
 
   it('passes through plain XML unchanged', () => {
     expect(decompressGleifBuffer(Buffer.from('<LEIData/>'))).toBe('<LEIData/>');
+  });
+});
+
+// ─── GLEIF streaming ingest (issue #6) ──────────────────────────────────────────
+//
+// The streaming golden-copy path must emit the SAME normalized records as the
+// buffered DOM parser (parseLeiLevel1 / parseLeiLevel2) — the DOM path is the
+// equivalence oracle. Multi-record documents are fed at awkward chunk sizes (down
+// to 1) to exercise record boundaries split across chunks and multi-byte UTF-8
+// characters split across the streaming TextDecoder.
+
+/** A multi-record L1 document: a full record (other names, both addresses), one
+ *  carrying multi-byte UTF-8 in its legal name, and a minimal one (LEI + name). */
+const MULTI_L1_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<LEIData>
+  <LEIRecords>
+    <LEIRecord>
+      <LEI>5493001KJTIIGC8Y1R12</LEI>
+      <Entity>
+        <LegalName>Fictional Trading Company LLC</LegalName>
+        <OtherEntityNames>
+          <OtherEntityName>Fictional Trading Co</OtherEntityName>
+          <OtherEntityName>FTC LLC</OtherEntityName>
+        </OtherEntityNames>
+        <LegalAddress><FirstAddressLine>99 Commerce Way</FirstAddressLine><City>Testopolis</City><Country>US</Country></LegalAddress>
+        <HeadquartersAddress><FirstAddressLine>1 HQ Plaza</FirstAddressLine><City>Testopolis</City><Country>US</Country></HeadquartersAddress>
+        <LegalJurisdiction>US</LegalJurisdiction>
+      </Entity>
+      <Registration><RegistrationStatus>ISSUED</RegistrationStatus><LastUpdateDate>2026-01-15T10:00:00Z</LastUpdateDate></Registration>
+    </LEIRecord>
+    <LEIRecord>
+      <LEI>529900T8BM49AURSDO55</LEI>
+      <Entity>
+        <LegalName>Société Générale Café Frères SA</LegalName>
+        <LegalJurisdiction>FR</LegalJurisdiction>
+      </Entity>
+      <Registration><RegistrationStatus>LAPSED</RegistrationStatus></Registration>
+    </LEIRecord>
+    <LEIRecord>
+      <LEI>213800MINIMAL00000X1</LEI>
+      <Entity><LegalName>Minimal Co</LegalName></Entity>
+    </LEIRecord>
+  </LEIRecords>
+</LEIData>`;
+
+const MULTI_L2_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<RelationshipData>
+  <RelationshipRecords>
+    <RelationshipRecord><Relationship>
+      <StartNode><NodeID>5493001KJTIIGC8Y1R12</NodeID></StartNode>
+      <EndNode><NodeID>529900T8BM49AURSDO55</NodeID></EndNode>
+      <RelationshipType>IS_ULTIMATELY_CONSOLIDATED_BY</RelationshipType>
+      <RelationshipStatus>ACTIVE</RelationshipStatus>
+      <RelationshipPeriods><RelationshipPeriod><StartDate>2020-01-01</StartDate></RelationshipPeriod></RelationshipPeriods>
+    </Relationship></RelationshipRecord>
+    <RelationshipRecord><Relationship>
+      <StartNode><NodeID>213800MINIMAL00000X1</NodeID></StartNode>
+      <EndNode><NodeID>529900T8BM49AURSDO55</NodeID></EndNode>
+      <RelationshipType>IS_DIRECTLY_CONSOLIDATED_BY</RelationshipType>
+    </Relationship></RelationshipRecord>
+  </RelationshipRecords>
+</RelationshipData>`;
+
+/** A `lei:`-prefixed record tag with unprefixed inner elements — the scanner must
+ *  find the prefixed record boundary; parseOneLei normalizes the inner fields. */
+const LEI_L1_PREFIXED_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<lei:LEIData xmlns:lei="http://www.gleif.org/data/schema/leidata/2016">
+  <lei:LEIRecords>
+    <lei:LEIRecord>
+      <LEI>PREFIX0000000000000X</LEI>
+      <Entity><LegalName>Prefixed Record Co</LegalName><LegalJurisdiction>DE</LegalJurisdiction></Entity>
+      <Registration><RegistrationStatus>ISSUED</RegistrationStatus></Registration>
+    </lei:LEIRecord>
+  </lei:LEIRecords>
+</lei:LEIData>`;
+
+const RR_L2_PREFIXED_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<rr:RelationshipData xmlns:rr="http://www.gleif.org/data/schema/rr/2016">
+  <rr:RelationshipRecords>
+    <rr:RelationshipRecord><Relationship>
+      <StartNode><NodeID>PREFIX0000000000000X</NodeID></StartNode>
+      <EndNode><NodeID>529900T8BM49AURSDO55</NodeID></EndNode>
+      <RelationshipType>IS_DIRECTLY_CONSOLIDATED_BY</RelationshipType>
+    </Relationship></rr:RelationshipRecord>
+  </rr:RelationshipRecords>
+</rr:RelationshipData>`;
+
+async function* chunkStr(s: string, size: number): AsyncGenerator<string> {
+  for (let i = 0; i < s.length; i += size) yield s.slice(i, i + size);
+}
+
+async function* chunkBytes(b: Uint8Array, size: number): AsyncGenerator<Uint8Array> {
+  for (let i = 0; i < b.length; i += size) yield b.subarray(i, i + size);
+}
+
+async function collect<T>(gen: AsyncIterable<T>): Promise<T[]> {
+  const out: T[] = [];
+  for await (const item of gen) out.push(item);
+  return out;
+}
+
+/** Build a single-entry ZIP with a raw-deflate member in the streaming
+ *  (data-descriptor, general-purpose bit 3) style the GLEIF golden copy uses:
+ *  the local header reports size 0 and a data descriptor + central directory
+ *  trail the deflate stream. */
+function buildDeflateZip(data: Buffer): Buffer {
+  const name = Buffer.from('lei.xml');
+  const deflated = deflateRawSync(data);
+  const lfh = Buffer.alloc(30);
+  lfh.writeUInt32LE(0x04034b50, 0); // local file header signature
+  lfh.writeUInt16LE(0x0008, 6); // general-purpose bit flag: bit 3 (data descriptor)
+  lfh.writeUInt16LE(8, 8); // method 8 = deflate
+  lfh.writeUInt32LE(0, 18); // compressed size 0 → in the trailing data descriptor
+  lfh.writeUInt32LE(0, 22); // uncompressed size 0
+  lfh.writeUInt16LE(name.length, 26);
+  lfh.writeUInt16LE(0, 28); // extra length
+  const dd = Buffer.alloc(16);
+  dd.writeUInt32LE(0x08074b50, 0); // data descriptor signature
+  dd.writeUInt32LE(deflated.length, 8);
+  dd.writeUInt32LE(data.length, 12);
+  const cd = Buffer.alloc(4);
+  cd.writeUInt32LE(0x02014b50, 0); // central directory signature (inflate ignores it)
+  return Buffer.concat([lfh, name, deflated, dd, cd]);
+}
+
+describe('GLEIF streaming L1 — equivalence with the DOM parser', () => {
+  it('emits identical records across awkward text chunk sizes', async () => {
+    const oracle = parseLeiLevel1(parseXml(MULTI_L1_XML));
+    expect(oracle.length).toBe(3);
+    for (const size of [1, 3, 7, 64, 100_000]) {
+      const streamed = await collect(streamLeiLevel1FromText(chunkStr(MULTI_L1_XML, size)));
+      expect(streamed, `chunk size ${size}`).toEqual(oracle);
+    }
+  });
+
+  it('emits identical records through gzip, ZIP-deflate, and plain byte streams', async () => {
+    const oracle = parseLeiLevel1(parseXml(MULTI_L1_XML));
+    const xml = Buffer.from(MULTI_L1_XML, 'utf8');
+    expect(await collect(streamLeiLevel1FromBytes(chunkBytes(gzipSync(xml), 16)))).toEqual(oracle);
+    expect(await collect(streamLeiLevel1FromBytes(chunkBytes(buildDeflateZip(xml), 16)))).toEqual(
+      oracle,
+    );
+    // Plain XML at 1-byte chunks splits every multi-byte UTF-8 character across the
+    // streaming TextDecoder boundary.
+    expect(await collect(streamLeiLevel1FromBytes(chunkBytes(xml, 1)))).toEqual(oracle);
+  });
+
+  it('extracts a lei:-prefixed record tag', async () => {
+    const streamed = await collect(streamLeiLevel1FromText(chunkStr(LEI_L1_PREFIXED_XML, 5)));
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]?.lei).toBe('PREFIX0000000000000X');
+    expect(streamed[0]?.legalName).toBe('Prefixed Record Co');
+  });
+
+  it('emits records identical to the DOM parser on the fully namespace-prefixed corpus', async () => {
+    const oracle = parseLeiLevel1(parseXml(LEI_L1_FULLY_PREFIXED_XML));
+    expect(oracle).toHaveLength(3);
+    for (const size of [1, 5, 64, 100_000]) {
+      const streamed = await collect(
+        streamLeiLevel1FromText(chunkStr(LEI_L1_FULLY_PREFIXED_XML, size)),
+      );
+      expect(streamed, `chunk size ${size}`).toEqual(oracle);
+    }
+    // …and decompressed from a ZIP-deflate byte stream (the golden-copy container).
+    const zip = buildDeflateZip(Buffer.from(LEI_L1_FULLY_PREFIXED_XML, 'utf8'));
+    expect(await collect(streamLeiLevel1FromBytes(chunkBytes(zip, 16)))).toEqual(oracle);
+  });
+});
+
+describe('GLEIF streaming L2 — equivalence with the DOM parser', () => {
+  it('emits identical records across awkward text chunk sizes', async () => {
+    const oracle = parseLeiLevel2(parseXml(MULTI_L2_XML));
+    expect(oracle.length).toBe(2);
+    for (const size of [1, 3, 7, 64, 100_000]) {
+      const streamed = await collect(streamLeiLevel2FromText(chunkStr(MULTI_L2_XML, size)));
+      expect(streamed, `chunk size ${size}`).toEqual(oracle);
+    }
+  });
+
+  it('emits identical records through a ZIP-deflate byte stream', async () => {
+    const oracle = parseLeiLevel2(parseXml(MULTI_L2_XML));
+    const zip = buildDeflateZip(Buffer.from(MULTI_L2_XML, 'utf8'));
+    expect(await collect(streamLeiLevel2FromBytes(chunkBytes(zip, 16)))).toEqual(oracle);
+  });
+
+  it('extracts an rr:-prefixed record tag', async () => {
+    const streamed = await collect(streamLeiLevel2FromText(chunkStr(RR_L2_PREFIXED_XML, 5)));
+    expect(streamed).toHaveLength(1);
+    expect(streamed[0]?.childLei).toBe('PREFIX0000000000000X');
+    expect(streamed[0]?.relationshipType).toBe('IS_DIRECTLY_CONSOLIDATED_BY');
+  });
+
+  it('emits records identical to the DOM parser on the fully namespace-prefixed corpus', async () => {
+    const oracle = parseLeiLevel2(parseXml(RR_L2_FULLY_PREFIXED_XML));
+    expect(oracle).toHaveLength(2);
+    for (const size of [1, 5, 64, 100_000]) {
+      const streamed = await collect(
+        streamLeiLevel2FromText(chunkStr(RR_L2_FULLY_PREFIXED_XML, size)),
+      );
+      expect(streamed, `chunk size ${size}`).toEqual(oracle);
+    }
+    const zip = buildDeflateZip(Buffer.from(RR_L2_FULLY_PREFIXED_XML, 'utf8'));
+    expect(await collect(streamLeiLevel2FromBytes(chunkBytes(zip, 16)))).toEqual(oracle);
+  });
+
+  it('yields nothing for a document with only the empty container', async () => {
+    const streamed = await collect(
+      streamLeiLevel2FromText(
+        chunkStr('<RelationshipData><RelationshipRecords/></RelationshipData>', 4),
+      ),
+    );
+    expect(streamed).toHaveLength(0);
   });
 });

@@ -118,6 +118,30 @@ export function bestTokenScore(queryTokens: string[], candidateTokens: string[])
   return best;
 }
 
+/**
+ * How many query tokens are individually "covered" by the candidate — i.e. score
+ * at least `threshold` (Jaro-Winkler) against some candidate token. Where
+ * {@link bestTokenScore} is the single best pair, this counts how MANY query
+ * tokens clear the bar, letting the matching engine require a candidate to explain
+ * enough of a multi-token query rather than admitting it on one strong fragment.
+ */
+export function tokenCoverage(
+  queryTokens: string[],
+  candidateTokens: string[],
+  threshold: number,
+): number {
+  let covered = 0;
+  for (const q of queryTokens) {
+    for (const c of candidateTokens) {
+      if (jaroWinkler(q, c) >= threshold) {
+        covered++;
+        break;
+      }
+    }
+  }
+  return covered;
+}
+
 // ─── Double Metaphone (single primary key) ─────────────────────────────────────
 
 /**

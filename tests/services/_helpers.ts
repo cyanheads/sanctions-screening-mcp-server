@@ -57,6 +57,29 @@ export async function seededService(): Promise<SeededService> {
 }
 
 /**
+ * Build a ScreeningService against a fresh temp SQLite file WITHOUT seeding or
+ * marking any mirror ready — a never-initialized mirror. Use for the delta/init
+ * lifecycle tests that assert readiness-gated behavior.
+ */
+export async function freshService(): Promise<SeededService> {
+  const dir = mkdtempSync(join(tmpdir(), 'sanctions-test-'));
+  process.env.SANCTIONS_MIRROR_PATH = join(dir, 'fresh.db');
+  resetServerConfig();
+
+  const service = buildScreeningService();
+
+  return {
+    service,
+    cleanup: async () => {
+      await service.close();
+      rmSync(dir, { recursive: true, force: true });
+      delete process.env.SANCTIONS_MIRROR_PATH;
+      resetServerConfig();
+    },
+  };
+}
+
+/**
  * Seed the GLOBAL screening service (the one tool handlers reach via
  * `getScreeningService()`) against a fresh temp DB. Use for tool-level tests.
  */

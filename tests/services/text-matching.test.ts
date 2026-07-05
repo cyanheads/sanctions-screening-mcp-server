@@ -13,6 +13,7 @@ import {
   fold,
   jaro,
   jaroWinkler,
+  tokenCoverage,
   tokenize,
 } from '@/services/screening/text-matching.js';
 
@@ -82,6 +83,36 @@ describe('bestTokenScore', () => {
     const q = tokenize(fold('Volkov Ivan'));
     const c = tokenize(fold('Ivan Volkov'));
     expect(bestTokenScore(q, c)).toBe(1);
+  });
+});
+
+describe('tokenCoverage', () => {
+  it('counts only query tokens that clear the threshold against some candidate token', () => {
+    // The single-token false-positive shape: one query token is close to the short
+    // candidate, the rest are noise. bestTokenScore would report the one high pair;
+    // coverage reports that only 1 of 3 query tokens is actually explained.
+    const q = tokenize(fold('Zzqxwv Nonexistent Qqpzm'));
+    const c = tokenize(fold('Noni'));
+    expect(bestTokenScore(q, c)).toBeGreaterThanOrEqual(0.85); // one strong pair
+    expect(tokenCoverage(q, c, 0.85)).toBe(1); // but only one token covered
+  });
+
+  it('counts every token for a full match (word-order swap)', () => {
+    const q = tokenize(fold('Volkov Ivan'));
+    const c = tokenize(fold('Ivan Volkov'));
+    expect(tokenCoverage(q, c, 0.85)).toBe(2);
+  });
+
+  it('counts a legitimate partial match (2 of 3 tokens)', () => {
+    const q = tokenize(fold('Ivan Volkov Qqzzxw'));
+    const c = tokenize(fold('Ivan Testovich Volkov'));
+    expect(tokenCoverage(q, c, 0.85)).toBe(2);
+  });
+
+  it('returns 0 when nothing clears the threshold', () => {
+    const q = tokenize(fold('Zzqxwv Qqpzm'));
+    const c = tokenize(fold('Noni'));
+    expect(tokenCoverage(q, c, 0.85)).toBe(0);
   });
 });
 

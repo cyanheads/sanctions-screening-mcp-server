@@ -151,6 +151,30 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
       remarks: 'Synthetic UN test entry.',
     },
   },
+  {
+    // Single-token false-positive guard (issue #4). A SHORT low-quality-aka whose
+    // folded form ("noni") a longer, unrelated query token scores near — JW of
+    // "nonexistent" vs "noni" is 0.8515, above the 0.85 fuzzy floor. Mirrors the
+    // live OFAC low-quality-aka "Noni". The regression: a multi-token nonsense
+    // query ("Zzqxwv Nonexistent Qqpzm") must NOT admit this entry on that one
+    // token pair — only 1 of 3 query tokens is explained (coverage 1/3), below the
+    // half-of-query admission gate — even though the pair itself clears the floor.
+    id: 'ofac_sdn:FX-8008',
+    source: 'ofac_sdn',
+    sourceEntryId: 'FX-8008',
+    entityType: 'person',
+    primaryName: 'Mateo Restrepo Cardoza',
+    program: 'TEST-PROGRAM',
+    designationDate: '2021-11-05',
+    payload: {
+      aliases: [{ name: 'Noni', nameType: 'low-quality-aka' }],
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+      remarks: 'Synthetic single-token false-positive test entry — not a real person.',
+    },
+  },
 ];
 
 /** Two invented GLEIF entities — a parent and a subsidiary — for resolution + tracing. */
