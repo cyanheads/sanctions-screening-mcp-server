@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 18:57:05
+Generated on: 2026-07-05 04:35:25
 
 ```text
 sanctions-screening-mcp-server/
@@ -186,6 +186,7 @@ sanctions-screening-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

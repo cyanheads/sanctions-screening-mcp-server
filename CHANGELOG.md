@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-07-04 · 🛡️ Security
+
+Fix a fuzzy-match single-token false positive and namespace-prefixed GLEIF XML parsing, advance GLEIF delta freshness reporting, stream the golden-copy ingest, and clear a moderate js-yaml DoS advisory via the mcp-ts-core ^0.10.10 bump
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-06-20
 
 Adopt @cyanheads/mcp-ts-core ^0.10.9 — re-synced scripts/ guards add a dependency-specifier check that rejects floating specifiers (latest/*/dist-tags) in package.json + bun.lock, and the packaging lint now validates the Codex/Claude plugin marketplace manifests

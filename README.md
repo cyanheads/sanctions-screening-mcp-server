@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/sanctions-screening-mcp-server/releases/latest/download/sanctions-screening-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=sanctions-screening-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvc2FuY3Rpb25zLXNjcmVlbmluZy1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22sanctions-screening-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Fsanctions-screening-mcp-server%22%5D%7D)
 
@@ -142,13 +142,13 @@ This harvests all four sanctions lists in full, rebuilds the per-alias name inde
 | Script | Purpose |
 |:---|:---|
 | `bun run mirror:init` | Full initial load of all sources (sanctions lists + GLEIF golden copy). |
-| `bun run mirror:refresh` | Re-harvest the sanctions lists and apply GLEIF deltas. Also runs on a cron under HTTP transport. |
+| `bun run mirror:refresh` | Re-harvest the sanctions lists and apply GLEIF deltas. The sanctions half (lists + name index) also runs on a cron under HTTP transport; GLEIF deltas are manual. |
 | `bun run mirror:verify` | Report mirror readiness and per-source record counts. |
 | `bun run mirror:seed` | Load a small synthetic fixture for local smoke tests (no downloads). |
 
 Set `SANCTIONS_INIT_SKIP_GLEIF=1` on `mirror:init` to load only the (small) sanctions lists and skip GLEIF.
 
-> **GLEIF memory note:** the GLEIF Level 1 ingest is the memory-heavy leg — the full golden copy is roughly 3.3M LEI records (~490 MB compressed) and ~890 MB of resident memory during the streaming ingest. The four sanctions lists and the GLEIF deltas / Level 2 ownership data are light by comparison. Size the host accordingly for `mirror:init`, or skip GLEIF with `SANCTIONS_INIT_SKIP_GLEIF=1` if you only need watchlist screening.
+> **GLEIF memory note:** the GLEIF Level 1 ingest is the heavy leg — the full golden copy is roughly 3.3M LEI records (~892 MB compressed, several GB decompressed). `mirror:init` streams and ingests it in bounded batches, so peak resident memory stays modest rather than scaling to the whole decompressed document. The four sanctions lists and the GLEIF deltas / Level 2 ownership data are light by comparison. Size disk for the mirror accordingly, or skip GLEIF with `SANCTIONS_INIT_SKIP_GLEIF=1` if you only need watchlist screening.
 
 ## Features
 
@@ -283,7 +283,7 @@ All sources are keyless — there is no required API key. Every variable below i
 | Variable | Description | Default |
 |:---|:---|:---|
 | `SANCTIONS_MIRROR_PATH` | Filesystem path for the SQLite mirror; a persistent volume on a hosted deployment. | `./data/sanctions.db` |
-| `SANCTIONS_REFRESH_CRON` | Cron for the scheduled refresh of sanctions lists + GLEIF deltas (HTTP transport only). | `0 4 * * *` |
+| `SANCTIONS_REFRESH_CRON` | Cron for the scheduled refresh of the sanctions lists + name index (HTTP transport only). GLEIF deltas are refreshed manually via `mirror:refresh`. | `0 4 * * *` |
 | `SANCTIONS_FUZZY_MIN_SCORE` | Default Jaro-Winkler similarity floor for fuzzy matches when `min_score` is omitted. | `0.85` |
 | `SANCTIONS_FUZZY_MAX_RESULTS` | Hard cap on fuzzy candidates scored per query, to bound work on short queries. | `50` |
 | `OFAC_SDN_URL` | Override for the OFAC SDN advanced-XML file. | official SLS URL |
