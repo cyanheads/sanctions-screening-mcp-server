@@ -1,9 +1,11 @@
 /**
  * @fileoverview `mirror:refresh` — incremental out-of-band refresh. Re-harvests
- * the (small) sanctions lists in full and rebuilds the name index, then applies
- * the GLEIF 8-hour deltas. The HTTP server runs the sanctions half of this on a
- * cron automatically; stdio operators run this manually. Set
- * `SANCTIONS_REFRESH_SKIP_GLEIF=1` to refresh only the sanctions lists.
+ * the sanctions lists in full — streamed, so the ~120 MB OFAC SDN document is
+ * never held whole — and rebuilds the name index, then applies the GLEIF 8-hour
+ * deltas, which are small enough for the buffered parse. The HTTP server runs
+ * the sanctions half of this on a cron automatically; stdio operators run this
+ * manually. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to refresh only the sanctions
+ * lists.
  *
  * Usage: `bun run mirror:refresh`
  * @module scripts/mirror-refresh
@@ -14,6 +16,7 @@ import {
   harvestLeiLevel2,
   resolveGleifFileUrl,
 } from '@/services/screening/gleif-ingest.js';
+import { createRejections } from '@/services/screening/ingest-validation.js';
 import { bootstrap, longRunSignal } from './_mirror-context.js';
 
 async function main(): Promise<void> {
@@ -36,13 +39,16 @@ async function main(): Promise<void> {
     resolveGleifFileUrl('lei2-delta', signal, 'LastDay'),
     resolveGleifFileUrl('rr-delta', signal, 'LastDay'),
   ]);
-  const entities = await harvestLeiLevel1(l1Url, signal);
+  const leiRejections = createRejections();
+  const entities = await harvestLeiLevel1(l1Url, signal, leiRejections);
   await service.ingestLeiEntities(entities);
   const relationships = await harvestLeiLevel2(l2Url, signal);
   await service.ingestLeiRelationships(relationships);
   log.info('mirror:refresh — GLEIF deltas applied', {
     entities: entities.length,
     relationships: relationships.length,
+    rejectedMissingIdentifier: leiRejections.missingIdentifier,
+    rejectedUnusableName: leiRejections.unusableName,
   });
 
   // Advance GLEIF freshness so sanctions_list_sources reports the data just loaded.

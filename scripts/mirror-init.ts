@@ -1,10 +1,15 @@
 /**
  * @fileoverview `mirror:init` — full out-of-band initialization of the local
- * mirror from the live upstream sources. Harvests all four sanctions lists in
+ * mirror from the live upstream sources. Harvests all five sanctions lists in
  * full (via the MirrorService `init` sync), rebuilds the per-alias name index,
  * then streams the GLEIF golden copy (Level 1 entities + Level 2 relationships).
  * Hours-long and resumable; never run on the request path. Set
- * `SANCTIONS_INIT_SKIP_GLEIF=1` to load only the (small) sanctions lists.
+ * `SANCTIONS_INIT_SKIP_GLEIF=1` to load the sanctions lists only.
+ *
+ * Both legs stream. The sanctions documents total ~172 MB — OFAC
+ * `SDN_ADVANCED.XML` alone is ~120 MB — and the GLEIF golden copy is far larger
+ * again, so neither is held whole: peak memory tracks the ingest batch, not the
+ * size of any source document.
  *
  * Usage: `bun run mirror:init`
  * @module scripts/mirror-init
@@ -15,6 +20,7 @@ import {
   streamLeiLevel1,
   streamLeiLevel2,
 } from '@/services/screening/gleif-ingest.js';
+import { createRejections } from '@/services/screening/ingest-validation.js';
 import { bootstrap, ingestInBatches, longRunSignal } from './_mirror-context.js';
 
 /** Records per ingest batch for the streaming golden-copy load. */
@@ -51,13 +57,18 @@ async function main(): Promise<void> {
   // ingest in bounded batches, so the ~892 MB compressed L1 file never has to be
   // held decompressed in memory. L1 entities upsert by LEI (idempotent per batch).
   log.info('mirror:init — streaming GLEIF Level 1 (who-is-who, ~3.3M records)');
+  const leiRejections = createRejections();
   const entityCount = await ingestInBatches(
-    streamLeiLevel1(l1Url, signal),
+    streamLeiLevel1(l1Url, signal, leiRejections),
     GLEIF_INGEST_BATCH,
     (batch) => service.ingestLeiEntities(batch),
     (total) => log.info('mirror:init — GLEIF Level 1 ingest progress', { entities: total }),
   );
-  log.info('mirror:init — GLEIF Level 1 loaded', { entities: entityCount });
+  log.info('mirror:init — GLEIF Level 1 loaded', {
+    entities: entityCount,
+    rejectedMissingIdentifier: leiRejections.missingIdentifier,
+    rejectedUnusableName: leiRejections.unusableName,
+  });
 
   // L2 is a full replace: wipe the relationship table ONCE, then insert-only
   // batches (no per-child delete) so a child whose relationships straddle a batch

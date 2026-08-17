@@ -17,10 +17,11 @@ import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import type { Mirror, SqliteHandle, SyncPage } from '@cyanheads/mcp-ts-core/mirror';
 import { defineMirror, sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { logger } from '@cyanheads/mcp-ts-core/utils';
+import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import {
   createSanctionsSync,
+  type DeferredDesignationFields,
   type SanctionsIngester,
 } from '@/services/screening/sanctions-ingest.js';
 import {
@@ -204,6 +205,13 @@ const STRICT_RAW_ROW_CAP = 5000;
 /** The same bound for the strict LEI scan; one row per entity, so a lower cap suffices. */
 const LEI_STRICT_RAW_ROW_CAP = 2000;
 
+/**
+ * Designation rows read per slice by {@link ScreeningService.rebuildNameIndex}.
+ * Bounds the rows, their JSON payloads, and one insert transaction — the whole
+ * corpus was previously resident at once.
+ */
+const NAME_INDEX_SLICE = 2000;
+
 /** A bounded strict scan: its ordered results plus whether the row cap bound. */
 interface BoundedScan<T> {
   /** True when the raw scan hit its row cap, making `results` an incomplete set. */
@@ -231,7 +239,23 @@ export class ScreeningService {
     this.designationMirror = defineMirror({
       name: 'sanctions-designations',
       store: sqliteMirrorStore({ path: config.mirrorPath, ...designationStoreSpec }),
-      sync: createSanctionsSync(),
+      // The harvest streams, so a source's trailing columns (OFAC publishes its
+      // programme block after every party) arrive after those rows are written —
+      // the sync patches them through the service rather than re-stating rows.
+      sync: createSanctionsSync({
+        applyDeferredFields: (source, fields) => this.applyDeferredFields(source, fields),
+        onSourceReport: (report) =>
+          logger.info(
+            'Sanctions harvest — source complete',
+            requestContextService.createRequestContext({
+              operation: 'mirror.sync.source',
+              source: report.source,
+              accepted: report.accepted,
+              rejectedMissingIdentifier: report.rejected.missingIdentifier,
+              rejectedUnusableName: report.rejected.unusableName,
+            }),
+          ),
+      }),
     });
 
     this.leiMirror = defineMirror({
@@ -344,37 +368,74 @@ export class ScreeningService {
   }
 
   /**
+   * Apply the columns a source could only publish after the records they belong
+   * to — the OFAC programme and designation date, which `SDN_ADVANCED.XML`
+   * carries in a `<SanctionsEntries>` block after every `<DistinctParty>`. The
+   * streaming harvest writes those parties first and hands the fields here once
+   * the source drains, keyed by `source_entry_id`.
+   *
+   * An UPDATE, not an upsert: a key with no row is a programme entry pointing at
+   * a party the document never published, and inventing a row for it would put
+   * an entity with no identity into the searchable corpus.
+   */
+  async applyDeferredFields(source: SourceCode, fields: DeferredDesignationFields): Promise<void> {
+    if (fields.size === 0) return;
+    const handle = await this.designationHandle();
+    handle.transaction(() => {
+      const update = handle.prepare(
+        `UPDATE designation SET program = ?, designation_date = ?
+         WHERE source = ? AND source_entry_id = ?`,
+      );
+      for (const [entryId, value] of fields) {
+        update.run(value.program ?? null, value.designationDate ?? null, source, entryId);
+      }
+    });
+  }
+
+  /**
    * Rebuild the per-alias `name` index from the current `designation` table.
    * The MirrorService `sync` path only writes the primary `designation` rows, so
    * after a `runSync` the lifecycle scripts (and the refresh cron) call this to
    * regenerate the matching index — including the Double-Metaphone phonetic keys
    * that can't be computed in SQL. Idempotent: clears and repopulates `name`.
+   *
+   * The designation table is walked in keyset slices ordered by `id` rather than
+   * materialized: `SELECT … .all()` over the whole corpus, plus a `JSON.parse`
+   * per row, is a second unbounded buffer in the same phase as the harvest, and
+   * it scales with the corpus. The walk still runs inside ONE transaction — a
+   * half-rebuilt index would silently narrow every screen — and nothing writes
+   * `designation` during it, so the keyset cursor sees a stable table.
    */
   async rebuildNameIndex(): Promise<void> {
     const handle = await this.designationHandle();
-    const rows = handle
-      .prepare<{ id: string; primary_name: string; payload: string }>(
-        `SELECT id, primary_name, payload FROM designation`,
-      )
-      .all();
+    const slice = handle.prepare<{ id: string; payload: string; primary_name: string }>(
+      `SELECT id, primary_name, payload FROM designation
+       WHERE id > ? ORDER BY id LIMIT ${NAME_INDEX_SLICE}`,
+    );
+    const insertName = handle.prepare(
+      `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
 
     handle.transaction(() => {
       handle.exec(`DELETE FROM ${NAME_TABLE}`);
-      const insertName = handle.prepare(
-        `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type)
-         VALUES (?, ?, ?, ?, ?)`,
-      );
-      for (const row of rows) {
-        const payload = JSON.parse(row.payload) as DesignationPayload;
-        const names: NameRecord[] = [
-          { name: row.primary_name, nameType: 'primary' },
-          ...payload.aliases,
-        ];
-        for (const rec of names) {
-          const normalized = fold(rec.name);
-          if (!normalized) continue;
-          insertName.run(row.id, rec.name, normalized, doubleMetaphone(normalized), rec.nameType);
+      let cursor = '';
+      for (;;) {
+        const rows = slice.all(cursor);
+        if (rows.length === 0) return;
+        for (const row of rows) {
+          const payload = JSON.parse(row.payload) as DesignationPayload;
+          const names: NameRecord[] = [
+            { name: row.primary_name, nameType: 'primary' },
+            ...payload.aliases,
+          ];
+          for (const rec of names) {
+            const normalized = fold(rec.name);
+            if (!normalized) continue;
+            insertName.run(row.id, rec.name, normalized, doubleMetaphone(normalized), rec.nameType);
+          }
         }
+        cursor = rows[rows.length - 1]?.id ?? cursor;
       }
     });
   }

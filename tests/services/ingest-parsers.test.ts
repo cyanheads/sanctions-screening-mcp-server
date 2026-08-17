@@ -21,7 +21,20 @@ import {
   streamLeiLevel2FromBytes,
   streamLeiLevel2FromText,
 } from '@/services/screening/gleif-ingest.js';
-import { parseEu, parseOfac, parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
+import { createRejections } from '@/services/screening/ingest-validation.js';
+import {
+  createHarvestState,
+  type HarvestState,
+  parseEu,
+  parseOfac,
+  parseUk,
+  parseUn,
+  streamEuFromText,
+  streamOfacFromText,
+  streamUkFromText,
+  streamUnFromText,
+} from '@/services/screening/sanctions-ingest.js';
+import type { NormalizedDesignation } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 
 // ─── OFAC advanced schema (attribute-driven) ────────────────────────────────────
@@ -327,6 +340,92 @@ describe('sanctions parser sparsity and alias quality', () => {
     expect(designation?.payload.datesOfBirth).toEqual([]);
   });
 
+  it('normalizes a sparse OFAC standard entry carrying only a uid and a surname', () => {
+    const [designation] = parseOfac(
+      parseXml(
+        '<sdnList><sdnEntry><uid>777</uid><lastName>SOLENAME</lastName></sdnEntry></sdnList>',
+      ),
+      'ofac_sdn',
+    );
+    expect(designation).toMatchObject({
+      id: 'ofac_sdn:777',
+      sourceEntryId: '777',
+      primaryName: 'SOLENAME',
+      entityType: 'unknown',
+    });
+  });
+
+  it('drops entries whose source published no stable identifier', () => {
+    const ofacStandard = parseOfac(
+      parseXml(
+        '<sdnList><sdnEntry><firstName>No</firstName><lastName>Uid</lastName></sdnEntry></sdnList>',
+      ),
+      'ofac_sdn',
+    );
+    const ofacAdvanced = parseOfac(
+      parseXml(
+        '<Sanctions><DistinctParties><DistinctParty><Profile><Identity><Alias Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>No Ref</NamePartValue></DocumentedNamePart></DocumentedName></Alias></Identity></Profile></DistinctParty></DistinctParties></Sanctions>',
+      ),
+      'ofac_sdn',
+    );
+    const eu = parseEu(
+      parseXml(
+        '<export><sanctionEntity><nameAlias wholeName="Acme SA"/></sanctionEntity></export>',
+      ),
+    );
+    const uk = parseUk(
+      parseXml(
+        '<Designations><Designation><Names><Name><Name6>Acme Ltd</Name6></Name></Names></Designation></Designations>',
+      ),
+    );
+    const un = parseUn(
+      parseXml(
+        '<CONSOLIDATED_LIST><ENTITIES><ENTITY><FIRST_NAME>ACME UN</FIRST_NAME></ENTITY></ENTITIES></CONSOLIDATED_LIST>',
+      ),
+    );
+    expect({ ofacStandard, ofacAdvanced, eu, uk, un }).toEqual({
+      ofacStandard: [],
+      ofacAdvanced: [],
+      eu: [],
+      uk: [],
+      un: [],
+    });
+  });
+
+  it('drops a name that decoded to a replacement character, and keeps it out of the aliases', () => {
+    // What a lossy UTF-8 decode leaves behind for the invalid byte pair `c3 28`.
+    const undecodable = '\uFFFD(';
+    expect(
+      parseOfac(
+        parseXml(
+          `<sdnList><sdnEntry><uid>801</uid><lastName>${undecodable}</lastName></sdnEntry></sdnList>`,
+        ),
+        'ofac_sdn',
+      ),
+    ).toHaveLength(0);
+
+    const [designation] = parseOfac(
+      parseXml(
+        `<sdnList><sdnEntry><uid>802</uid><lastName>Readable Co</lastName><akaList><aka><lastName>${undecodable}</lastName></aka><aka><lastName>Readable Trading</lastName></aka></akaList></sdnEntry></sdnList>`,
+      ),
+      'ofac_sdn',
+    );
+    expect(designation?.payload.aliases).toEqual([{ name: 'Readable Trading', nameType: 'aka' }]);
+  });
+
+  it('drops nameless OFAC standard and GLEIF entries instead of naming them "Unknown"', () => {
+    expect(
+      parseOfac(parseXml('<sdnList><sdnEntry><uid>42</uid></sdnEntry></sdnList>'), 'ofac_sdn'),
+    ).toEqual([]);
+    expect(
+      parseLeiLevel1(
+        parseXml(
+          '<LEIData><LEIRecords><LEIRecord><LEI>5493001KJTIIGC8Y1R12</LEI><Entity/></LEIRecord></LEIRecords></LEIData>',
+        ),
+      ),
+    ).toEqual([]);
+  });
+
   it('drops nameless OFAC advanced, EU, UK, and UN entries', () => {
     const ofac = parseOfac(
       parseXml(
@@ -348,6 +447,379 @@ describe('sanctions parser sparsity and alias quality', () => {
       ),
     );
     expect({ ofac, eu, uk, un }).toEqual({ ofac: [], eu: [], uk: [], un: [] });
+  });
+});
+
+// ─── Sanctions streaming ingest (issue #13) ─────────────────────────────────────
+//
+// Each sanctions source now streams: the document is scanned for complete record
+// elements and each is parsed alone, so a 120 MB OFAC document is never resident.
+// The buffered whole-document parsers above are the equivalence oracle — a
+// streamed parse must produce byte-identical normalized records, and the same
+// per-source rejection tallies, for the same input. Documents are fed at awkward
+// chunk sizes (down to 1) so every record boundary is split across chunks.
+
+/**
+ * A multi-record OFAC advanced document with the real element order: reference
+ * sets, a large non-record region, parties, relationships, then the programme
+ * block. Carries nesting depth (Profile → Identity → Alias → DocumentedName →
+ * DocumentedNamePart, repeated at three levels), two dropped siblings, two
+ * programme entries for one profile, and an orphan entry.
+ */
+const MULTI_OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Sanctions xmlns="https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/ADVANCED_XML">
+  <DateOfIssue><Year>2026</Year><Month>7</Month><Day>27</Day></DateOfIssue>
+  <ReferenceValueSets>
+    <AliasTypeValues>
+      <AliasType ID="1400">A.K.A.</AliasType>
+      <AliasType ID="1401">F.K.A.</AliasType>
+      <AliasType ID="1403">Name</AliasType>
+    </AliasTypeValues>
+    <FeatureTypeValues>
+      <FeatureType ID="8">Birthdate</FeatureType>
+      <FeatureType ID="9">Place of Birth</FeatureType>
+    </FeatureTypeValues>
+    <PartySubTypeValues>
+      <PartySubType ID="1" PartyTypeID="4">Vessel</PartySubType>
+      <PartySubType ID="4" PartyTypeID="1">Unknown</PartySubType>
+    </PartySubTypeValues>
+  </ReferenceValueSets>
+  <Locations>
+    <Location ID="1"><LocationCountry><Country>US</Country></LocationCountry></Location>
+    <Location ID="2"><LocationCountry><Country>CU</Country></LocationCountry></Location>
+  </Locations>
+  <IDRegDocuments><IDRegDocument ID="1"><IDRegistrationNo>X1</IDRegistrationNo></IDRegDocument></IDRegDocuments>
+  <DistinctParties>
+    <DistinctParty FixedRef="2674">
+      <Profile ID="2674" PartySubTypeID="4">
+        <Identity ID="4420" Primary="true">
+          <Alias AliasTypeID="1403" Primary="true" LowQuality="false">
+            <DocumentedName ID="2">
+              <DocumentedNamePart><NamePartValue>ABBAS</NamePartValue></DocumentedNamePart>
+              <DocumentedNamePart><NamePartValue>Abu</NamePartValue></DocumentedNamePart>
+            </DocumentedName>
+          </Alias>
+          <Alias AliasTypeID="1400" Primary="false" LowQuality="false">
+            <DocumentedName ID="1">
+              <DocumentedNamePart><NamePartValue>ZAYDAN</NamePartValue></DocumentedNamePart>
+            </DocumentedName>
+            <DocumentedName ID="3">
+              <DocumentedNamePart><NamePartValue>Muhammad Abbas</NamePartValue></DocumentedNamePart>
+            </DocumentedName>
+          </Alias>
+          <Alias AliasTypeID="1401" Primary="false" LowQuality="true">
+            <DocumentedName ID="4">
+              <DocumentedNamePart><NamePartValue>Abu Abbas</NamePartValue></DocumentedNamePart>
+            </DocumentedName>
+          </Alias>
+        </Identity>
+        <Feature FeatureTypeID="8">
+          <FeatureVersion ID="1"><DatePeriod><Start><From>
+            <Year>1948</Year><Month>12</Month><Day>10</Day>
+          </From></Start></DatePeriod></FeatureVersion>
+        </Feature>
+        <Feature FeatureTypeID="9">
+          <FeatureVersion ID="2"><VersionDetail DetailTypeID="1432">Safed, Israel</VersionDetail></FeatureVersion>
+        </Feature>
+      </Profile>
+    </DistinctParty>
+    <DistinctParty>
+      <Profile PartySubTypeID="4"><Identity><Alias AliasTypeID="1403" Primary="true">
+        <DocumentedName><DocumentedNamePart><NamePartValue>No Fixed Ref</NamePartValue></DocumentedNamePart></DocumentedName>
+      </Alias></Identity></Profile>
+    </DistinctParty>
+    <DistinctParty FixedRef="4238">
+      <Profile ID="4238" PartySubTypeID="1">
+        <Identity ID="9001" Primary="true">
+          <Alias AliasTypeID="1403" Primary="true" LowQuality="false">
+            <DocumentedName ID="5"><DocumentedNamePart><NamePartValue>MAR AZUL</NamePartValue></DocumentedNamePart></DocumentedName>
+          </Alias>
+        </Identity>
+      </Profile>
+    </DistinctParty>
+    <DistinctParty FixedRef="5000"><Profile ID="5000" PartySubTypeID="4"/></DistinctParty>
+  </DistinctParties>
+  <ProfileRelationships><ProfileRelationship ID="1" From="2674" To="4238"/></ProfileRelationships>
+  <SanctionsEntries>
+    <SanctionsEntry ID="1" ProfileID="2674" ListID="1550">
+      <EntryEvent ID="1"><Date><Year>1995</Year><Month>1</Month><Day>23</Day></Date></EntryEvent>
+      <SanctionsMeasure ID="1"><Comment>SDGT</Comment></SanctionsMeasure>
+      <SanctionsMeasure ID="2"><Comment>SDT</Comment></SanctionsMeasure>
+    </SanctionsEntry>
+    <SanctionsEntry ID="2" ProfileID="4238" ListID="1550">
+      <EntryEvent ID="2"><Date><Year>1989</Year><Month>1</Month><Day>5</Day></Date></EntryEvent>
+      <SanctionsMeasure ID="3"><Comment>CUBA</Comment></SanctionsMeasure>
+    </SanctionsEntry>
+    <SanctionsEntry ID="3" ProfileID="2674" ListID="1551">
+      <EntryEvent ID="3"><Date><Year>2001</Year><Month>9</Month><Day>11</Day></Date></EntryEvent>
+    </SanctionsEntry>
+    <SanctionsEntry ID="4" ProfileID="99999" ListID="1550">
+      <SanctionsMeasure ID="4"><Comment>ORPHAN</Comment></SanctionsMeasure>
+    </SanctionsEntry>
+  </SanctionsEntries>
+</Sanctions>`;
+
+/** The OFAC standard schema, which a URL override can still point the ingest at. */
+const MULTI_OFAC_STANDARD_XML = `<?xml version="1.0"?><sdnList>
+  <sdnEntry>
+    <uid>12345</uid><firstName>Example</firstName><lastName>Person</lastName><sdnType>Individual</sdnType>
+    <program>SDGT</program>
+    <akaList>
+      <aka><category>strong</category><firstName>Example</firstName><lastName>Alias</lastName></aka>
+      <aka><category>weak</category><lastName>Shortname</lastName></aka>
+    </akaList>
+    <idList><id><idType>Passport</idType><idNumber>P123</idNumber><idCountry>Testland</idCountry></id></idList>
+    <addressList><address><address1>1 Test Way</address1><city>Test City</city><country>Testland</country></address></addressList>
+    <dateOfBirthList><dateOfBirthItem><dateOfBirth>1980-01-02</dateOfBirth></dateOfBirthItem></dateOfBirthList>
+    <nationalityList><nationality><country>Testland</country></nationality></nationalityList>
+    <remarks>Designated on 2015-06-07 under the programme.</remarks>
+  </sdnEntry>
+  <sdnEntry><firstName>Missing</firstName><lastName>Uid</lastName></sdnEntry>
+  <sdnEntry><uid>777</uid></sdnEntry>
+  <sdnEntry><uid>778</uid><lastName>SOLENAME</lastName></sdnEntry>
+</sdnList>`;
+
+const MULTI_EU_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<export xmlns="http://eu.europa.ec/fpi/fsd/export">
+  <sanctionEntity logicalId="13" euReferenceNumber="EU.27.28">
+    <regulation regulationType="regulation" programme="IRQ" publicationDate="2003-07-08"/>
+    <subjectType code="person" classificationCode="P"/>
+    <nameAlias firstName="Saddam" lastName="Hussein Al-Tikriti" wholeName="Saddam Hussein Al-Tikriti" strong="true"/>
+    <nameAlias wholeName="Abu Ali" strong="false"/>
+    <nameAlias firstName="Saddam" lastName="Hussein"/>
+    <birthdate birthdate="1937-04-28"/>
+    <birthdate birthdate="1937-04-29"/>
+    <citizenship countryDescription="Iraq"/>
+    <citizenship countryDescription="Société Générale"/>
+  </sanctionEntity>
+  <sanctionEntity euReferenceNumber="EU.99.9">
+    <subjectType code="enterprise"/>
+    <nameAlias wholeName="Reference Number Only Ltd" strong="true"/>
+  </sanctionEntity>
+  <sanctionEntity><nameAlias wholeName="No Identifier SA"/></sanctionEntity>
+  <sanctionEntity logicalId="77"><subjectType code="person"/></sanctionEntity>
+</export>`;
+
+const MULTI_UK_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Designations>
+  <DateGenerated>10/06/2026</DateGenerated>
+  <Designation>
+    <LastUpdated>16/04/2026</LastUpdated><DateDesignated>29/06/2012</DateDesignated>
+    <UniqueID>AFG0001</UniqueID><RegimeName>Afghanistan</RegimeName>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+    <Names>
+      <Name><Name6>HAJI KHAIRULLAH MONEY EXCHANGE</Name6><NameType>Primary Name</NameType></Name>
+      <Name><Name6>Haji Alim Hawala</Name6><NameType>Alias</NameType></Name>
+      <Name><Name1>Abdul</Name1><Name2>Satar</Name2><Name6>Abdul Manan</Name6><NameType>Alias</NameType></Name>
+    </Names>
+    <Nationalities><Nationality>Afghanistan</Nationality><Nationality>Pakistan</Nationality></Nationalities>
+    <OtherInformation>Money exchange business.</OtherInformation>
+  </Designation>
+  <Designation>
+    <OFSIGroupID>UK-GRP-2</OFSIGroupID><GroupType>Ship</GroupType>
+    <Names><Names><WholeName>Ignored Nested</WholeName></Names><Name><WholeName>MV Example</WholeName></Name></Names>
+  </Designation>
+  <Designation><Names><Name><Name6>No Identifier Ltd</Name6></Name></Names></Designation>
+  <Designation><UniqueID>UK-EMPTY</UniqueID></Designation>
+</Designations>`;
+
+const MULTI_UN_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<CONSOLIDATED_LIST>
+  <INDIVIDUALS>
+    <INDIVIDUAL>
+      <DATAID>6907993</DATAID>
+      <FIRST_NAME>ERIC</FIRST_NAME><SECOND_NAME>BADEGE</SECOND_NAME>
+      <UN_LIST_TYPE>DRC</UN_LIST_TYPE><LISTED_ON>2012-12-31</LISTED_ON>
+      <COMMENTS1>Colonel in the armed forces.</COMMENTS1>
+      <NATIONALITY><VALUE>Democratic Republic of the Congo</VALUE></NATIONALITY>
+      <INDIVIDUAL_ALIAS><QUALITY>Good</QUALITY><ALIAS_NAME>Eric Badegé</ALIAS_NAME></INDIVIDUAL_ALIAS>
+      <INDIVIDUAL_ALIAS><QUALITY>Low</QUALITY><ALIAS_NAME>E. Badege</ALIAS_NAME></INDIVIDUAL_ALIAS>
+      <INDIVIDUAL_DATE_OF_BIRTH><DATE>1971-01-01</DATE></INDIVIDUAL_DATE_OF_BIRTH>
+      <INDIVIDUAL_DATE_OF_BIRTH><YEAR>1972</YEAR></INDIVIDUAL_DATE_OF_BIRTH>
+      <INDIVIDUAL_DOCUMENT><TYPE_OF_DOCUMENT>Passport</TYPE_OF_DOCUMENT><NUMBER>X1</NUMBER><ISSUING_COUNTRY>DRC</ISSUING_COUNTRY></INDIVIDUAL_DOCUMENT>
+    </INDIVIDUAL>
+    <INDIVIDUAL><FIRST_NAME>NO</FIRST_NAME><SECOND_NAME>DATAID</SECOND_NAME></INDIVIDUAL>
+    <INDIVIDUAL><DATAID>6907994</DATAID></INDIVIDUAL>
+  </INDIVIDUALS>
+  <ENTITIES>
+    <ENTITY>
+      <DATAID>6908100</DATAID><FIRST_NAME>EXAMPLE UN ENTITY</FIRST_NAME>
+      <UN_LIST_TYPE>DRC</UN_LIST_TYPE><LISTED_ON>2013-01-01</LISTED_ON>
+      <ENTITY_ALIAS><QUALITY>Good</QUALITY><ALIAS_NAME>Example Trading</ALIAS_NAME></ENTITY_ALIAS>
+    </ENTITY>
+    <ENTITY><REFERENCE_NUMBER>UN-REF-9</REFERENCE_NUMBER><FIRST_NAME>REFERENCE ONLY</FIRST_NAME></ENTITY>
+  </ENTITIES>
+</CONSOLIDATED_LIST>`;
+
+/** Chunk sizes that split every record boundary and multi-byte character. */
+const CHUNK_SIZES = [1, 3, 7, 64, 1_000_000] as const;
+
+async function streamAll(
+  stream: (
+    chunks: AsyncIterable<string>,
+    state: HarvestState,
+  ) => AsyncGenerator<NormalizedDesignation>,
+  xml: string,
+  size: number,
+): Promise<{ records: NormalizedDesignation[]; state: HarvestState }> {
+  const state = createHarvestState();
+  const records = await collect(stream(chunkStr(xml, size), state));
+  return { records, state };
+}
+
+/**
+ * The streamed OFAC record as the mirror ends up holding it: the party as
+ * emitted, plus the programme columns the deferred join applies afterwards.
+ * Both columns are nullable, so absence stays absence.
+ */
+function withDeferred(
+  records: NormalizedDesignation[],
+  state: HarvestState,
+): NormalizedDesignation[] {
+  return records.map((record) => {
+    const fields = state.deferredFields.get(record.sourceEntryId);
+    return {
+      ...record,
+      ...(fields?.program ? { program: fields.program } : {}),
+      ...(fields?.designationDate ? { designationDate: fields.designationDate } : {}),
+    };
+  });
+}
+
+describe('sanctions streaming ingest — equivalence with the buffered parsers', () => {
+  it('OFAC advanced: streamed records match, once the deferred programme join lands', async () => {
+    const rejections = createRejections();
+    const oracle = parseOfac(parseXml(MULTI_OFAC_ADVANCED_XML), 'ofac_sdn', rejections);
+    expect(oracle.map((d) => d.sourceEntryId)).toEqual(['2674', '4238']);
+    expect(oracle[0]?.program).toBe('SDGT, SDT');
+    // The second entry for profile 2674 publishes only a date, so it overrides
+    // the date and leaves the earlier programme in place.
+    expect(oracle[0]?.designationDate).toBe('2001-09-11');
+    expect(rejections).toEqual({ missingIdentifier: 1, unusableName: 1 });
+
+    for (const size of CHUNK_SIZES) {
+      const { records, state } = await streamAll(
+        (chunks, s) => streamOfacFromText(chunks, 'ofac_sdn', s),
+        MULTI_OFAC_ADVANCED_XML,
+        size,
+      );
+      expect(withDeferred(records, state), `chunk size ${size}`).toEqual(oracle);
+      expect(state.rejections, `chunk size ${size}`).toEqual(rejections);
+      // The orphan programme entry is carried, and patches nothing downstream.
+      expect(state.deferredFields.get('99999')).toEqual({ program: 'ORPHAN' });
+    }
+  });
+
+  it('OFAC standard: streamed records match the buffered parse', async () => {
+    const rejections = createRejections();
+    const oracle = parseOfac(parseXml(MULTI_OFAC_STANDARD_XML), 'ofac_sdn', rejections);
+    expect(oracle.map((d) => d.sourceEntryId)).toEqual(['12345', '778']);
+    expect(rejections).toEqual({ missingIdentifier: 1, unusableName: 1 });
+
+    for (const size of CHUNK_SIZES) {
+      const { records, state } = await streamAll(
+        (chunks, s) => streamOfacFromText(chunks, 'ofac_sdn', s),
+        MULTI_OFAC_STANDARD_XML,
+        size,
+      );
+      expect(records, `chunk size ${size}`).toEqual(oracle);
+      expect(state.rejections, `chunk size ${size}`).toEqual(rejections);
+      expect(state.deferredFields.size).toBe(0);
+    }
+  });
+
+  it.each([
+    ['EU', MULTI_EU_XML, parseEu, streamEuFromText, ['13', 'EU.99.9']],
+    ['UK', MULTI_UK_XML, parseUk, streamUkFromText, ['AFG0001', 'UK-GRP-2']],
+    ['UN', MULTI_UN_XML, parseUn, streamUnFromText, ['6907993', '6908100', 'UN-REF-9']],
+  ] as const)(
+    '%s: streamed records match the buffered parse across chunk boundaries',
+    async (_label, xml, parse, stream, expectedIds) => {
+      const rejections = createRejections();
+      const oracle = parse(parseXml(xml), rejections);
+      expect(oracle.map((d) => d.sourceEntryId)).toEqual(expectedIds);
+      expect(rejections.missingIdentifier + rejections.unusableName).toBeGreaterThan(0);
+
+      for (const size of CHUNK_SIZES) {
+        const { records, state } = await streamAll(stream, xml, size);
+        expect(records, `chunk size ${size}`).toEqual(oracle);
+        expect(state.rejections, `chunk size ${size}`).toEqual(rejections);
+      }
+    },
+  );
+});
+
+describe('sanctions streaming ingest — document boundaries', () => {
+  it.each([
+    ['EU', streamEuFromText, '<export></export>'],
+    [
+      'UK',
+      streamUkFromText,
+      '<Designations><DateGenerated>10/06/2026</DateGenerated></Designations>',
+    ],
+    ['UN', streamUnFromText, '<CONSOLIDATED_LIST><INDIVIDUALS/><ENTITIES/></CONSOLIDATED_LIST>'],
+  ] as const)('%s: an empty document yields nothing', async (_label, stream, xml) => {
+    for (const size of [1, 4, 1_000_000]) {
+      expect((await streamAll(stream, xml, size)).records).toHaveLength(0);
+    }
+  });
+
+  it('an empty OFAC document yields nothing and defers nothing', async () => {
+    const { records, state } = await streamAll(
+      (chunks, s) => streamOfacFromText(chunks, 'ofac_sdn', s),
+      '<Sanctions><ReferenceValueSets/><DistinctParties/><SanctionsEntries/></Sanctions>',
+      4,
+    );
+    expect(records).toHaveLength(0);
+    expect(state.deferredFields.size).toBe(0);
+    expect(state.rejections).toEqual({ missingIdentifier: 0, unusableName: 0 });
+  });
+
+  it('a single record with no siblings is emitted whole', async () => {
+    const xml =
+      '<export><sanctionEntity logicalId="solo"><subjectType code="person"/><nameAlias wholeName="Solo Person"/></sanctionEntity></export>';
+    for (const size of [1, 5, 1_000_000]) {
+      const { records } = await streamAll(streamEuFromText, xml, size);
+      expect(
+        records.map((d) => d.primaryName),
+        `chunk size ${size}`,
+      ).toEqual(['Solo Person']);
+    }
+  });
+
+  it('drops a truncated trailing record but keeps the complete ones before it', async () => {
+    const truncated = `${MULTI_EU_XML.slice(0, MULTI_EU_XML.indexOf('<sanctionEntity euReferenceNumber'))}<sanctionEntity logicalId="cut"><nameAlias wholeName="Never Clo`;
+    for (const size of [1, 9, 1_000_000]) {
+      const { records } = await streamAll(streamEuFromText, truncated, size);
+      expect(
+        records.map((d) => d.sourceEntryId),
+        `chunk size ${size}`,
+      ).toEqual(['13']);
+    }
+  });
+
+  it('drops an OFAC party whose closing tag never arrives', async () => {
+    const cut = MULTI_OFAC_ADVANCED_XML.slice(
+      0,
+      MULTI_OFAC_ADVANCED_XML.indexOf('<DistinctParty>'),
+    );
+    const { records, state } = await streamAll(
+      (chunks, s) => streamOfacFromText(chunks, 'ofac_sdn', s),
+      `${cut}<DistinctParty FixedRef="9"><Profile ID="9"`,
+      7,
+    );
+    expect(records.map((d) => d.sourceEntryId)).toEqual(['2674']);
+    // Truncation is not a rejection — the record was never seen whole.
+    expect(state.rejections).toEqual({ missingIdentifier: 0, unusableName: 0 });
+  });
+
+  it('never mistakes a container element for the record it contains', async () => {
+    // <DistinctParties>, <SanctionsEntries>, <INDIVIDUALS>, <ENTITIES>, and the
+    // <Designations> root all prefix a record name they must not match.
+    const { records } = await streamAll(streamUnFromText, MULTI_UN_XML, 3);
+    expect(records.map((d) => d.entityType)).toEqual(['person', 'organization', 'organization']);
+    const uk = await streamAll(streamUkFromText, MULTI_UK_XML, 3);
+    expect(uk.records.map((d) => d.sourceEntryId)).toEqual(['AFG0001', 'UK-GRP-2']);
   });
 });
 

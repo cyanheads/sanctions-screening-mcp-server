@@ -64,6 +64,54 @@ describe('text matcher fuzz invariants', () => {
   });
 });
 
+/** A `<DocumentedName>` body — the smallest advanced-schema name a party can carry. */
+const OFAC_NAME_PART =
+  '<DocumentedNamePart><NamePartValue>No Ref</NamePartValue></DocumentedNamePart>';
+
+/** Matches a `crypto.randomUUID()` value anywhere in a designation id. */
+const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/*
+ * One well-formed record beside a sibling with no stable source identifier, per
+ * source. The valid record must survive every parse unchanged; the sibling must
+ * never contribute a record — a minted id would differ on each harvest.
+ */
+const MIXED_OFAC_STANDARD_XML = `<sdnList>
+  <sdnEntry><uid>77</uid><firstName>Valid</firstName><lastName>Person</lastName><sdnType>Individual</sdnType></sdnEntry>
+  <sdnEntry><firstName>Missing</firstName><lastName>Identifier</lastName></sdnEntry>
+</sdnList>`;
+
+const MIXED_OFAC_ADVANCED_XML = `<Sanctions>
+  <ReferenceValueSets><AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues></ReferenceValueSets>
+  <DistinctParties>
+    <DistinctParty FixedRef="2674">
+      <Profile ID="2674"><Identity><Alias AliasTypeID="1403" Primary="true">
+        <DocumentedName><DocumentedNamePart><NamePartValue>ABBAS Abu</NamePartValue></DocumentedNamePart></DocumentedName>
+      </Alias></Identity></Profile>
+    </DistinctParty>
+    <DistinctParty>
+      <Profile><Identity><Alias AliasTypeID="1403" Primary="true">
+        <DocumentedName>${OFAC_NAME_PART}</DocumentedName>
+      </Alias></Identity></Profile>
+    </DistinctParty>
+  </DistinctParties>
+</Sanctions>`;
+
+const MIXED_EU_XML = `<export>
+  <sanctionEntity logicalId="13"><subjectType code="person"/><nameAlias wholeName="Saddam Hussein Al-Tikriti"/></sanctionEntity>
+  <sanctionEntity><subjectType code="person"/><nameAlias wholeName="Acme SA"/></sanctionEntity>
+</export>`;
+
+const MIXED_UK_XML = `<Designations>
+  <Designation><UniqueID>AFG0001</UniqueID><Names><Name><Name6>HAJI KHAIRULLAH MONEY EXCHANGE</Name6></Name></Names></Designation>
+  <Designation><Names><Name><Name6>Acme Ltd</Name6></Name></Names></Designation>
+</Designations>`;
+
+const MIXED_UN_XML = `<CONSOLIDATED_LIST><INDIVIDUALS>
+  <INDIVIDUAL><DATAID>6907993</DATAID><FIRST_NAME>ERIC</FIRST_NAME><SECOND_NAME>BADEGE</SECOND_NAME></INDIVIDUAL>
+  <INDIVIDUAL><FIRST_NAME>NO</FIRST_NAME><SECOND_NAME>ID</SECOND_NAME></INDIVIDUAL>
+</INDIVIDUALS></CONSOLIDATED_LIST>`;
+
 describe('ingest parser fuzz invariants', () => {
   it('does not turn adversarial content under unknown roots into source records', () => {
     const random = mulberry32(0x1badb002);
@@ -90,16 +138,45 @@ describe('ingest parser fuzz invariants', () => {
     expect(await collect(streamLeiLevel1FromText(chunks(truncated, 7)))).toHaveLength(0);
   });
 
-  // Correct behavior is tracked by https://github.com/cyanheads/sanctions-screening-mcp-server/issues/14
-  it.skip('rejects source-shaped records with missing IDs, names, or truncated XML', () => {
+  it('rejects source-shaped records with missing IDs, names, or truncated XML', () => {
     const invalid = [
       '<sdnList><sdnEntry><firstName>Test</firstName><lastName>Person</lastName></sdnEntry></sdnList>',
       '<sdnList><sdnEntry><uid>42</uid></sdnEntry></sdnList>',
       '<sdnList><sdnEntry><uid>1</uid><firstName>Truncated',
     ];
     for (const xml of invalid) {
-      expect(parseOfac(parseXml(xml), 'ofac_sdn')).toHaveLength(0);
+      expect(parseOfac(parseXml(xml), 'ofac_sdn'), xml).toHaveLength(0);
     }
+    // Advanced schema: a party carrying neither FixedRef nor ID.
+    expect(
+      parseOfac(
+        parseXml(
+          `<Sanctions><DistinctParties><DistinctParty><Profile><Identity><Alias Primary="true"><DocumentedName>${OFAC_NAME_PART}</DocumentedName></Alias></Identity></Profile></DistinctParty></DistinctParties></Sanctions>`,
+        ),
+        'ofac_sdn',
+      ),
+    ).toHaveLength(0);
+    expect(
+      parseEu(
+        parseXml(
+          '<export><sanctionEntity><nameAlias wholeName="Acme SA"/></sanctionEntity></export>',
+        ),
+      ),
+    ).toHaveLength(0);
+    expect(
+      parseUk(
+        parseXml(
+          '<Designations><Designation><Names><Name><Name6>Acme Ltd</Name6></Name></Names></Designation></Designations>',
+        ),
+      ),
+    ).toHaveLength(0);
+    expect(
+      parseUn(
+        parseXml(
+          '<CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL><FIRST_NAME>NO</FIRST_NAME><SECOND_NAME>ID</SECOND_NAME></INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>',
+        ),
+      ),
+    ).toHaveLength(0);
     expect(
       parseLeiLevel1(
         parseXml(
@@ -109,8 +186,33 @@ describe('ingest parser fuzz invariants', () => {
     ).toHaveLength(0);
   });
 
-  // Correct behavior is tracked by https://github.com/cyanheads/sanctions-screening-mcp-server/issues/14
-  it.skip('rejects invalid UTF-8 instead of indexing replacement-character names', async () => {
+  it('parses the same payload twice into identical records, entry ids included', () => {
+    const cases: [label: string, expectedIds: string[], parse: () => NormalizedDesignation[]][] = [
+      ['ofac standard', ['77'], () => parseOfac(parseXml(MIXED_OFAC_STANDARD_XML), 'ofac_sdn')],
+      ['ofac advanced', ['2674'], () => parseOfac(parseXml(MIXED_OFAC_ADVANCED_XML), 'ofac_sdn')],
+      ['eu', ['13'], () => parseEu(parseXml(MIXED_EU_XML))],
+      ['uk', ['AFG0001'], () => parseUk(parseXml(MIXED_UK_XML))],
+      ['un', ['6907993'], () => parseUn(parseXml(MIXED_UN_XML))],
+    ];
+    for (const [label, expectedIds, parse] of cases) {
+      const first = parse();
+      const second = parse();
+      // The malformed sibling is dropped; the valid record beside it survives.
+      expect(
+        first.map((d) => d.sourceEntryId),
+        label,
+      ).toEqual(expectedIds);
+      // A re-harvest must re-derive the same primary keys, or the mirror's
+      // upsert-only apply inserts a duplicate row instead of updating.
+      expect(second, label).toEqual(first);
+      expect(
+        first.every((d) => !UUID_PATTERN.test(d.id)),
+        label,
+      ).toBe(true);
+    }
+  });
+
+  it('rejects invalid UTF-8 instead of indexing replacement-character names', async () => {
     const prefix = new TextEncoder().encode(
       '<LEIData><LEIRecords><LEIRecord><LEI>5493001KJTIIGC8Y1R12</LEI><Entity><LegalName>',
     );
@@ -121,6 +223,17 @@ describe('ingest parser fuzz invariants', () => {
       yield Uint8Array.from([...prefix, 0xc3, 0x28, ...suffix]);
     }
     expect(await collect(streamLeiLevel1FromBytes(bytes()))).toHaveLength(0);
+  });
+
+  it('keeps GLEIF Level 1 output identical across repeat parses, dropping unusable records', () => {
+    const xml = `<LEIData><LEIRecords>
+      <LEIRecord><LEI>5493001KJTIIGC8Y1R12</LEI><Entity><LegalName>Fictional Trading Company LLC</LegalName></Entity></LEIRecord>
+      <LEIRecord><LEI>529900T8BM49AURSDO55</LEI><Entity/></LEIRecord>
+      <LEIRecord><Entity><LegalName>No LEI Co</LegalName></Entity></LEIRecord>
+    </LEIRecords></LEIData>`;
+    const first = parseLeiLevel1(parseXml(xml));
+    expect(first.map((e) => e.lei)).toEqual(['5493001KJTIIGC8Y1R12']);
+    expect(parseLeiLevel1(parseXml(xml))).toEqual(first);
   });
 });
 

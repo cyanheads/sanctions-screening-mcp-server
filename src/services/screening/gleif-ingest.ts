@@ -24,8 +24,14 @@ import { createGunzip, createInflateRaw, gunzipSync, inflateRawSync } from 'node
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  createRejections,
+  type IngestRejections,
+  isUsableName,
+} from '@/services/screening/ingest-validation.js';
 import type { NormalizedLeiEntity, NormalizedLeiRelationship } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
+import { decodeUtf8Stream, scanRecordFragments } from '@/services/screening/xml-stream.js';
 
 /** Bounds the buffered delta / fixture download (see {@link downloadGleifXml}). */
 const FETCH_TIMEOUT_MS = 600_000;
@@ -39,13 +45,6 @@ const FETCH_TIMEOUT_MS = 600_000;
  * timeout, so this value guards a stalled connection, not the transfer itself.
  */
 const STREAM_HEADERS_TIMEOUT_MS = 120_000;
-
-/**
- * Max characters the record scanner retains between records when no open tag is
- * buffered — enough to reassemble a record's open tag split across a chunk
- * boundary, bounded so inter-record whitespace can't grow the buffer unboundedly.
- */
-const MAX_RETAINED_TAIL = 4096;
 
 /** Which GLEIF dataset + window to fetch. */
 export type GleifFileKind = 'lei2-full' | 'lei2-delta' | 'rr-full' | 'rr-delta';
@@ -209,29 +208,45 @@ export function extractFirstZipEntry(buf: Buffer): string {
  * `<Entity>` (legal name, other names, addresses, jurisdiction, status), and a
  * `<Registration>` (registration status, last-update, RA).
  */
-export function parseLeiLevel1(doc: Record<string, unknown>): NormalizedLeiEntity[] {
+export function parseLeiLevel1(
+  doc: Record<string, unknown>,
+  rejections: IngestRejections = createRejections(),
+): NormalizedLeiEntity[] {
   const root = (doc.LEIData ?? doc) as Record<string, unknown>;
   const records = asArray((root.LEIRecords as Record<string, unknown> | undefined)?.LEIRecord);
   return records
-    .map((raw) => parseOneLei(raw as Record<string, unknown>))
+    .map((raw) => parseOneLei(raw as Record<string, unknown>, rejections))
     .filter(Boolean) as NormalizedLeiEntity[];
 }
 
-function parseOneLei(r: Record<string, unknown>): NormalizedLeiEntity | null {
+/**
+ * Normalize one `<LEIRecord>`. Null when the record publishes no LEI or no
+ * usable legal name — the mirror key and the searchable name respectively.
+ */
+function parseOneLei(
+  r: Record<string, unknown>,
+  rejections: IngestRejections,
+): NormalizedLeiEntity | null {
   const lei = asText(r.LEI);
-  if (!lei) return null;
+  if (!lei) {
+    rejections.missingIdentifier += 1;
+    return null;
+  }
   const entity = r.Entity as Record<string, unknown> | undefined;
   const registration = r.Registration as Record<string, unknown> | undefined;
 
-  const legalName =
-    asText(
-      (entity?.LegalName as Record<string, unknown> | undefined)?.['#text'] ?? entity?.LegalName,
-    ) ?? 'Unknown';
+  const legalName = asText(
+    (entity?.LegalName as Record<string, unknown> | undefined)?.['#text'] ?? entity?.LegalName,
+  );
+  if (!isUsableName(legalName)) {
+    rejections.unusableName += 1;
+    return null;
+  }
   const otherNames = asArray(
     (entity?.OtherEntityNames as Record<string, unknown> | undefined)?.OtherEntityName as unknown,
   )
     .map((n) => asText((n as Record<string, unknown>)?.['#text'] ?? n))
-    .filter((x): x is string => Boolean(x));
+    .filter(isUsableName);
 
   const legalAddr = renderAddress(entity?.LegalAddress as Record<string, unknown> | undefined);
   const hqAddr = renderAddress(entity?.HeadquartersAddress as Record<string, unknown> | undefined);
@@ -314,10 +329,11 @@ function parseOneRelationship(r: Record<string, unknown>): NormalizedLeiRelation
 export async function harvestLeiLevel1(
   url: string,
   signal: AbortSignal,
+  rejections: IngestRejections = createRejections(),
 ): Promise<NormalizedLeiEntity[]> {
   const xml = await downloadGleifXml(url, signal);
   const doc = parseXml<Record<string, unknown>>(xml);
-  return parseLeiLevel1(doc);
+  return parseLeiLevel1(doc, rejections);
 }
 
 /** Fetch + decompress + parse Level 2 from a resolved URL. */
@@ -450,66 +466,18 @@ async function* decompressGleifByteStream(
   yield* restFrom(0);
 }
 
-/** Decode a byte stream as UTF-8, honoring multi-byte characters split across
- *  chunk boundaries via the streaming `TextDecoder`. */
-async function* decodeUtf8Stream(byteChunks: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
-  const decoder = new TextDecoder('utf-8');
-  for await (const chunk of byteChunks) {
-    const text = decoder.decode(chunk, { stream: true });
-    if (text) yield text;
-  }
-  const tail = decoder.decode();
-  if (tail) yield tail;
-}
-
-/**
- * Scan a decoded-text stream for complete `<recordName>…</recordName>` fragments,
- * buffering across chunk boundaries. Matches unprefixed and namespace-prefixed
- * (`lei:` / `rr:`) tags, and never matches the plural container element
- * (`<LEIRecords>` / `<RelationshipRecords>`) — the boundary lookahead requires the
- * tag name to be followed by whitespace, `/`, or `>`.
- */
-async function* scanRecordFragments(
-  textChunks: AsyncIterable<string>,
-  recordName: 'LEIRecord' | 'RelationshipRecord',
-): AsyncGenerator<string> {
-  const openRe = new RegExp(`<((?:[A-Za-z][\\w.-]*:)?${recordName})(?=[\\s/>])`);
-  let buf = '';
-  for await (const chunk of textChunks) {
-    buf += chunk;
-    for (;;) {
-      const open = openRe.exec(buf);
-      if (!open) {
-        // No open tag yet — retain only a short tail so an open tag split across
-        // chunks still matches once the rest arrives.
-        if (buf.length > MAX_RETAINED_TAIL) buf = buf.slice(buf.length - MAX_RETAINED_TAIL);
-        break;
-      }
-      const closeTag = `</${open[1]}>`;
-      const closeIdx = buf.indexOf(closeTag, open.index + open[0].length);
-      if (closeIdx === -1) {
-        // Record not fully buffered — drop the pre-record prefix and read more.
-        buf = buf.slice(open.index);
-        break;
-      }
-      const end = closeIdx + closeTag.length;
-      yield buf.slice(open.index, end);
-      buf = buf.slice(end);
-    }
-  }
-}
-
 /** Normalize a decoded LEI-CDF text stream into Level 1 entity records. Shares
  *  {@link parseOneLei} with the buffered {@link parseLeiLevel1} path. */
 export async function* streamLeiLevel1FromText(
   textChunks: AsyncIterable<string>,
+  rejections: IngestRejections = createRejections(),
 ): AsyncGenerator<NormalizedLeiEntity> {
-  for await (const fragment of scanRecordFragments(textChunks, 'LEIRecord')) {
+  for await (const fragment of scanRecordFragments(textChunks, ['LEIRecord'])) {
     // The scanner matched the (possibly `lei:`-prefixed) tag on raw text, but
     // parseXml strips the prefix, so the parsed root key is always `LEIRecord`.
-    const doc = parseXml<Record<string, unknown>>(fragment);
+    const doc = parseXml<Record<string, unknown>>(fragment.xml);
     const record = doc.LEIRecord as Record<string, unknown> | undefined;
-    const entity = record ? parseOneLei(record) : null;
+    const entity = record ? parseOneLei(record, rejections) : null;
     if (entity) yield entity;
   }
 }
@@ -519,10 +487,10 @@ export async function* streamLeiLevel1FromText(
 export async function* streamLeiLevel2FromText(
   textChunks: AsyncIterable<string>,
 ): AsyncGenerator<NormalizedLeiRelationship> {
-  for await (const fragment of scanRecordFragments(textChunks, 'RelationshipRecord')) {
+  for await (const fragment of scanRecordFragments(textChunks, ['RelationshipRecord'])) {
     // The scanner matched the (possibly `rr:`-prefixed) tag on raw text, but
     // parseXml strips the prefix, so the parsed root key is always `RelationshipRecord`.
-    const doc = parseXml<Record<string, unknown>>(fragment);
+    const doc = parseXml<Record<string, unknown>>(fragment.xml);
     const record = doc.RelationshipRecord as Record<string, unknown> | undefined;
     const rel = record ? parseOneRelationship(record) : null;
     if (rel) yield rel;
@@ -533,8 +501,12 @@ export async function* streamLeiLevel2FromText(
  *  (ZIP/gzip/plain) byte stream. The network-free seam under {@link streamLeiLevel1}. */
 export function streamLeiLevel1FromBytes(
   byteChunks: AsyncIterable<Uint8Array>,
+  rejections: IngestRejections = createRejections(),
 ): AsyncGenerator<NormalizedLeiEntity> {
-  return streamLeiLevel1FromText(decodeUtf8Stream(decompressGleifByteStream(byteChunks)));
+  return streamLeiLevel1FromText(
+    decodeUtf8Stream(decompressGleifByteStream(byteChunks)),
+    rejections,
+  );
 }
 
 /** Decompress + decode + scan + normalize Level 2 relationships from a raw byte
@@ -550,8 +522,9 @@ export function streamLeiLevel2FromBytes(
 export async function* streamLeiLevel1(
   url: string,
   signal: AbortSignal,
+  rejections: IngestRejections = createRejections(),
 ): AsyncGenerator<NormalizedLeiEntity> {
-  yield* streamLeiLevel1FromBytes(await openGleifByteStream(url, signal));
+  yield* streamLeiLevel1FromBytes(await openGleifByteStream(url, signal), rejections);
 }
 
 /** Stream + decompress + scan + normalize Level 2 relationships from a resolved

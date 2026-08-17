@@ -13,6 +13,7 @@ import {
   resolveGleifFileUrl,
 } from '@/services/screening/gleif-ingest.js';
 import { buildSanctionsIngesters } from '@/services/screening/sanctions-ingest.js';
+import type { NormalizedDesignation } from '@/services/screening/types.js';
 
 const sourceBodies = new Map<string, string>([
   [
@@ -54,10 +55,13 @@ describe('sanctions source boundaries', () => {
 
     const ingesters = buildSanctionsIngesters();
     const harvested = await Promise.all(
-      ingesters.map(async (ingester) => ({
-        source: ingester.source,
-        records: await ingester.harvest(new AbortController().signal),
-      })),
+      ingesters.map(async (ingester) => {
+        const records: NormalizedDesignation[] = [];
+        for await (const record of ingester.harvest(new AbortController().signal)) {
+          records.push(record);
+        }
+        return { source: ingester.source, records };
+      }),
     );
 
     expect(harvested.map((result) => result.source)).toEqual([

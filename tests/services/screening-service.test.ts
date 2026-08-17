@@ -8,8 +8,10 @@
 
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { parseOfac } from '@/services/screening/sanctions-ingest.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
+import { parseXml } from '@/services/screening/xml.js';
 import { freshService, type SeededService, seededService } from './_helpers.js';
 
 let seeded: SeededService;
@@ -795,5 +797,35 @@ describe('advanceLeiFreshnessIfReady — GLEIF delta freshness (issue #5)', () =
     } finally {
       await fresh.cleanup();
     }
+  });
+});
+
+describe('re-harvest idempotence (issue #14)', () => {
+  const HARVEST_XML = `<sdnList>
+    <sdnEntry><uid>RH-1</uid><firstName>Reharvest</firstName><lastName>Person</lastName></sdnEntry>
+    <sdnEntry><firstName>Identifierless</firstName><lastName>Person</lastName></sdnEntry>
+  </sdnList>`;
+
+  it('re-ingesting the same source document updates rows instead of inserting new ones', async () => {
+    const harvest = () => parseOfac(parseXml(HARVEST_XML), 'ofac_sdn');
+
+    await svc.ingestDesignations(harvest());
+    const afterFirst = await svc.sourceCounts();
+    await svc.ingestDesignations(harvest());
+
+    expect(await svc.sourceCounts()).toEqual(afterFirst);
+  });
+
+  it('never admits a record the source gave no identifier for', async () => {
+    await svc.ingestDesignations(parseOfac(parseXml(HARVEST_XML), 'ofac_sdn'));
+
+    const admitted = await svc.screenName({ ...screenDefaults, query: 'Reharvest Person' }, ctx);
+    expect(admitted.hits.map((h) => h.sourceEntryId)).toContain('RH-1');
+
+    const rejected = await svc.screenName(
+      { ...screenDefaults, query: 'Identifierless Person', autoFallback: false },
+      ctx,
+    );
+    expect(rejected.hits).toHaveLength(0);
   });
 });
