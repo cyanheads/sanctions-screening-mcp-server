@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.9-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/sanctions-screening-mcp-server/releases/latest/download/sanctions-screening-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=sanctions-screening-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvc2FuY3Rpb25zLXNjcmVlbmluZy1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22sanctions-screening-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Fsanctions-screening-mcp-server%22%5D%7D)
 
@@ -55,7 +55,7 @@ The 80% entry point — "is this entity on a watchlist?"
 - Alias-aware: matches against every published primary name, a.k.a., and f.k.a., not just the canonical name
 - Strict mode (default): exact-normalized equality, then all-tokens-present via FTS5 — handles word-order swaps and missing interior words with no fuzzy library
 - Fuzzy mode (opt-in, or automatic when strict finds nothing): adds Jaro-Winkler similarity and Double-Metaphone phonetic matching for transliteration-class misses
-- Hits labeled `exact` / `strong` / `approximate`; approximate hits carry the raw Jaro-Winkler score (0–1)
+- Hits labeled `exact` / `strong` / `approximate`; approximate hits carry the raw Jaro-Winkler score (0–1) plus `queryTokenCoverage` — how many query tokens the candidate explains, which ranks candidates that one shared exact token pins at the same score
 - Filter by entity type, source list subset, similarity floor (`min_score`), and result limit
 - Paged: `totalAvailable` and `hasMore` report matches beyond the returned page and `nextOffset` retrieves them, with `totalAvailableBasis` marking that count exact (strict) or a scanned-set floor (fuzzy)
 - On an empty result, returns guidance on how to broaden — and states explicitly that no match is **not** a clearance
@@ -78,7 +78,7 @@ The bridge from a free-text counterparty name to a stable LEI that the entity to
 
 - Resolves a company / organization name to ranked GLEIF LEI candidates
 - Optional ISO 3166-1 alpha-2 jurisdiction filter and registration-status filter (`issued` default, `lapsed`, or `any`)
-- Same strict-then-fuzzy matching model as name screening; approximate hits carry the raw Jaro-Winkler score
+- Same strict-then-fuzzy matching model as name screening; approximate hits carry the raw Jaro-Winkler score and the same `queryTokenCoverage` count
 - Matches against legal names and published other/trading names
 - Paged on the same contract as `sanctions_screen_name` — `totalAvailable`, `totalAvailableBasis`, `hasMore`, `nextOffset`
 
@@ -90,6 +90,8 @@ Who is this legal entity — plus a watchlist cross-reference in the same call.
 
 - Full GLEIF Level 1 record: legal name, other/trading names, legal and headquarters addresses, registration status, jurisdiction, registration authority and ID, last-update date
 - Cross-references the entity's legal name against all loaded watchlists (strict match only — auto-fuzzy on a generic legal name would flood the result with single-common-token false positives)
+- `screeningStatus` says whether that cross-reference actually ran: an empty hit list under `not_ready` means the sanctions mirror was unavailable, not that nothing matched
+- A screened entity carries `sanctionsScreen` — `totalAvailable`, `totalAvailableBasis`, `hasMore` — since the hit list is capped at twenty-five; re-screen the legal name with `sanctions_screen_name` for the full set
 - LEI input is regex-validated (20 chars: 18 alphanumerics + 2 check digits)
 
 ---
@@ -103,6 +105,8 @@ Beneficial-ownership screening — the cross-source workflow that single-list to
 - Returns nodes (with role and depth) and directed ownership edges with relationship type
 - `screenNodes: true` screens every entity in the graph against all watchlists — "is anyone in this ownership chain sanctioned?"
 - Per-node screen is strict-only and reports `screenedNodeCount` / `flaggedNodeCount` so a caller can see coverage at a glance
+- Reports whether the graph is the full known picture: `complete`, `truncated` (further relationships exist past the requested depth), and `missingEntityLeis` (nodes with no GLEIF Level 1 record, which carry their LEI where a legal name would be)
+- `screeningStatus` separates a completed node screen from one never requested and one the sanctions mirror could not run; each screened node carries `sanctionsScreen` — `totalAvailable`, `totalAvailableBasis`, `hasMore` — since its hit list is capped at ten
 
 ---
 
@@ -173,7 +177,8 @@ Sanctions-specific:
 
 Agent-friendly output:
 
-- Real signal, not synthetic confidence — approximate hits carry the raw Jaro-Winkler similarity (0–1); strict hits carry a `match_type` (`exact` / `strong`), never a fabricated percentage
+- Real signal, not synthetic confidence — approximate hits carry the raw Jaro-Winkler similarity (0–1) and a literal query-token coverage count, two separate measurements rather than one blended verdict; strict hits carry a `match_type` (`exact` / `strong`), never a fabricated percentage
+- Ranking a caller can account for — hits order by match type, then score, then coverage, then a stable identifier, and the coverage that broke the tie is on the hit itself
 - Provenance on every hit — source list, sanctioning program, designation date, the exact name/alias that matched, and its type (`primary` / `aka` / `fka` / `low-quality-aka`)
 - Decision-support caveat carried in every screening tool's output — a hit is a candidate to verify, an empty result is not a clearance
 - Freshness surfaced via `sanctions_list_sources` — each source's record count and the mirror's as-of timestamp, so an agent can judge staleness

@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** sanctions-screening-mcp-server
-**Version:** 0.1.8
+**Version:** 0.1.9
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.5`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -19,7 +19,7 @@ Entity screening and resolution over the world's open sanctions data plus the gl
 
 **The data path is a local mirror, not a live API.** All five sources are bulk, keyless, and clear for redistribution. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys), and a GLEIF `lei_entity` mirror with a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
 
-**Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in or auto-on-empty. Surface only real signal: `match_type` (`exact`/`strong`/`approximate`), the matched name and its type, and the raw score for approximate hits.
+**Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in or auto-on-empty. Surface only real signal: `match_type` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains. Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
 
 ---
 
