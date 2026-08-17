@@ -269,6 +269,88 @@ describe('UN parser', () => {
   });
 });
 
+describe('sanctions parser sparsity and alias quality', () => {
+  it('preserves multiple OFAC standard aliases and weak-alias provenance', () => {
+    const doc = parseXml<Record<string, unknown>>(`
+      <sdnList>
+        <sdnEntry>
+          <uid>12345</uid>
+          <firstName>Example</firstName><lastName>Person</lastName>
+          <sdnType>Individual</sdnType>
+          <akaList>
+            <aka><category>strong</category><firstName>Example</firstName><lastName>Alias</lastName></aka>
+            <aka><category>weak</category><lastName>Shortname</lastName></aka>
+          </akaList>
+          <idList><id><idType>Passport</idType><idNumber>P123</idNumber></id></idList>
+          <addressList><address><city>Test City</city><country>Testland</country></address></addressList>
+          <dateOfBirthList><dateOfBirthItem><dateOfBirth>1980-01-02</dateOfBirth></dateOfBirthItem></dateOfBirthList>
+          <nationalityList><nationality><country>Testland</country></nationality></nationalityList>
+          <unexpected><nested>ignored</nested></unexpected>
+        </sdnEntry>
+      </sdnList>
+    `);
+    const [designation] = parseOfac(doc, 'ofac_sdn');
+    expect(designation).toMatchObject({
+      sourceEntryId: '12345',
+      entityType: 'person',
+      primaryName: 'Example Person',
+    });
+    expect(designation?.payload.aliases).toEqual([
+      { name: 'Example Alias', nameType: 'aka' },
+      { name: 'Shortname', nameType: 'low-quality-aka' },
+    ]);
+    expect(designation?.payload.identifiers).toEqual([{ type: 'Passport', value: 'P123' }]);
+    expect(designation?.payload.addresses).toEqual([
+      { full: 'Test City, Testland', country: 'Testland' },
+    ]);
+    expect(designation?.payload.datesOfBirth).toEqual([{ date: '1980-01-02' }]);
+    expect(designation?.payload.nationalities).toEqual(['Testland']);
+  });
+
+  it('preserves UN high/low aliases and sparse document fields', () => {
+    const doc = parseXml<Record<string, unknown>>(`
+      <CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL>
+        <DATAID>67890</DATAID><FIRST_NAME>PUBLIC</FIRST_NAME><SECOND_NAME>EXAMPLE</SECOND_NAME>
+        <INDIVIDUAL_ALIAS><QUALITY>Good</QUALITY><ALIAS_NAME>Public Alias</ALIAS_NAME></INDIVIDUAL_ALIAS>
+        <INDIVIDUAL_ALIAS><QUALITY>Low</QUALITY><ALIAS_NAME>P. Example</ALIAS_NAME></INDIVIDUAL_ALIAS>
+        <INDIVIDUAL_DOCUMENT><TYPE_OF_DOCUMENT>Passport</TYPE_OF_DOCUMENT><NUMBER>X1</NUMBER></INDIVIDUAL_DOCUMENT>
+        <UNEXPECTED_FIELD>ignored</UNEXPECTED_FIELD>
+      </INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>
+    `);
+    const [designation] = parseUn(doc);
+    expect(designation?.payload.aliases).toEqual([
+      { name: 'Public Alias', nameType: 'aka' },
+      { name: 'P. Example', nameType: 'low-quality-aka' },
+    ]);
+    expect(designation?.payload.identifiers).toEqual([{ type: 'Passport', value: 'X1' }]);
+    expect(designation?.payload.addresses).toEqual([]);
+    expect(designation?.payload.datesOfBirth).toEqual([]);
+  });
+
+  it('drops nameless OFAC advanced, EU, UK, and UN entries', () => {
+    const ofac = parseOfac(
+      parseXml(
+        '<Sanctions><DistinctParties><DistinctParty FixedRef="1"><Profile/></DistinctParty></DistinctParties></Sanctions>',
+      ),
+      'ofac_sdn',
+    );
+    const eu = parseEu(
+      parseXml(
+        '<export><sanctionEntity logicalId="1"><subjectType code="person"/></sanctionEntity></export>',
+      ),
+    );
+    const uk = parseUk(
+      parseXml('<Designations><Designation><UniqueID>1</UniqueID></Designation></Designations>'),
+    );
+    const un = parseUn(
+      parseXml(
+        '<CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL><DATAID>1</DATAID></INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>',
+      ),
+    );
+    expect({ ofac, eu, uk, un }).toEqual({ ofac: [], eu: [], uk: [], un: [] });
+  });
+});
+
 // ─── GLEIF (element-based) ──────────────────────────────────────────────────────
 
 const LEI_L1_XML = `<?xml version="1.0" encoding="UTF-8"?>

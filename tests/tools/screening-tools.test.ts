@@ -5,6 +5,7 @@
  * @module tests/tools/screening-tools.test
  */
 
+import type { ErrorContract } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
@@ -19,9 +20,13 @@ import {
   seededGlobalService,
 } from '../services/_helpers.js';
 
-/** A mock context whose typed `ctx.fail` is wired against a tool's error contract. */
-const ctxFor = (errors?: readonly unknown[]) =>
-  createMockContext(errors ? { errors: errors as never } : {});
+/**
+ * A mock context whose typed `ctx.fail` is wired against a tool's error
+ * contract. `const E` keeps the reason union intact, so the returned context
+ * satisfies the `HandlerContext<Reason>` the handler declares.
+ */
+const ctxFor = <const E extends readonly ErrorContract[] | undefined>(errors: E) =>
+  createMockContext({ errors });
 
 describe('screening tools (seeded)', () => {
   let seeded: SeededService;
@@ -68,7 +73,10 @@ describe('screening tools (seeded)', () => {
   });
 
   it('list_sources reports counts, readiness, and licenses', async () => {
-    const result = await listSourcesTool.handler(listSourcesTool.input.parse({}), ctxFor());
+    const result = await listSourcesTool.handler(
+      listSourcesTool.input.parse({}),
+      createMockContext(),
+    );
     expect(result.sanctionsReady).toBe(true);
     expect(result.leiReady).toBe(true);
     const uk = result.sources.find((s) => s.code === 'uk');

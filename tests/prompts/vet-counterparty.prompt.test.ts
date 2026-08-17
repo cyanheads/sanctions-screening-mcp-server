@@ -8,9 +8,9 @@ import { describe, expect, it } from 'vitest';
 import { vetCounterpartyPrompt } from '@/mcp-server/prompts/definitions/vet-counterparty.prompt.js';
 
 describe('vetCounterpartyPrompt', () => {
-  it('generates a workflow message referencing the screening tools', () => {
+  it('generates a workflow message referencing the screening tools', async () => {
     const args = vetCounterpartyPrompt.args!.parse({ name: 'Acme Corp' });
-    const messages = vetCounterpartyPrompt.generate(args);
+    const messages = await vetCounterpartyPrompt.generate(args);
     const text = messages[0]!.content.type === 'text' ? messages[0]!.content.text : '';
     expect(text).toContain('Acme Corp');
     expect(text).toContain('sanctions_resolve_entity');
@@ -21,9 +21,9 @@ describe('vetCounterpartyPrompt', () => {
     expect(text).toMatch(/not a clearance/i);
   });
 
-  it('weaves the jurisdiction into the workflow when provided', () => {
+  it('weaves the jurisdiction into the workflow when provided', async () => {
     const args = vetCounterpartyPrompt.args!.parse({ name: 'Acme Corp', jurisdiction: 'US' });
-    const messages = vetCounterpartyPrompt.generate(args);
+    const messages = await vetCounterpartyPrompt.generate(args);
     const text = messages[0]!.content.type === 'text' ? messages[0]!.content.text : '';
     expect(text).toContain('US');
   });
