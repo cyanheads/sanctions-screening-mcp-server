@@ -293,6 +293,151 @@ describe('screenName — filters', () => {
   });
 });
 
+describe('screenName — offset pagination and overflow disclosure (issue #9)', () => {
+  /** Six designations sharing a name stem, so one strict screen matches all six. */
+  const pageDesignations = Array.from({ length: 6 }, (_, index) => ({
+    id: `un:PAGE-${index}`,
+    source: 'un' as const,
+    sourceEntryId: `PAGE-${index}`,
+    entityType: 'organization' as const,
+    primaryName: `Overflow Candidate ${String.fromCharCode(65 + index)}`,
+    payload: {
+      aliases: [],
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+    },
+  }));
+
+  beforeEach(async () => {
+    await svc.ingestDesignations(pageDesignations);
+  });
+
+  const screenPage = (offset: number, limit: number) =>
+    svc.screenName({ ...screenDefaults, query: 'Overflow Candidate', limit, offset }, ctx);
+
+  it('reports the pre-slice total as exact and returns only the requested page', async () => {
+    const res = await screenPage(0, 2);
+    expect(res.hits).toHaveLength(2);
+    expect(res.totalAvailable).toBe(6);
+    expect(res.totalAvailableBasis).toBe('exact');
+  });
+
+  it('walks disjoint pages that reassemble the complete set in order', async () => {
+    const pages = await Promise.all([screenPage(0, 2), screenPage(2, 2), screenPage(4, 2)]);
+    const ids = pages.flatMap((page) => page.hits.map((hit) => hit.designationId));
+    expect(ids).toEqual([
+      'un:PAGE-0',
+      'un:PAGE-1',
+      'un:PAGE-2',
+      'un:PAGE-3',
+      'un:PAGE-4',
+      'un:PAGE-5',
+    ]);
+  });
+
+  it('orders same-band ties deterministically across repeated identical queries', async () => {
+    // Every hit here is `strong`, so matchRank cannot separate them — without an
+    // explicit secondary key the order is incidental Map-insertion order and the
+    // pages above could overlap or drop rows.
+    const first = await screenPage(0, 6);
+    const second = await screenPage(0, 6);
+    expect(second.hits.map((hit) => hit.designationId)).toEqual(
+      first.hits.map((hit) => hit.designationId),
+    );
+  });
+
+  it('returns an empty page past the end while still reporting the true total', async () => {
+    const res = await screenPage(99, 2);
+    expect(res.hits).toHaveLength(0);
+    expect(res.totalAvailable).toBe(6);
+  });
+
+  it('labels a fuzzy-mode total as a bound, never an exact corpus count', async () => {
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'Ivan Volkow', matchMode: 'fuzzy' },
+      ctx,
+    );
+    expect(res.modeUsed).toBe('fuzzy');
+    expect(res.totalAvailableBasis).toBe('lower_bound');
+  });
+
+  it('reports a lower bound once the raw-row scan cap binds', async () => {
+    // The strict FTS query caps raw (pre-dedup) alias rows at 5000; above it the
+    // deduplicated designation count is a floor, not a total, and must say so.
+    await svc.ingestDesignations(
+      Array.from({ length: 5000 }, (_, index) => ({
+        id: `un:CAP-${index}`,
+        source: 'un' as const,
+        sourceEntryId: `CAP-${index}`,
+        entityType: 'organization' as const,
+        primaryName: `Capped Candidate ${index}`,
+        payload: {
+          aliases: [],
+          identifiers: [],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+        },
+      })),
+    );
+    const res = await svc.screenName({ ...screenDefaults, query: 'Capped', limit: 5 }, ctx);
+    expect(res.hits).toHaveLength(5);
+    expect(res.totalAvailableBasis).toBe('lower_bound');
+    expect(res.totalAvailable).toBeGreaterThanOrEqual(res.hits.length);
+  });
+});
+
+describe('resolveEntity — offset pagination and overflow disclosure (issue #9)', () => {
+  const pageEntities = Array.from({ length: 4 }, (_, index) => ({
+    lei: `OVERFLOWSERVICE${index}0011`,
+    legalName: `Overflow Candidate ${String.fromCharCode(65 + index)} Ltd`,
+    otherNames: [],
+    jurisdiction: 'US',
+    status: 'ISSUED',
+  }));
+
+  beforeEach(async () => {
+    await svc.ingestLeiEntities(pageEntities);
+  });
+
+  const resolvePage = (offset: number, limit: number) =>
+    svc.resolveEntity(
+      { query: 'Overflow Candidate', matchMode: 'strict', status: 'issued', limit, offset },
+      ctx,
+    );
+
+  it('reports the pre-slice total as exact and returns only the requested page', async () => {
+    const res = await resolvePage(0, 2);
+    expect(res.matches).toHaveLength(2);
+    expect(res.totalAvailable).toBe(4);
+    expect(res.totalAvailableBasis).toBe('exact');
+  });
+
+  it('walks disjoint pages that reassemble the complete set in a stable order', async () => {
+    const pages = await Promise.all([resolvePage(0, 2), resolvePage(2, 2)]);
+    const leis = pages.flatMap((page) => page.matches.map((match) => match.lei));
+    expect(leis).toEqual(pageEntities.map((entity) => entity.lei));
+    expect((await resolvePage(0, 4)).matches.map((match) => match.lei)).toEqual(leis);
+  });
+
+  it('returns an empty page past the end while still reporting the true total', async () => {
+    const res = await resolvePage(99, 2);
+    expect(res.matches).toHaveLength(0);
+    expect(res.totalAvailable).toBe(4);
+  });
+
+  it('labels a fuzzy-mode total as a bound, never an exact corpus count', async () => {
+    const res = await svc.resolveEntity(
+      { query: 'Fictionel Trading Compny', matchMode: 'fuzzy', status: 'any', limit: 10 },
+      ctx,
+    );
+    expect(res.modeUsed).toBe('fuzzy');
+    expect(res.totalAvailableBasis).toBe('lower_bound');
+  });
+});
+
 describe('getDesignation', () => {
   it('returns the full normalized record', async () => {
     const d = await svc.getDesignation('ofac_sdn', 'FX-1001');

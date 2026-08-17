@@ -73,6 +73,13 @@ export interface MirrorReadiness {
   total: number;
 }
 
+/**
+ * How to read a `totalAvailable`. `exact` is the complete matching set the query
+ * can reach; `lower_bound` means a bounded scan produced it and more matches may
+ * exist beyond what was scanned — never present a bound as a total.
+ */
+export type CountBasis = 'exact' | 'lower_bound';
+
 /** Options for {@link ScreeningService.screenName}. */
 export interface ScreenNameOptions {
   /**
@@ -91,6 +98,8 @@ export interface ScreenNameOptions {
   matchMode: MatchMode;
   /** Jaro-Winkler floor for fuzzy hits; defaults to config `fuzzyMinScore`. */
   minScore?: number;
+  /** Zero-based index of the first hit to return; defaults to 0. */
+  offset?: number;
   query: string;
   sources: SourceCode[];
 }
@@ -104,6 +113,10 @@ export interface ScreenNameResult {
   modeUsed: MatchMode;
   /** Folded query the server matched on. */
   normalizedQuery: string;
+  /** Matching designations before `limit`/`offset` — read with `totalAvailableBasis`. */
+  totalAvailable: number;
+  /** Whether {@link totalAvailable} is the complete count or a scanned-set floor. */
+  totalAvailableBasis: CountBasis;
 }
 
 /** Options for {@link ScreeningService.resolveEntity}. */
@@ -112,6 +125,8 @@ export interface ResolveEntityOptions {
   limit: number;
   matchMode: MatchMode;
   minScore?: number;
+  /** Zero-based index of the first candidate to return; defaults to 0. */
+  offset?: number;
   query: string;
   status: 'any' | 'issued' | 'lapsed';
 }
@@ -122,6 +137,10 @@ export interface ResolveEntityResult {
   matches: LeiMatch[];
   modeUsed: MatchMode;
   normalizedQuery: string;
+  /** Matching LEIs before `limit`/`offset` — read with `totalAvailableBasis`. */
+  totalAvailable: number;
+  /** Whether {@link totalAvailable} is the complete count or a scanned-set floor. */
+  totalAvailableBasis: CountBasis;
 }
 
 /** Internal row shape from the `name` join used during matching. */
@@ -171,6 +190,25 @@ interface LeiCandidateRow {
  * than a config knob.
  */
 const WHOLE_STRING_MIN_LENGTH_RATIO = 0.5;
+
+/**
+ * Cap on RAW (pre-dedup) alias rows the strict designation scan reads. A common
+ * token can match far more alias rows than designations, so the scan is bounded
+ * rather than unbounded. When the cap binds, the deduplicated designation count
+ * derived from those rows is a floor, not a total — {@link ScreeningService.runStrict}
+ * reports that so the caller can label it `lower_bound` instead of overclaiming.
+ */
+const STRICT_RAW_ROW_CAP = 5000;
+
+/** The same bound for the strict LEI scan; one row per entity, so a lower cap suffices. */
+const LEI_STRICT_RAW_ROW_CAP = 2000;
+
+/** A bounded strict scan: its ordered results plus whether the row cap bound. */
+interface BoundedScan<T> {
+  /** True when the raw scan hit its row cap, making `results` an incomplete set. */
+  capped: boolean;
+  results: T[];
+}
 
 /**
  * The screening service. Holds both mirrors and the matching engine. Initialized
@@ -493,6 +531,7 @@ export class ScreeningService {
     const normalizedQuery = fold(opts.query);
     const queryTokens = tokenize(normalizedQuery);
     const handle = await this.designationHandle();
+    const offset = opts.offset ?? 0;
 
     const sourceFilter = this.sourceFilterClause(opts.sources);
     // entityType is enum-constrained at the tool boundary; escape at the SQL sink
@@ -504,13 +543,12 @@ export class ScreeningService {
         : ` AND d.entity_type = '${this.escapeLiteral(opts.entityType)}'`;
 
     // Step 1+2: exact-normalized, then strict all-tokens-present (FTS5 AND).
-    const strictHits = this.runStrict(handle, {
+    const strict = this.runStrict(handle, {
       normalizedQuery,
-      queryTokens,
       sourceFilter,
       typeFilter,
-      limit: opts.limit,
     });
+    const strictHits = strict.results;
 
     // Explicit fuzzy always runs fuzzy; strict auto-upgrades to fuzzy on an empty
     // result ONLY when auto-fallback is enabled (the default — off for internal
@@ -523,10 +561,12 @@ export class ScreeningService {
         hitCount: strictHits.length,
       });
       return {
-        hits: strictHits.slice(0, opts.limit),
+        hits: strictHits.slice(offset, offset + opts.limit),
         modeUsed: 'strict',
         normalizedQuery,
         fuzzyFallbackTriggered: false,
+        totalAvailable: strictHits.length,
+        totalAvailableBasis: strict.capped ? 'lower_bound' : 'exact',
       };
     }
 
@@ -550,10 +590,15 @@ export class ScreeningService {
       minScore,
     });
     return {
-      hits: merged.slice(0, opts.limit),
+      hits: merged.slice(offset, offset + opts.limit),
       modeUsed: 'fuzzy',
       normalizedQuery,
       fuzzyFallbackTriggered: opts.matchMode === 'strict' && strictHits.length === 0,
+      totalAvailable: merged.length,
+      // The fuzzy pool comes from bounded blocking queries and is truncated to
+      // `fuzzyMaxResults` before the merge, so no fuzzy-mode count can be a
+      // corpus-wide total — it is always a floor on what scoring actually saw.
+      totalAvailableBasis: 'lower_bound',
     };
   }
 
@@ -569,14 +614,12 @@ export class ScreeningService {
     handle: SqliteHandle,
     args: {
       normalizedQuery: string;
-      queryTokens: string[];
       sourceFilter: string;
       typeFilter: string;
-      limit: number;
     },
-  ): ScreeningHit[] {
+  ): BoundedScan<ScreeningHit> {
     const match = buildFtsMatch(args.normalizedQuery);
-    if (!match) return [];
+    if (!match) return { results: [], capped: false };
 
     // FTS over the name index; join back to name + designation. Classify each
     // matched name as exact (normalized equality) or strong (all tokens present).
@@ -589,7 +632,7 @@ export class ScreeningService {
          JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
          JOIN designation d ON d.id = n.designation_id
          WHERE ${NAME_FTS_TABLE} MATCH ?${args.sourceFilter}${args.typeFilter}
-         LIMIT 5000`,
+         LIMIT ${STRICT_RAW_ROW_CAP}`,
       )
       .all(match);
 
@@ -603,10 +646,17 @@ export class ScreeningService {
         byDesignation.set(row.designation_id, hit);
       }
     }
-    // Exact hits first, then strong; stable within each band.
-    return [...byDesignation.values()].sort(
-      (a, b) => matchRank(b.matchType) - matchRank(a.matchType),
-    );
+    // Exact hits first, then strong; designation id breaks same-band ties. The
+    // id is the total order pagination needs — without it, tied hits fall back to
+    // incidental row-arrival/Map-insertion order and pages could overlap or drop rows.
+    return {
+      results: [...byDesignation.values()].sort(
+        (a, b) =>
+          matchRank(b.matchType) - matchRank(a.matchType) ||
+          a.designationId.localeCompare(b.designationId),
+      ),
+      capped: rows.length >= STRICT_RAW_ROW_CAP,
+    };
   }
 
   private runFuzzy(
@@ -721,7 +771,9 @@ export class ScreeningService {
       }
     }
     return [...byDesignation.values()]
-      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+      .sort(
+        (a, b) => (b.score ?? 0) - (a.score ?? 0) || a.designationId.localeCompare(b.designationId),
+      )
       .slice(0, args.cap);
   }
 
@@ -830,6 +882,7 @@ export class ScreeningService {
     const normalizedQuery = fold(opts.query);
     const queryTokens = tokenize(normalizedQuery);
     const handle = await this.leiHandle();
+    const offset = opts.offset ?? 0;
 
     const filters: string[] = [];
     if (opts.jurisdiction)
@@ -838,14 +891,17 @@ export class ScreeningService {
     else if (opts.status === 'lapsed') filters.push(`UPPER(e.status) != 'ISSUED'`);
     const filterClause = filters.length ? ` AND ${filters.join(' AND ')}` : '';
 
-    const strict = this.runLeiStrict(handle, { normalizedQuery, filterClause, limit: opts.limit });
+    const strictScan = this.runLeiStrict(handle, { normalizedQuery, filterClause });
+    const strict = strictScan.results;
     const wantFuzzy = opts.matchMode === 'fuzzy' || strict.length === 0;
     if (!wantFuzzy || queryTokens.length === 0) {
       return {
-        matches: strict.slice(0, opts.limit),
+        matches: strict.slice(offset, offset + opts.limit),
         modeUsed: 'strict',
         normalizedQuery,
         fuzzyFallbackTriggered: false,
+        totalAvailable: strict.length,
+        totalAvailableBasis: strictScan.capped ? 'lower_bound' : 'exact',
       };
     }
 
@@ -865,34 +921,44 @@ export class ScreeningService {
       fuzzyCount: fuzzy.length,
     });
     return {
-      matches: merged.slice(0, opts.limit),
+      matches: merged.slice(offset, offset + opts.limit),
       modeUsed: 'fuzzy',
       normalizedQuery,
       fuzzyFallbackTriggered: opts.matchMode === 'strict' && strict.length === 0,
+      totalAvailable: merged.length,
+      // Same bound as the screening path: the fuzzy candidate pool is blocked and
+      // capped before the merge, so its count is a floor, never a corpus total.
+      totalAvailableBasis: 'lower_bound',
     };
   }
 
   private runLeiStrict(
     handle: SqliteHandle,
-    args: { normalizedQuery: string; filterClause: string; limit: number },
-  ): LeiMatch[] {
+    args: { normalizedQuery: string; filterClause: string },
+  ): BoundedScan<LeiMatch> {
     const match = buildFtsMatch(args.normalizedQuery);
-    if (!match) return [];
+    if (!match) return { results: [], capped: false };
     const rows = handle
       .prepare<LeiCandidateRow>(
         `SELECT e.lei, e.legal_name, e.normalized_name, e.other_names, e.jurisdiction, e.status
          FROM ${leiStoreSpec.table}_fts f
          JOIN ${leiStoreSpec.table} e ON e.rowid = f.rowid
          WHERE ${leiStoreSpec.table}_fts MATCH ?${args.filterClause}
-         LIMIT 2000`,
+         LIMIT ${LEI_STRICT_RAW_ROW_CAP}`,
       )
       .all(match);
-    return rows
-      .map((row) => {
-        const isExact = row.normalized_name === args.normalizedQuery;
-        return this.leiRowToMatch(row, isExact ? 'exact' : 'strong', row.legal_name);
-      })
-      .sort((a, b) => matchRank(b.matchType) - matchRank(a.matchType));
+    return {
+      // LEI breaks same-band ties — the total order offset pagination requires.
+      results: rows
+        .map((row) => {
+          const isExact = row.normalized_name === args.normalizedQuery;
+          return this.leiRowToMatch(row, isExact ? 'exact' : 'strong', row.legal_name);
+        })
+        .sort(
+          (a, b) => matchRank(b.matchType) - matchRank(a.matchType) || a.lei.localeCompare(b.lei),
+        ),
+      capped: rows.length >= LEI_STRICT_RAW_ROW_CAP,
+    };
   }
 
   private runLeiFuzzy(
@@ -969,7 +1035,9 @@ export class ScreeningService {
         scored.push(m);
       }
     }
-    return scored.sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, args.cap);
+    return scored
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || a.lei.localeCompare(b.lei))
+      .slice(0, args.cap);
   }
 
   private leiRowToMatch(

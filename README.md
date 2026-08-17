@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/sanctions-screening-mcp-server/releases/latest/download/sanctions-screening-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=sanctions-screening-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvc2FuY3Rpb25zLXNjcmVlbmluZy1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22sanctions-screening-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Fsanctions-screening-mcp-server%22%5D%7D)
 
@@ -57,6 +57,7 @@ The 80% entry point — "is this entity on a watchlist?"
 - Fuzzy mode (opt-in, or automatic when strict finds nothing): adds Jaro-Winkler similarity and Double-Metaphone phonetic matching for transliteration-class misses
 - Hits labeled `exact` / `strong` / `approximate`; approximate hits carry the raw Jaro-Winkler score (0–1)
 - Filter by entity type, source list subset, similarity floor (`min_score`), and result limit
+- Paged: `totalAvailable` and `hasMore` report matches beyond the returned page and `nextOffset` retrieves them, with `totalAvailableBasis` marking that count exact (strict) or a scanned-set floor (fuzzy)
 - On an empty result, returns guidance on how to broaden — and states explicitly that no match is **not** a clearance
 
 ---
@@ -79,6 +80,7 @@ The bridge from a free-text counterparty name to a stable LEI that the entity to
 - Optional ISO 3166-1 alpha-2 jurisdiction filter and registration-status filter (`issued` default, `lapsed`, or `any`)
 - Same strict-then-fuzzy matching model as name screening; approximate hits carry the raw Jaro-Winkler score
 - Matches against legal names and published other/trading names
+- Paged on the same contract as `sanctions_screen_name` — `totalAvailable`, `totalAvailableBasis`, `hasMore`, `nextOffset`
 
 ---
 

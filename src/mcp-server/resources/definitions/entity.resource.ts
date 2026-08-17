@@ -29,10 +29,24 @@ export const entityResource = resource('sanctions://entity/{lei}', {
       recovery:
         'Resolve the entity name with sanctions_resolve_entity to obtain a valid LEI first.',
     },
+    {
+      reason: 'mirror_not_ready',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The GLEIF (LEI) mirror has never completed an initial sync.',
+      retryable: true,
+      recovery: 'Run the mirror:init lifecycle script to load the GLEIF golden copy, then retry.',
+    },
   ],
 
   async handler(params, ctx) {
     const svc = getScreeningService();
+    // Readiness first, mirroring sanctions_get_entity, and gated on the GLEIF
+    // mirror alone — the two mirrors sync independently.
+    if (!(await svc.leiReady())) {
+      throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.', {
+        ...ctx.recoveryFor('mirror_not_ready'),
+      });
+    }
     const entity = await svc.getLeiEntity(params.lei);
     if (!entity) {
       throw ctx.fail('lei_not_found', `No GLEIF entity with LEI "${params.lei}".`, {

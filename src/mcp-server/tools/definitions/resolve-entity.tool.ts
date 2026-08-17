@@ -14,7 +14,7 @@ import { getScreeningService } from '@/services/screening/screening-service.js';
 export const resolveEntityTool = tool('sanctions_resolve_entity', {
   title: 'sanctions-screening-mcp-server: resolve entity',
   description:
-    'Resolve a company or organization name (with an optional ISO 3166-1 alpha-2 jurisdiction) to candidate GLEIF Legal Entity Identifiers (LEIs), ranked. This turns a free-text counterparty name into a stable global identifier that sanctions_get_entity and sanctions_trace_ownership key off. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler scoring labeled approximate with a raw 0–1 score. Returns potential matches to confirm against the GLEIF record — name resolution is a candidate ranking, not an authoritative identification.',
+    'Resolve a company or organization name (with an optional ISO 3166-1 alpha-2 jurisdiction) to candidate GLEIF Legal Entity Identifiers (LEIs), ranked. This turns a free-text counterparty name into a stable global identifier that sanctions_get_entity and sanctions_trace_ownership key off. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler scoring labeled approximate with a raw 0–1 score. Results are paged: totalAvailable and hasMore report candidates beyond the returned page, and nextOffset retrieves them. Returns potential matches to confirm against the GLEIF record — name resolution is a candidate ranking, not an authoritative identification.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z.string().min(1).describe('The company / organization name to resolve to an LEI.'),
@@ -54,7 +54,15 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       .min(1)
       .max(50)
       .default(10)
-      .describe('Maximum LEI candidates to return.'),
+      .describe('Maximum LEI candidates to return in one page.'),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Zero-based index of the first LEI candidate to return. Re-call with the returned nextOffset to page through every candidate when hasMore is true; an offset past the end returns an empty page, not an error.',
+      ),
   }),
   output: z.object({
     matches: z
@@ -92,8 +100,28 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     matchModeUsed: z
       .string()
       .describe('The match mode actually applied (strict may upgrade to fuzzy).'),
-    totalCount: z.number().describe('Number of LEI candidates returned.'),
-    notice: z.string().optional().describe('Guidance when no LEI matched and how to broaden.'),
+    totalCount: z.number().describe('Number of LEI candidates returned in this page.'),
+    totalAvailable: z
+      .number()
+      .describe('LEI candidates available across all pages, before limit and offset were applied.'),
+    totalAvailableBasis: z
+      .enum(['exact', 'lower_bound'])
+      .describe(
+        'How to read totalAvailable: exact = the complete strict candidate set; lower_bound = a bounded scan produced it (every fuzzy pass, and any strict pass that hit the raw-row scan cap), so more may exist.',
+      ),
+    hasMore: z
+      .boolean()
+      .describe('True when LEI candidates remain beyond this page — re-call with nextOffset.'),
+    nextOffset: z
+      .number()
+      .optional()
+      .describe('The offset to request next. Present only when hasMore is true.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance when no LEI matched and how to broaden, or when the requested offset sits past the end of the result set.',
+      ),
   },
   errors: [
     {
@@ -123,16 +151,31 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
         status: input.status,
         ...(input.minScore !== undefined ? { minScore: input.minScore } : {}),
         limit: input.limit,
+        offset: input.offset,
       },
       ctx,
     );
 
-    ctx.enrich({ normalizedQuery: result.normalizedQuery, matchModeUsed: result.modeUsed });
+    const hasMore = input.offset + result.matches.length < result.totalAvailable;
+    ctx.enrich({
+      normalizedQuery: result.normalizedQuery,
+      matchModeUsed: result.modeUsed,
+      totalAvailable: result.totalAvailable,
+      totalAvailableBasis: result.totalAvailableBasis,
+      hasMore,
+      ...(hasMore ? { nextOffset: input.offset + result.matches.length } : {}),
+    });
     ctx.enrich.total(result.matches.length);
-    if (result.matches.length === 0) {
+    // An empty page has two very different causes; conflating them would either
+    // hide an out-of-range offset or read a paging artifact as "no LEI exists".
+    if (result.totalAvailable === 0) {
       ctx.enrich.notice(
         `No LEI candidate for "${input.name}"${jurisdiction ? ` in ${jurisdiction}` : ''} (mode: ${result.modeUsed}). ` +
           'Try matchMode:"fuzzy", drop the jurisdiction/status filter, or set status:"any" — an unmatched name is not proof the entity has no LEI.',
+      );
+    } else if (result.matches.length === 0) {
+      ctx.enrich.notice(
+        `Offset ${input.offset} is past the end of this result set — ${result.totalAvailable} LEI candidate(s) are available. Re-request from offset 0 and page forward with nextOffset.`,
       );
     }
 

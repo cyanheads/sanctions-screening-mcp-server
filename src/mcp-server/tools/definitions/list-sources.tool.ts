@@ -8,20 +8,15 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { DEFAULT_SOURCE_URLS, getServerConfig } from '@/config/server-config.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
-
-const LICENSES: Record<SourceCode, string> = {
-  ofac_sdn: 'US Government public domain',
-  ofac_consolidated: 'US Government public domain',
-  eu: 'EU consolidated list — freely redistributable',
-  uk: 'Open Government Licence v3.0 (attribution required)',
-  un: 'Freely redistributable',
-};
-
-/** GLEIF golden copy is CC0 — cited but no attribution required. */
-const GLEIF_LICENSE = 'CC0 1.0 Universal (public domain)';
+import {
+  GLEIF_LICENSE,
+  GLEIF_SOURCE_LABEL,
+  gleifSourceUrl,
+  SOURCE_LICENSES,
+  sourceUrls,
+} from './_shared.js';
 
 export const listSourcesTool = tool('sanctions_list_sources', {
   title: 'sanctions-screening-mcp-server: list sources',
@@ -61,33 +56,25 @@ export const listSourcesTool = tool('sanctions_list_sources', {
 
   async handler(_input, ctx) {
     const svc = getScreeningService();
-    const cfg = getServerConfig();
     const [counts, sanctions, lei] = await Promise.all([
       svc.sourceCounts(),
       svc.sanctionsReadiness(),
       svc.leiReadiness(),
     ]);
 
-    const urlFor: Record<SourceCode, string> = {
-      ofac_sdn: cfg.ofacSdnUrl,
-      ofac_consolidated: cfg.ofacConsolidatedUrl,
-      eu: cfg.euFsfUrl,
-      uk: cfg.ukSanctionsUrl,
-      un: cfg.unScUrl,
-    };
-
+    const urlFor = sourceUrls();
     const sources = counts.map((s) => ({
       code: s.code,
       label: SOURCE_LABELS[s.code as SourceCode],
       recordCount: s.recordCount,
       url: urlFor[s.code as SourceCode],
-      license: LICENSES[s.code as SourceCode],
+      license: SOURCE_LICENSES[s.code as SourceCode],
     }));
     sources.push({
       code: 'gleif',
-      label: 'GLEIF LEI (Level 1 entities + Level 2 ownership)',
+      label: GLEIF_SOURCE_LABEL,
       recordCount: lei.entityCount,
-      url: `${cfg.gleifGoldenCopyBaseUrl.replace(/\/$/, '')} (golden copy) — default ${DEFAULT_SOURCE_URLS.gleifGoldenCopyBase}`,
+      url: gleifSourceUrl(),
       license: GLEIF_LICENSE,
     });
 

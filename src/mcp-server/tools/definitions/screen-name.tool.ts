@@ -56,7 +56,7 @@ const HitSchema = z
 export const screenNameTool = tool('sanctions_screen_name', {
   title: 'sanctions-screening-mcp-server: screen name',
   description:
-    'Screen a name (person, company, vessel, aircraft) against all loaded sanctions watchlists at once — OFAC SDN + Consolidated, EU, UK, and UN — alias- and fuzzy-aware. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."',
+    'Screen a name (person, company, vessel, aircraft) against all loaded sanctions watchlists at once — OFAC SDN + Consolidated, EU, UK, and UN — alias- and fuzzy-aware. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z
@@ -91,7 +91,15 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .min(1)
       .max(100)
       .default(25)
-      .describe('Maximum number of potential matches to return.'),
+      .describe('Maximum number of potential matches to return in one page.'),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Zero-based index of the first potential match to return. Re-call with the returned nextOffset to page through every match when hasMore is true; an offset past the end returns an empty page, not an error.',
+      ),
   }),
   output: z.object({
     hits: z.array(HitSchema).describe('Scored potential matches, highest-confidence first.'),
@@ -106,12 +114,29 @@ export const screenNameTool = tool('sanctions_screen_name', {
     matchModeUsed: z
       .string()
       .describe('The match mode actually applied (strict may auto-upgrade to fuzzy on empty).'),
-    totalCount: z.number().describe('Number of potential matches returned.'),
+    totalCount: z.number().describe('Number of potential matches returned in this page.'),
+    totalAvailable: z
+      .number()
+      .describe(
+        'Potential matches available across all pages, before limit and offset were applied.',
+      ),
+    totalAvailableBasis: z
+      .enum(['exact', 'lower_bound'])
+      .describe(
+        'How to read totalAvailable: exact = the complete strict match set; lower_bound = a bounded scan produced it (every fuzzy pass, and any strict pass that hit the raw-row scan cap), so more may exist.',
+      ),
+    hasMore: z
+      .boolean()
+      .describe('True when potential matches remain beyond this page — re-call with nextOffset.'),
+    nextOffset: z
+      .number()
+      .optional()
+      .describe('The offset to request next. Present only when hasMore is true.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no candidate matched — how to broaden, and what an empty result does NOT mean.',
+        'Guidance when no candidate matched — how to broaden, and what an empty result does NOT mean — or when the requested offset sits past the end of the result set.',
       ),
   },
   errors: [
@@ -142,17 +167,32 @@ export const screenNameTool = tool('sanctions_screen_name', {
         ...(input.minScore !== undefined ? { minScore: input.minScore } : {}),
         sources,
         limit: input.limit,
+        offset: input.offset,
       },
       ctx,
     );
 
-    ctx.enrich({ normalizedQuery: result.normalizedQuery, matchModeUsed: result.modeUsed });
+    const hasMore = input.offset + result.hits.length < result.totalAvailable;
+    ctx.enrich({
+      normalizedQuery: result.normalizedQuery,
+      matchModeUsed: result.modeUsed,
+      totalAvailable: result.totalAvailable,
+      totalAvailableBasis: result.totalAvailableBasis,
+      hasMore,
+      ...(hasMore ? { nextOffset: input.offset + result.hits.length } : {}),
+    });
     ctx.enrich.total(result.hits.length);
-    if (result.hits.length === 0) {
+    // An empty page has two very different causes; conflating them would either
+    // hide an out-of-range offset or read a paging artifact as "nothing is listed".
+    if (result.totalAvailable === 0) {
       ctx.enrich.notice(
         `No potential match for "${input.name}" across the selected lists (mode: ${result.modeUsed}). ` +
           'This is NOT a clearance — the entity may be listed under a name variant the mirror does not index, ' +
           'or under a transliteration. Try matchMode:"fuzzy", a broader name, or verify directly against the official source.',
+      );
+    } else if (result.hits.length === 0) {
+      ctx.enrich.notice(
+        `Offset ${input.offset} is past the end of this result set — ${result.totalAvailable} potential match(es) are available. Re-request from offset 0 and page forward with nextOffset.`,
       );
     }
 

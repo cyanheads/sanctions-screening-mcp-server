@@ -1,12 +1,19 @@
 /**
  * @fileoverview `sanctions://sources` — read-only mirror of
- * sanctions_list_sources: loaded lists + GLEIF datasets with counts and refresh
- * timestamps. A small fixed list; no pagination.
+ * sanctions_list_sources: loaded lists + GLEIF datasets with counts, upstream
+ * URL, license, and refresh timestamps. A small fixed list; no pagination.
  * @module mcp-server/resources/definitions/sources.resource
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  GLEIF_LICENSE,
+  GLEIF_SOURCE_LABEL,
+  gleifSourceUrl,
+  SOURCE_LICENSES,
+  sourceUrls,
+} from '@/mcp-server/tools/definitions/_shared.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
 
@@ -26,6 +33,10 @@ export const sourcesResource = resource('sanctions://sources', {
       svc.sanctionsReadiness(),
       svc.leiReadiness(),
     ]);
+    // Provenance (url + license) comes from the same shared table
+    // sanctions_list_sources reads, so the mirror cannot drop fields the tool
+    // reports — the resource claims to mirror the tool, so it must carry its data.
+    const urlFor = sourceUrls();
     return {
       sanctionsReady: sanctions.ready,
       sanctionsAsOf: sanctions.completedAt,
@@ -36,12 +47,16 @@ export const sourcesResource = resource('sanctions://sources', {
           code: s.code,
           label: SOURCE_LABELS[s.code as SourceCode],
           recordCount: s.recordCount,
+          url: urlFor[s.code as SourceCode],
+          license: SOURCE_LICENSES[s.code as SourceCode],
         })),
         {
           code: 'gleif',
-          label: 'GLEIF LEI (Level 1 entities + Level 2 ownership)',
+          label: GLEIF_SOURCE_LABEL,
           recordCount: lei.entityCount,
           relationshipCount: lei.relationshipCount,
+          url: gleifSourceUrl(),
+          license: GLEIF_LICENSE,
         },
       ],
       gleifBaseUrl: cfg.gleifGoldenCopyBaseUrl,

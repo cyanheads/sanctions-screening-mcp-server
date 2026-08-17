@@ -31,10 +31,24 @@ export const designationResource = resource('sanctions://designation/{source}/{e
       when: 'No designation exists for the given source + entry ID in the mirror.',
       recovery: 'Use sanctions_screen_name to discover valid source/entryId pairs first.',
     },
+    {
+      reason: 'mirror_not_ready',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The sanctions mirror has never completed an initial sync.',
+      retryable: true,
+      recovery: 'Run the mirror:init lifecycle script to load the sanctions lists, then retry.',
+    },
   ],
 
   async handler(params, ctx) {
     const svc = getScreeningService();
+    // Readiness first, mirroring sanctions_get_designation: without this gate an
+    // unsynced corpus reports a valid entry as absent rather than as unavailable.
+    if (!(await svc.sanctionsReady())) {
+      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.', {
+        ...ctx.recoveryFor('mirror_not_ready'),
+      });
+    }
     const d = await svc.getDesignation(params.source as SourceCode, params.entryId);
     if (!d) {
       throw ctx.fail(
