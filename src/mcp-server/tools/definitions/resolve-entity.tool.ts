@@ -14,7 +14,7 @@ import { getScreeningService } from '@/services/screening/screening-service.js';
 export const resolveEntityTool = tool('sanctions_resolve_entity', {
   title: 'sanctions-screening-mcp-server: resolve entity',
   description:
-    'Resolve a company or organization name (with an optional ISO 3166-1 alpha-2 jurisdiction) to candidate GLEIF Legal Entity Identifiers (LEIs), ranked. This turns a free-text counterparty name into a stable global identifier that sanctions_get_entity and sanctions_trace_ownership key off. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler scoring labeled approximate with a raw 0–1 score. Results are paged: totalAvailable and hasMore report candidates beyond the returned page, and nextOffset retrieves them. Returns potential matches to confirm against the GLEIF record — name resolution is a candidate ranking, not an authoritative identification.',
+    'Resolve a company or organization name (with an optional ISO 3166-1 alpha-2 jurisdiction) to candidate GLEIF Legal Entity Identifiers (LEIs), ranked. This turns a free-text counterparty name into a stable global identifier that sanctions_get_entity and sanctions_trace_ownership key off. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler scoring labeled approximate with a raw 0–1 score plus the count of query tokens the matched name covers, which orders candidates that tie on score. Results are paged: totalAvailable and hasMore report candidates beyond the returned page, and nextOffset retrieves them. Returns potential matches to confirm against the GLEIF record — name resolution is a candidate ranking, not an authoritative identification.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z.string().min(1).describe('The company / organization name to resolve to an LEI.'),
@@ -85,6 +85,20 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
               .describe(
                 'Raw Jaro-Winkler similarity (0–1) for approximate hits only — a real measurement.',
               ),
+            queryTokenCoverage: z
+              .object({
+                covered: z
+                  .number()
+                  .int()
+                  .describe(
+                    "Query tokens individually matched by one of the matched name's tokens at the applied score floor.",
+                  ),
+                total: z.number().int().describe('Total tokens in the normalized query.'),
+              })
+              .optional()
+              .describe(
+                'How much of the query the matched name explains, as a literal token count — a second real measurement, never folded into score. It is the tie-break applied after score, because one shared exact token pins several candidates at the same score. Absent for exact/strong matches.',
+              ),
             jurisdiction: z
               .string()
               .optional()
@@ -93,7 +107,9 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
           })
           .describe('One LEI candidate — confirm against the GLEIF record before relying on it.'),
       )
-      .describe('Ranked LEI candidates, highest-confidence first.'),
+      .describe(
+        'LEI candidates, ranked by match type, then score, then how much of the query each matched name explains.',
+      ),
   }),
   enrichment: {
     normalizedQuery: z.string().describe('The name as the server folded it for matching.'),
@@ -186,6 +202,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
         matchedName: m.matchedName,
         matchType: m.matchType,
         ...(m.score !== undefined ? { score: m.score } : {}),
+        ...(m.queryTokenCoverage ? { queryTokenCoverage: m.queryTokenCoverage } : {}),
         ...(m.jurisdiction ? { jurisdiction: m.jurisdiction } : {}),
         ...(m.status ? { status: m.status } : {}),
       })),
@@ -197,7 +214,9 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     const lines = [`**${r.matches.length} LEI candidate(s)** — confirm before relying on:\n`];
     for (const m of r.matches) {
       const scoreStr = m.score !== undefined ? ` · score ${m.score.toFixed(3)}` : '';
-      lines.push(`### ${m.legalName} — ${m.matchType}${scoreStr}`);
+      const cov = m.queryTokenCoverage;
+      const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
+      lines.push(`### ${m.legalName} — ${m.matchType}${scoreStr}${coverStr}`);
       lines.push(`**LEI:** \`${m.lei}\``);
       lines.push(`**Matched on:** "${m.matchedName}"`);
       const meta = [

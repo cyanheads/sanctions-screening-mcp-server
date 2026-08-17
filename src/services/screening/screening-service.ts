@@ -51,6 +51,7 @@ import type {
   NormalizedDesignation,
   NormalizedLeiEntity,
   NormalizedLeiRelationship,
+  QueryTokenCoverage,
   ScreeningHit,
   SourceCode,
 } from '@/services/screening/types.js';
@@ -744,13 +745,16 @@ export class ScreeningService {
       const candidateTokens = tokenize(row.normalized);
       const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
       const wholeScore = jaroWinkler(args.normalizedQuery, row.normalized);
+      // Coverage is computed for every candidate, not just the ones the token arm
+      // gates: it is BOTH an admission input and the surfaced ranking key.
+      const covered = tokenCoverage(args.queryTokens, candidateTokens, args.minScore);
 
       if (
         this.admitFuzzy(
           args.normalizedQuery,
           row.normalized,
-          args.queryTokens,
-          candidateTokens,
+          args.queryTokens.length,
+          covered,
           wholeScore,
           tokenScore,
           args.minScore,
@@ -758,22 +762,23 @@ export class ScreeningService {
       ) {
         const hit = this.rowToHit(row, 'approximate');
         hit.score = Number(Math.max(tokenScore, wholeScore).toFixed(4));
+        hit.queryTokenCoverage = { covered, total: args.queryTokens.length };
         scored.push(hit);
       }
     }
 
-    // Best score per designation, then sort by score desc, cap.
+    // Best alias per designation, then rank, cap. Two aliases of one designation
+    // can tie on score, so coverage picks the one that explains the most of the
+    // query — the surfaced matchedName/score/coverage then describe one alias.
     const byDesignation = new Map<string, ScreeningHit>();
     for (const hit of scored) {
       const existing = byDesignation.get(hit.designationId);
-      if (!existing || (hit.score ?? 0) > (existing.score ?? 0)) {
+      if (!existing || compareFuzzyRank(hit, existing) < 0) {
         byDesignation.set(hit.designationId, hit);
       }
     }
     return [...byDesignation.values()]
-      .sort(
-        (a, b) => (b.score ?? 0) - (a.score ?? 0) || a.designationId.localeCompare(b.designationId),
-      )
+      .sort((a, b) => compareFuzzyRank(a, b) || a.designationId.localeCompare(b.designationId))
       .slice(0, args.cap);
   }
 
@@ -798,8 +803,8 @@ export class ScreeningService {
    *    — so the guard drops the false positive while preserving that recall. OR
    *
    *  - TOKEN-PAIR + coverage arm (issue #4): the best token pair clears `minScore` AND
-   *    at least half the query tokens each individually clear it (coverage) — so one
-   *    strong token pair can't carry an otherwise-unrelated multi-token query.
+   *    at least half the query tokens each individually clear it (`coveredTokens`) —
+   *    so one strong token pair can't carry an otherwise-unrelated multi-token query.
    *
    * A candidate that fails the whole-string arm's length guard still admits through
    * the token arm when it genuinely covers the query. By construction the length
@@ -807,12 +812,16 @@ export class ScreeningService {
    * diverge sharply, and the coverage arm only tightens queries of three or more
    * tokens (a one- or two-token query with a passing token score already has half-
    * or-more coverage, so the `minScore` floor alone governs, exactly as before).
+   *
+   * Every measurement arrives precomputed — the callers need `coveredTokens` for
+   * ranking regardless (see {@link compareFuzzyRank}), so computing it once at the
+   * call site keeps this a pure predicate over the candidate's measurements.
    */
   private admitFuzzy(
     normalizedQuery: string,
     candidateNormalized: string,
-    queryTokens: string[],
-    candidateTokens: string[],
+    queryTokenCount: number,
+    coveredTokens: number,
     wholeScore: number,
     tokenScore: number,
     minScore: number,
@@ -824,8 +833,7 @@ export class ScreeningService {
       return true;
     }
     if (tokenScore < minScore) return false;
-    const covered = tokenCoverage(queryTokens, candidateTokens, minScore);
-    return covered * 2 >= queryTokens.length;
+    return coveredTokens * 2 >= queryTokenCount;
   }
 
   private mergeHits(strict: ScreeningHit[], fuzzy: ScreeningHit[]): ScreeningHit[] {
@@ -1000,21 +1008,24 @@ export class ScreeningService {
       // eligible only when it explains enough of the query (the whole string clears
       // the floor, or at least half the query tokens do), so one strong token pair
       // can't carry an unrelated multi-token query on a short legal/trading name.
-      // The surfaced score stays the raw Jaro-Winkler max of the best ELIGIBLE name.
+      // The surfaced score stays the raw Jaro-Winkler max of the best ELIGIBLE name;
+      // coverage is that same name's, so matchedName/score/coverage stay consistent.
       let best = 0;
       let bestName = row.legal_name;
+      let bestCovered = 0;
       let admitted = false;
       for (const name of names) {
         const folded = fold(name);
         const candidateTokens = tokenize(folded);
         const wholeScore = jaroWinkler(args.normalizedQuery, folded);
         const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
+        const covered = tokenCoverage(args.queryTokens, candidateTokens, args.minScore);
         if (
           !this.admitFuzzy(
             args.normalizedQuery,
             folded,
-            args.queryTokens,
-            candidateTokens,
+            args.queryTokens.length,
+            covered,
             wholeScore,
             tokenScore,
             args.minScore,
@@ -1022,21 +1033,23 @@ export class ScreeningService {
         ) {
           continue;
         }
-        admitted = true;
         const s = Math.max(wholeScore, tokenScore);
-        if (s > best) {
+        if (!admitted || s > best || (s === best && covered > bestCovered)) {
           best = s;
           bestName = name;
+          bestCovered = covered;
         }
+        admitted = true;
       }
       if (admitted) {
         const m = this.leiRowToMatch(row, 'approximate', bestName);
         m.score = Number(best.toFixed(4));
+        m.queryTokenCoverage = { covered: bestCovered, total: args.queryTokens.length };
         scored.push(m);
       }
     }
     return scored
-      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || a.lei.localeCompare(b.lei))
+      .sort((a, b) => compareFuzzyRank(a, b) || a.lei.localeCompare(b.lei))
       .slice(0, args.cap);
   }
 
@@ -1169,6 +1182,33 @@ export class ScreeningService {
 /** Rank for sorting match types (exact > strong > approximate). */
 function matchRank(type: ScreeningHit['matchType']): number {
   return type === 'exact' ? 3 : type === 'strong' ? 2 : 1;
+}
+
+/**
+ * Rank two admitted fuzzy candidates: raw score descending, then query-token
+ * coverage descending. Shared by {@link ScreeningService.runFuzzy} and
+ * {@link ScreeningService.runLeiFuzzy} so both surfaces order by the same rule.
+ *
+ * The score stays the primary key AND keeps its raw Jaro-Winkler value — coverage
+ * is a separate real measurement that orders candidates, never a term blended into
+ * the score. It earns the second key because `score` is a max over a whole-string
+ * and a single best token-pair comparison, so every candidate sharing one exact
+ * query token reports 1.0 regardless of how much of the rest of the query it
+ * explains; without a second key those ties fall through to an identity key that
+ * carries no quality signal at all.
+ *
+ * Callers append that identity key (designation id / LEI) as the terminal
+ * tie-break, which is what makes the order total — the precondition offset
+ * pagination depends on.
+ */
+function compareFuzzyRank(
+  a: { queryTokenCoverage?: QueryTokenCoverage; score?: number },
+  b: { queryTokenCoverage?: QueryTokenCoverage; score?: number },
+): number {
+  return (
+    (b.score ?? 0) - (a.score ?? 0) ||
+    (b.queryTokenCoverage?.covered ?? 0) - (a.queryTokenCoverage?.covered ?? 0)
+  );
 }
 
 /**

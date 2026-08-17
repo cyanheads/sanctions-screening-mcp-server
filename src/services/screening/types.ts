@@ -141,6 +141,25 @@ export interface NormalizedLeiRelationship {
 /** Match classification, in descending confidence. */
 export type MatchType = 'exact' | 'strong' | 'approximate';
 
+/**
+ * How much of a multi-token query a candidate actually explains: a literal count
+ * of query tokens that individually clear the applied score floor against one of
+ * the candidate's tokens, alongside the query's total token count.
+ *
+ * This is a second real measurement, never a blend — `score` stays the raw
+ * Jaro-Winkler value. It exists because `score` is the max over a whole-string
+ * and a single best token-pair comparison, so any two candidates sharing one
+ * exact query token both report 1.0 no matter how much of the rest of the query
+ * they explain. Coverage separates those ties and is surfaced so a caller can
+ * account for the resulting order.
+ */
+export interface QueryTokenCoverage {
+  /** Query tokens individually matched by some candidate token, at the applied floor. */
+  covered: number;
+  /** Total tokens in the folded query. */
+  total: number;
+}
+
 /** The two screening match modes. */
 export type MatchMode = 'strict' | 'fuzzy';
 
@@ -159,6 +178,12 @@ export interface ScreeningHit {
   primaryName: string;
   program?: string;
   /**
+   * Query-token coverage for `approximate` hits — the ranking key applied after
+   * {@link ScreeningHit.score}. Omitted for exact/strong hits, which are ranked
+   * by match type.
+   */
+  queryTokenCoverage?: QueryTokenCoverage;
+  /**
    * Raw Jaro-Winkler similarity (0–1) for `approximate` hits — a real
    * measurement, never a fabricated composite. Omitted for exact/strong hits,
    * which are deterministic and not scored.
@@ -176,6 +201,11 @@ export interface LeiMatch {
   /** The name (legal or other) that matched the query. */
   matchedName: string;
   matchType: MatchType;
+  /**
+   * Query-token coverage of {@link LeiMatch.matchedName} for `approximate`
+   * matches — the ranking key applied after {@link LeiMatch.score}.
+   */
+  queryTokenCoverage?: QueryTokenCoverage;
   /** Raw Jaro-Winkler similarity for `approximate` hits only. */
   score?: number;
   status?: string;

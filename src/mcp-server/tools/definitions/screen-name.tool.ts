@@ -42,6 +42,20 @@ const HitSchema = z
       .describe(
         'Raw Jaro-Winkler similarity (0–1) for approximate hits only — a real measurement, not a confidence verdict. Absent for exact/strong hits.',
       ),
+    queryTokenCoverage: z
+      .object({
+        covered: z
+          .number()
+          .int()
+          .describe(
+            "Query tokens individually matched by one of this candidate's tokens at the applied score floor.",
+          ),
+        total: z.number().int().describe('Total tokens in the normalized query.'),
+      })
+      .optional()
+      .describe(
+        'How much of the query this candidate explains, as a literal token count — a second real measurement, never folded into score. It is the tie-break applied after score, because one shared exact token pins several candidates at the same score. Absent for exact/strong hits.',
+      ),
     program: z
       .string()
       .optional()
@@ -56,7 +70,7 @@ const HitSchema = z
 export const screenNameTool = tool('sanctions_screen_name', {
   title: 'sanctions-screening-mcp-server: screen name',
   description:
-    'Screen a name (person, company, vessel, aircraft) against all loaded sanctions watchlists at once — OFAC SDN + Consolidated, EU, UK, and UN — alias- and fuzzy-aware. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."',
+    'Screen a name (person, company, vessel, aircraft) against all loaded sanctions watchlists at once — OFAC SDN + Consolidated, EU, UK, and UN — alias- and fuzzy-aware. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z
@@ -102,7 +116,11 @@ export const screenNameTool = tool('sanctions_screen_name', {
       ),
   }),
   output: z.object({
-    hits: z.array(HitSchema).describe('Scored potential matches, highest-confidence first.'),
+    hits: z
+      .array(HitSchema)
+      .describe(
+        'Potential matches, ranked by match type, then score, then how much of the query each candidate explains.',
+      ),
     caveat: z
       .string()
       .describe(
@@ -207,6 +225,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
         matchedNameType: h.matchedNameType,
         matchType: h.matchType,
         ...(h.score !== undefined ? { score: h.score } : {}),
+        ...(h.queryTokenCoverage ? { queryTokenCoverage: h.queryTokenCoverage } : {}),
         ...(h.program ? { program: h.program } : {}),
         ...(h.designationDate ? { designationDate: h.designationDate } : {}),
       })),
@@ -224,7 +243,9 @@ export const screenNameTool = tool('sanctions_screen_name', {
       );
       for (const h of result.hits) {
         const scoreStr = h.score !== undefined ? ` · score ${h.score.toFixed(3)}` : '';
-        lines.push(`### ${h.primaryName} — ${h.matchType}${scoreStr}`);
+        const cov = h.queryTokenCoverage;
+        const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
+        lines.push(`### ${h.primaryName} — ${h.matchType}${scoreStr}${coverStr}`);
         lines.push(
           `**List:** ${h.sourceLabel} (\`${h.source}\`) | **Entry ID:** ${h.sourceEntryId} | **Type:** ${h.entityType}`,
         );

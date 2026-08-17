@@ -121,6 +121,109 @@ describe('screening tools (seeded)', () => {
   });
 });
 
+describe('query-token coverage on both client surfaces (issue #15)', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  it('screen_name carries coverage in structuredContent and renders it in format()', async () => {
+    const input = screenNameTool.input.parse({ name: 'Ivan Volkow', matchMode: 'fuzzy' });
+    const result = await screenNameTool.handler(input, ctxFor(screenNameTool.errors));
+    const approx = result.hits.find((h) => h.matchType === 'approximate');
+    expect(approx?.queryTokenCoverage).toEqual({ covered: 2, total: 2 });
+    expect(renderFormat(screenNameTool, result)).toContain('covers 2/2 query tokens');
+  });
+
+  it('screen_name omits coverage for an exact hit on both surfaces', async () => {
+    const input = screenNameTool.input.parse({ name: 'Ivan Testovich Volkov' });
+    const result = await screenNameTool.handler(input, ctxFor(screenNameTool.errors));
+    expect(result.hits.every((h) => h.queryTokenCoverage === undefined)).toBe(true);
+    expect(renderFormat(screenNameTool, result)).not.toContain('query tokens');
+  });
+
+  it('screen_name renders no coverage for an empty result or a page past the end', async () => {
+    const empty = await screenNameTool.handler(
+      screenNameTool.input.parse({ name: 'Zzqxwv Qqpzm Unlisted' }),
+      ctxFor(screenNameTool.errors),
+    );
+    expect(empty.hits).toHaveLength(0);
+    expect(renderFormat(screenNameTool, empty)).not.toContain('query tokens');
+
+    const pastEnd = await screenNameTool.handler(
+      screenNameTool.input.parse({ name: 'Ivan Volkow', matchMode: 'fuzzy', offset: 99 }),
+      ctxFor(screenNameTool.errors),
+    );
+    expect(pastEnd.hits).toHaveLength(0);
+    expect(renderFormat(screenNameTool, pastEnd)).not.toContain('query tokens');
+  });
+
+  it('screen_name keeps coverage on every hit of a capped page', async () => {
+    // Three designations tie at score 1.0 on the exact token "marenko" and each
+    // cover 2 of 3 query tokens, so the page cap binds with the tie still live.
+    await seeded.service.ingestDesignations(
+      ['Sorel', 'Torres', 'Vasquez'].map((surname) => ({
+        id: `un:CAP-${surname}`,
+        source: 'un' as const,
+        sourceEntryId: `CAP-${surname}`,
+        entityType: 'person' as const,
+        primaryName: `Ludvik Marenko ${surname}`,
+        payload: {
+          aliases: [],
+          identifiers: [],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+        },
+      })),
+    );
+
+    const input = screenNameTool.input.parse({
+      name: 'Ludvig Marenko Qqzz',
+      matchMode: 'fuzzy',
+      limit: 2,
+    });
+    const result = await screenNameTool.handler(input, ctxFor(screenNameTool.errors));
+    expect(result.hits).toHaveLength(2);
+    for (const hit of result.hits) {
+      expect(hit.queryTokenCoverage).toEqual({ covered: 2, total: 3 });
+    }
+    expect(renderFormat(screenNameTool, result)).toContain('covers 2/3 query tokens');
+  });
+
+  it('rejects an out-of-range minScore before the handler ever runs', () => {
+    expect(() => screenNameTool.input.parse({ name: 'Ivan Volkow', minScore: 2 })).toThrow();
+    expect(() => resolveEntityTool.input.parse({ name: 'Fictional', minScore: -1 })).toThrow();
+  });
+
+  it('resolve_entity carries coverage in structuredContent and renders it in format()', async () => {
+    const input = resolveEntityTool.input.parse({
+      name: 'Fictionel Trading Compny',
+      matchMode: 'fuzzy',
+      status: 'any',
+    });
+    const result = await resolveEntityTool.handler(input, ctxFor(resolveEntityTool.errors));
+    const approx = result.matches.find((m) => m.matchType === 'approximate');
+    expect(approx?.queryTokenCoverage?.total).toBe(3);
+    expect(approx!.queryTokenCoverage!.covered).toBeGreaterThan(0);
+    expect(approx!.queryTokenCoverage!.covered).toBeLessThanOrEqual(3);
+    expect(renderFormat(resolveEntityTool, result)).toContain(
+      `covers ${approx!.queryTokenCoverage!.covered}/3 query tokens`,
+    );
+  });
+
+  it('resolve_entity omits coverage for an exact match on both surfaces', async () => {
+    const input = resolveEntityTool.input.parse({ name: 'Fictional Trading Company LLC' });
+    const result = await resolveEntityTool.handler(input, ctxFor(resolveEntityTool.errors));
+    expect(result.matches[0]?.matchType).toBe('exact');
+    expect(result.matches[0]?.queryTokenCoverage).toBeUndefined();
+    expect(renderFormat(resolveEntityTool, result)).not.toContain('query tokens');
+  });
+});
+
 describe('screening tools (not ready)', () => {
   let empty: SeededService;
   beforeEach(async () => {

@@ -223,6 +223,173 @@ describe('screenName — minScore floor enforced uniformly (issue #1)', () => {
   });
 });
 
+describe('screenName — query-token coverage ranking (issue #15)', () => {
+  // Coverage is a literal count of query tokens the candidate explains, surfaced
+  // as its own field and used as the ranking key BETWEEN score and the terminal
+  // designation-id key. It never enters `score`, which stays raw Jaro-Winkler.
+  it('omits queryTokenCoverage on exact and strong hits', async () => {
+    const exact = await svc.screenName({ ...screenDefaults, query: 'Ivan Testovich Volkov' }, ctx);
+    const strong = await svc.screenName({ ...screenDefaults, query: 'Volkov Ivan' }, ctx);
+    for (const res of [exact, strong]) {
+      for (const hit of res.hits) {
+        expect(hit.matchType).not.toBe('approximate');
+        expect(hit.queryTokenCoverage).toBeUndefined();
+      }
+    }
+  });
+
+  it('counts coverage at the applied minScore floor, not a fixed threshold', async () => {
+    // "volkow" ~ "volkov" is 0.9556: covered at the default 0.85 floor, uncovered
+    // at 0.99. The exact "ivan" pair carries admission either way, so the same
+    // candidate surfaces with a different, honest coverage count per floor.
+    const atDefault = await svc.screenName(
+      { ...screenDefaults, query: 'Ivan Volkow', matchMode: 'fuzzy' },
+      ctx,
+    );
+    expect(atDefault.hits.find((h) => h.sourceEntryId === 'FX-1001')?.queryTokenCoverage).toEqual({
+      covered: 2,
+      total: 2,
+    });
+
+    const atHighFloor = await svc.screenName(
+      { ...screenDefaults, query: 'Ivan Volkow', matchMode: 'fuzzy', minScore: 0.99 },
+      ctx,
+    );
+    expect(atHighFloor.hits.find((h) => h.sourceEntryId === 'FX-1001')?.queryTokenCoverage).toEqual(
+      { covered: 1, total: 2 },
+    );
+  });
+
+  it('keeps the designation id as the terminal key when score and coverage tie', async () => {
+    // Offset pagination needs a total order. Coverage is inserted BETWEEN score
+    // and the id — it must not displace the id as the final tie-break.
+    await svc.ingestDesignations(
+      (['TIE-B', 'TIE-A'] as const).map((entryId, index) => ({
+        id: `un:${entryId}`,
+        source: 'un' as const,
+        sourceEntryId: entryId,
+        entityType: 'person' as const,
+        primaryName: `Rikardo Almeyda ${index === 0 ? 'Sorel' : 'Torres'}`,
+        payload: {
+          aliases: [],
+          identifiers: [],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+        },
+      })),
+    );
+
+    const res = await svc.screenName(
+      { ...screenDefaults, query: 'Rikardo Almeyda Zzqx', matchMode: 'fuzzy' },
+      ctx,
+    );
+    const a = res.hits.find((h) => h.sourceEntryId === 'TIE-A');
+    const b = res.hits.find((h) => h.sourceEntryId === 'TIE-B');
+    expect(a?.score).toBe(b?.score);
+    expect(a?.queryTokenCoverage).toEqual(b?.queryTokenCoverage);
+    expect(res.hits.findIndex((h) => h.sourceEntryId === 'TIE-A')).toBeLessThan(
+      res.hits.findIndex((h) => h.sourceEntryId === 'TIE-B'),
+    );
+  });
+});
+
+describe('resolveEntity — query-token coverage ranking (issue #15)', () => {
+  // runLeiFuzzy shares runFuzzy's `Math.max(tokenScore, wholeScore)` shape and so
+  // shares the tie: two candidates each holding one exact query token both score
+  // 1.0. The weaker LEI sorts first alphabetically, so the terminal LEI tie-break
+  // ranks it ahead until coverage separates them.
+  const FULL_LEI = 'ZZZZFULLCOVERAGE0011';
+  const WEAK_LEI = 'AAAAWEAKCOVERAGE0011';
+
+  beforeEach(async () => {
+    await svc.ingestLeiEntities([
+      {
+        lei: FULL_LEI,
+        legalName: 'Testland Maritime Holdings Group PLC',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+      {
+        lei: WEAK_LEI,
+        legalName: 'Aurora Holdings Group Ltd',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+    ]);
+  });
+
+  const resolveFuzzy = () =>
+    svc.resolveEntity(
+      {
+        query: 'Testlandia Maritime Holdings Group',
+        matchMode: 'fuzzy',
+        status: 'any',
+        limit: 25,
+      },
+      ctx,
+    );
+
+  it('ranks the full-coverage candidate above a weaker one tied at the same score', async () => {
+    const res = await resolveFuzzy();
+    const full = res.matches.findIndex((m) => m.lei === FULL_LEI);
+    const weak = res.matches.findIndex((m) => m.lei === WEAK_LEI);
+    expect(full).toBe(0);
+    expect(weak).toBeGreaterThan(full);
+    expect(res.matches[full]?.score).toBe(res.matches[weak]?.score);
+  });
+
+  it('surfaces the literal coverage count for each candidate', async () => {
+    const res = await resolveFuzzy();
+    expect(res.matches.find((m) => m.lei === FULL_LEI)?.queryTokenCoverage).toEqual({
+      covered: 4,
+      total: 4,
+    });
+    expect(res.matches.find((m) => m.lei === WEAK_LEI)?.queryTokenCoverage).toEqual({
+      covered: 2,
+      total: 4,
+    });
+  });
+
+  it('keeps the LEI as the terminal key when score and coverage tie', async () => {
+    const res = await resolveFuzzy();
+    const tied = res.matches.filter((m) => m.score === 1 && m.queryTokenCoverage?.covered === 2);
+    expect(tied.length).toBeGreaterThan(1);
+    expect(tied.map((m) => m.lei)).toEqual([...tied.map((m) => m.lei)].sort());
+  });
+
+  it('reports the coverage of the same name it reports the score for', async () => {
+    // FX-2002's LEI carries both a legal name and a shorter trading name. Both
+    // hold the exact token "trading" and so tie at score 1.0; the legal name
+    // covers "compny" too, so it is the name surfaced — and the coverage on the
+    // match describes that name, not a different one.
+    const res = await svc.resolveEntity(
+      { query: 'Fictionel Trading Compny', matchMode: 'fuzzy', status: 'any', limit: 10 },
+      ctx,
+    );
+    const match = res.matches.find((m) => m.lei === '5493001KJTIIGC8Y1R12');
+    expect(match?.matchedName).toBe('Fictional Trading Company LLC');
+    expect(match?.queryTokenCoverage).toEqual({ covered: 3, total: 3 });
+  });
+
+  it('omits queryTokenCoverage on strict matches', async () => {
+    const res = await svc.resolveEntity(
+      {
+        query: 'Testland Maritime Holdings Group PLC',
+        matchMode: 'strict',
+        status: 'any',
+        limit: 10,
+      },
+      ctx,
+    );
+    const match = res.matches.find((m) => m.lei === FULL_LEI);
+    expect(match?.matchType).toBe('exact');
+    expect(match?.queryTokenCoverage).toBeUndefined();
+  });
+});
+
 describe('screenName — candidate-pool fairness', () => {
   it('surfaces a fuzzy match whose distinctive token is not the first query token', async () => {
     // Every query token contributes candidates to the fuzzy pool (not just the

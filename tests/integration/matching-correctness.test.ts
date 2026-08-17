@@ -86,7 +86,8 @@ const matchingDesignations: NormalizedDesignation[] = [
       nationalities: [],
     },
   },
-  // Insert the weaker public designation first to expose insertion-order ties.
+  // TM-1006 sorts lexicographically before TM-1007, so the terminal designation-id
+  // tie-break puts the WEAKER candidate first whenever the two tie on score.
   {
     id: 'ofac_sdn:TM-1006',
     source: 'ofac_sdn',
@@ -215,30 +216,68 @@ describe('screenName name-shape correctness', () => {
     expect(approximateScores).toEqual([...approximateScores].sort((a, b) => b - a));
   });
 
-  // Correct behavior is tracked by https://github.com/cyanheads/sanctions-screening-mcp-server/issues/15
-  it.skip('ranks the full transliteration match above a weaker two-token candidate', async () => {
+  // Both candidates share an exact query token, so both surface score 1.0. Rank —
+  // not score — is what separates them: the candidate covering all three query
+  // tokens outranks the one covering two.
+  it('ranks the full transliteration match above a weaker two-token candidate', async () => {
+    const result = await service.screenName(
+      { ...defaults, query: 'Nikolas Maduro Moros', matchMode: 'fuzzy' },
+      createMockContext(),
+    );
+    const intendedRank = result.hits.findIndex((hit) => hit.sourceEntryId === 'TM-1007');
+    const weakerRank = result.hits.findIndex((hit) => hit.sourceEntryId === 'TM-1006');
+    expect(intendedRank).toBe(0);
+    expect(weakerRank).toBeGreaterThan(intendedRank);
+  });
+
+  it('ranks the Arabic full-name variant above a weaker shared-token fixture', async () => {
+    const result = await service.screenName(
+      { ...defaults, query: 'Mohamad Abdulla Al Qadir', matchMode: 'fuzzy' },
+      createMockContext(),
+    );
+    const intendedRank = result.hits.findIndex((hit) => hit.sourceEntryId === 'TM-1002');
+    const weakerRank = result.hits.findIndex((hit) => hit.sourceEntryId === 'FX-6006');
+    expect(intendedRank).toBe(0);
+    expect(weakerRank).toBeGreaterThan(intendedRank);
+  });
+
+  it('separates the tied candidates by coverage while leaving both scores raw', async () => {
+    // The doctrine constraint: coverage orders the hits, it is never folded into
+    // `score`. Both candidates keep the raw Jaro-Winkler 1.0 their shared exact
+    // token earns — the ranking rationale lives in its own field.
     const result = await service.screenName(
       { ...defaults, query: 'Nikolas Maduro Moros', matchMode: 'fuzzy' },
       createMockContext(),
     );
     const intended = result.hits.find((hit) => hit.sourceEntryId === 'TM-1007');
     const weaker = result.hits.find((hit) => hit.sourceEntryId === 'TM-1006');
-    expect(intended?.score).toBeGreaterThan(weaker?.score ?? 0);
-    expect(result.hits[0]?.sourceEntryId).toBe('TM-1007');
+    expect(intended?.score).toBe(1);
+    expect(weaker?.score).toBe(1);
+    expect(intended?.queryTokenCoverage).toEqual({ covered: 3, total: 3 });
+    expect(weaker?.queryTokenCoverage).toEqual({ covered: 2, total: 3 });
   });
 
-  // Correct behavior is tracked by https://github.com/cyanheads/sanctions-screening-mcp-server/issues/15
-  it.skip('ranks the Arabic full-name variant above a weaker shared-token fixture', async () => {
+  it('orders every approximate hit by score, then by coverage, then by designation id', async () => {
     const result = await service.screenName(
-      { ...defaults, query: 'Mohamad Abdulla Al Qadir', matchMode: 'fuzzy' },
+      { ...defaults, query: 'Nikolas Maduro Moros', matchMode: 'fuzzy' },
       createMockContext(),
     );
-    const intended = result.hits.find((hit) => hit.sourceEntryId === 'TM-1002');
-    const weaker = result.hits.find((hit) => hit.sourceEntryId === 'FX-6006');
-    expect(intended?.score).toBeGreaterThan(weaker?.score ?? 0);
-    expect(result.hits[0]?.sourceEntryId).toBe('TM-1002');
+    const keys: RankKey[] = result.hits
+      .filter((hit) => hit.matchType === 'approximate')
+      .map((hit) => [
+        -(hit.score ?? 0),
+        -(hit.queryTokenCoverage?.covered ?? 0),
+        hit.designationId,
+      ]);
+    expect(keys).toEqual([...keys].sort(compareRankKeys));
   });
 });
+
+/** One hit's ranking key, ascending: negated score, negated coverage, designation id. */
+type RankKey = [number, number, string];
+
+const compareRankKeys = (a: RankKey, b: RankKey): number =>
+  a[0] - b[0] || a[1] - b[1] || a[2].localeCompare(b[2]);
 
 describe('designation merge and deduplication', () => {
   let standalone: SeededService;
