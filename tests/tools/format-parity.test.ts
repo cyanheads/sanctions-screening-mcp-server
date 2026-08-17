@@ -42,6 +42,7 @@ describe('sanctions_screen_name format()', () => {
           matchedNameType: 'aka',
           matchType: 'approximate',
           score: 0.912_345,
+          queryTokenCoverage: { covered: 2, total: 3 },
           program: 'UKRAINE-EO13662',
           designationDate: '2019-03-15',
         },
@@ -52,6 +53,7 @@ describe('sanctions_screen_name format()', () => {
     expect(text).toContain('1 potential match(es)');
     expect(text).toContain('Ivan Testovich Volkov — approximate');
     expect(text).toContain('score 0.912'); // raw Jaro-Winkler, three decimals
+    expect(text).toContain('covers 2/3 query tokens'); // the secondary ranking key
     expect(text).toContain('OFAC Specially Designated Nationals');
     expect(text).toContain('Entry ID:** FX-1001');
     expect(text).toContain('Matched on:** "Ivan Wolkow" (aka)');
@@ -79,6 +81,7 @@ describe('sanctions_screen_name format()', () => {
 
     expect(text).toContain('Sparse Holdings — exact');
     expect(text).not.toContain('score');
+    expect(text).not.toContain('query tokens');
     expect(text).not.toContain('Program:');
     expect(text).not.toContain('Designated:');
   });
@@ -166,6 +169,7 @@ describe('sanctions_resolve_entity format()', () => {
           matchedName: 'Fictional Trading Co',
           matchType: 'approximate',
           score: 0.887_777,
+          queryTokenCoverage: { covered: 3, total: 3 },
           jurisdiction: 'US-DE',
           status: 'ISSUED',
         },
@@ -175,6 +179,7 @@ describe('sanctions_resolve_entity format()', () => {
     expect(text).toContain('1 LEI candidate(s)');
     expect(text).toContain('### Fictional Trading Company LLC — approximate');
     expect(text).toContain('score 0.888');
+    expect(text).toContain('covers 3/3 query tokens');
     expect(text).toContain('`5493001KJTIIGC8Y1R12`');
     expect(text).toContain('Matched on:** "Fictional Trading Co"');
     expect(text).toContain('Jurisdiction: US-DE | Status: ISSUED');
@@ -194,6 +199,7 @@ describe('sanctions_resolve_entity format()', () => {
 
     expect(text).toContain('### Bare Record Ltd — exact');
     expect(text).not.toContain('score');
+    expect(text).not.toContain('query tokens');
     expect(text).not.toContain('Jurisdiction:');
     expect(text).not.toContain('Status:');
   });
@@ -209,6 +215,7 @@ describe('sanctions_get_entity format()', () => {
     legalName: 'Fictional Trading Company LLC',
     otherNames: [],
     sanctionsHits: [],
+    screeningStatus: 'screened',
     caveat: SCREENING_CAVEAT,
   };
 
@@ -242,6 +249,7 @@ describe('sanctions_get_entity format()', () => {
           score: 0.934_21,
         },
       ],
+      sanctionsScreen: { totalAvailable: 31, totalAvailableBasis: 'exact', hasMore: true },
     });
 
     expect(text).toContain('# Fictional Trading Company LLC');
@@ -255,7 +263,31 @@ describe('sanctions_get_entity format()', () => {
     expect(text).toContain('## Sanctions screening cross-reference');
     expect(text).toContain('entry FX-2002');
     expect(text).toContain('score 0.934');
+    expect(text).toContain('showing 2 of 31 potential match(es) (count basis: exact)');
+    expect(text).toContain('more available: true');
+    expect(text).toContain('sanctions_screen_name');
     expect(text).not.toContain('NOT a clearance');
+  });
+
+  it('discloses a complete cross-reference without pointing at a follow-up screen', () => {
+    const text = render(getEntityTool, {
+      ...base,
+      sanctionsScreen: { totalAvailable: 0, totalAvailableBasis: 'exact', hasMore: false },
+    });
+
+    expect(text).toContain('showing 0 of 0 potential match(es) (count basis: exact)');
+    expect(text).toContain('more available: false');
+    expect(text).not.toContain('sanctions_screen_name');
+    expect(text).toContain('No potential watchlist matches on the legal name (NOT a clearance).');
+  });
+
+  it('labels a bounded cross-reference count as a floor rather than a total', () => {
+    const text = render(getEntityTool, {
+      ...base,
+      sanctionsScreen: { totalAvailable: 5000, totalAvailableBasis: 'lower_bound', hasMore: true },
+    });
+
+    expect(text).toContain('count basis: lower_bound');
   });
 
   it('renders a registration authority with no entity ID and no hits', () => {
@@ -266,6 +298,17 @@ describe('sanctions_get_entity format()', () => {
     expect(text).not.toContain('Other names:');
     expect(text).not.toContain('Jurisdiction:');
     expect(text).toContain('No potential watchlist matches on the legal name (NOT a clearance).');
+    // No `sanctionsScreen` at all: an unscreened payload discloses no coverage.
+    expect(text).not.toContain('count basis');
+  });
+
+  it('states that the cross-reference never ran when the sanctions mirror is unavailable', () => {
+    const text = render(getEntityTool, { ...base, screeningStatus: 'not_ready' });
+
+    expect(text).toMatch(/did not run/i);
+    expect(text).toMatch(/not a clearance/i);
+    expect(text).not.toContain('No potential watchlist matches on the legal name');
+    expect(text).not.toContain('count basis');
   });
 });
 
@@ -280,6 +323,10 @@ describe('sanctions_trace_ownership format()', () => {
   it('renders nodes, per-node hits, edges, and the screened/flagged counts', () => {
     const text = render(traceOwnershipTool, {
       rootLei: root.lei,
+      complete: true,
+      truncated: false,
+      missingEntityLeis: [],
+      screeningStatus: 'screened',
       nodes: [
         {
           ...root,
@@ -296,6 +343,7 @@ describe('sanctions_trace_ownership format()', () => {
               score: 0.951,
             },
           ],
+          sanctionsScreen: { totalAvailable: 7, totalAvailableBasis: 'exact', hasMore: true },
         },
         {
           lei: '5493009BRIT0PARENT12',
@@ -303,6 +351,7 @@ describe('sanctions_trace_ownership format()', () => {
           depth: 1,
           role: 'parent',
           sanctionsHits: [],
+          sanctionsScreen: { totalAvailable: 0, totalAvailableBasis: 'exact', hasMore: false },
         },
       ],
       edges: [
@@ -325,21 +374,49 @@ describe('sanctions_trace_ownership format()', () => {
 
     expect(text).toContain('# Ownership graph for `5493001KJTIIGC8Y1R12`');
     expect(text).toContain('**2 node(s), 2 edge(s).**');
-    expect(text).toContain('**Screened 2 node(s); 1 had potential matches.**');
+    expect(text).toContain('screened 2 node(s); 1 had potential matches');
     expect(text).toContain('depth 0 (US-DE, ISSUED)');
     expect(text).toContain('⚠ Fictional Trading Company LLC');
     expect(text).toContain('score 0.951');
     // A screened node with zero hits states the absence rather than staying silent.
     expect(text).toContain('No potential matches (not a clearance).');
+    // Each screened node discloses whether its own hit list was capped.
+    expect(text).toContain('showing 1 of 7 potential match(es) (count basis: exact)');
+    expect(text).toContain('showing 0 of 0 potential match(es) (count basis: exact)');
+    expect(text).toContain('sanctions_screen_name');
     expect(text).toContain('## Ownership edges');
     expect(text).toContain('IS_DIRECTLY_CONSOLIDATED_BY `5493009BRIT0PARENT12` (ACTIVE)');
     expect(text).toContain('IS_ULTIMATELY_CONSOLIDATED_BY `5493009ULTIMATE00099`');
     expect(text).not.toContain('IS_ULTIMATELY_CONSOLIDATED_BY `5493009ULTIMATE00099` (');
   });
 
-  it('drops the screening line, the edges section, and per-node hit lines when unscreened and isolated', () => {
+  it('renders an incomplete graph as truncated and names its unhydrated nodes', () => {
     const text = render(traceOwnershipTool, {
       rootLei: root.lei,
+      complete: false,
+      truncated: true,
+      missingEntityLeis: ['33333333333333333333'],
+      screeningStatus: 'not_ready',
+      nodes: [root],
+      edges: [],
+      screenedNodeCount: 0,
+      flaggedNodeCount: 0,
+      caveat: SCREENING_CAVEAT,
+    });
+
+    expect(text).toMatch(/not the full known ownership picture/i);
+    expect(text).toMatch(/truncated at the requested depth/i);
+    expect(text).toContain('33333333333333333333');
+    expect(text).toMatch(/not run/i);
+  });
+
+  it('drops the edges section and per-node hit lines when unscreened and isolated', () => {
+    const text = render(traceOwnershipTool, {
+      rootLei: root.lei,
+      complete: true,
+      truncated: false,
+      missingEntityLeis: [],
+      screeningStatus: 'not_requested',
       nodes: [root],
       edges: [],
       screenedNodeCount: 0,
@@ -348,11 +425,13 @@ describe('sanctions_trace_ownership format()', () => {
     });
 
     expect(text).toContain('**1 node(s), 0 edge(s).**');
-    expect(text).not.toContain('Screened');
+    expect(text).toMatch(/screening:\*\* not requested/i);
+    expect(text).not.toContain('had potential matches');
     expect(text).not.toContain('## Ownership edges');
     // A node with no `sanctionsHits` key at all was never screened, so it gets
     // no per-node line either way — unlike a screened node with zero hits.
     expect(text).not.toContain('No potential matches (not a clearance).');
+    expect(text).not.toContain('potential match(es) (count basis');
     expect(text).toContain('depth 0');
     expect(text).not.toContain('depth 0 (');
   });

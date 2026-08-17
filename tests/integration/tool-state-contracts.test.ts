@@ -279,6 +279,37 @@ const overflowEntities = ['Alpha', 'Bravo', 'Charlie'].map((suffix, index) => ({
   status: 'ISSUED',
 }));
 
+/** The fixture LEI whose legal name a fixture designation already matches exactly. */
+const LISTED_ENTITY_LEI = '5493001KJTIIGC8Y1R12';
+
+/** The fixture LEI whose legal name no fixture designation matches. */
+const UNLISTED_ENTITY_LEI = '529900T8BM49AURSDO55';
+
+/**
+ * `count` designations published under `Fictional Trading Company LLC` — the
+ * exact legal name of {@link LISTED_ENTITY_LEI} — so `sanctions_get_entity`'s
+ * cross-reference screen on that LEI matches every one of them, on top of the
+ * fixture's own designation of the same name.
+ */
+const crossReferenceDesignations = (count: number): NormalizedDesignation[] =>
+  Array.from(
+    { length: count },
+    (_unused, index): NormalizedDesignation => ({
+      id: `un:XREF-${index}`,
+      source: 'un',
+      sourceEntryId: `XREF-${index}`,
+      entityType: 'organization',
+      primaryName: 'Fictional Trading Company LLC',
+      payload: {
+        aliases: [],
+        identifiers: [],
+        addresses: [],
+        datesOfBirth: [],
+        nationalities: [],
+      },
+    }),
+  );
+
 describe('capped result disclosure and retrieval', () => {
   let global: SeededService | undefined;
 
@@ -407,6 +438,67 @@ describe('capped result disclosure and retrieval', () => {
     expect(new Set([first, second, last].map((page) => page.matches[0]?.lei)).size).toBe(3);
   });
 
+  it('discloses a capped get_entity cross-reference on both surfaces', async () => {
+    global = await seededGlobalService();
+    // Twenty-six under the entity's exact legal name plus the fixture's own, so
+    // the twenty-five-hit cross-reference cap binds with two matches left behind.
+    await global.service.ingestDesignations(crossReferenceDesignations(26));
+
+    const result = await runToolContract(getEntityTool, { lei: LISTED_ENTITY_LEI });
+    const structured = result.structuredContent as Record<string, unknown>;
+
+    expect(result.isError).toBeFalsy();
+    expect(structured.sanctionsHits).toHaveLength(25);
+    expect(structured).toMatchObject({
+      screeningStatus: 'screened',
+      sanctionsScreen: { totalAvailable: 27, totalAvailableBasis: 'exact', hasMore: true },
+    });
+
+    const text = contentText(result);
+    expect(text).toContain('showing 25 of 27 potential match(es) (count basis: exact)');
+    expect(text).toContain('sanctions_screen_name');
+  });
+
+  it('leaves an uncapped get_entity cross-reference reading as complete', async () => {
+    global = await seededGlobalService();
+    // Twenty-four plus the fixture's own is exactly the cap: the whole match set
+    // fits, so a complete cross-reference must not read as capped.
+    await global.service.ingestDesignations(crossReferenceDesignations(24));
+
+    const result = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: LISTED_ENTITY_LEI }),
+      ctxFor(getEntityTool.errors),
+    );
+
+    expect(result.sanctionsHits).toHaveLength(25);
+    expect(result.sanctionsScreen).toEqual({
+      totalAvailable: 25,
+      totalAvailableBasis: 'exact',
+      hasMore: false,
+    });
+    const text = render(getEntityTool, result);
+    expect(text).toContain('showing 25 of 25 potential match(es) (count basis: exact)');
+    expect(text).not.toContain('sanctions_screen_name');
+  });
+
+  it('reads a zero-match get_entity cross-reference as screened, not capped', async () => {
+    global = await seededGlobalService();
+    const result = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: UNLISTED_ENTITY_LEI }),
+      ctxFor(getEntityTool.errors),
+    );
+
+    expect(result).toMatchObject({ screeningStatus: 'screened', sanctionsHits: [] });
+    expect(result.sanctionsScreen).toEqual({
+      totalAvailable: 0,
+      totalAvailableBasis: 'exact',
+      hasMore: false,
+    });
+    const text = render(getEntityTool, result);
+    expect(text).toContain('No potential watchlist matches on the legal name (NOT a clearance).');
+    expect(text).toContain('showing 0 of 0 potential match(es) (count basis: exact)');
+  });
+
   it('keeps the empty-result guidance when nothing matched at all', async () => {
     global = await seededGlobalService();
     const ctx = ctxFor(screenNameTool.errors);
@@ -488,8 +580,7 @@ describe('degraded cross-reference status', () => {
     return state;
   }
 
-  // Correct behavior is tracked by https://github.com/cyanheads/sanctions-screening-mcp-server/issues/17
-  it.skip('marks get_entity screening as unavailable instead of returning no hits', async () => {
+  it('marks get_entity screening as unavailable instead of returning no hits', async () => {
     global = await gleifOnly();
     const ctx = ctxFor(getEntityTool.errors);
     const result = await getEntityTool.handler(
@@ -497,10 +588,18 @@ describe('degraded cross-reference status', () => {
       ctx,
     );
     expect({ ...result, ...getEnrichment(ctx) }).toMatchObject({ screeningStatus: 'not_ready' });
+    // A screen that never ran discloses no coverage — there is nothing to cap.
+    expect(result.sanctionsScreen).toBeUndefined();
+
+    // The markdown surface must not present the unrun screen as a clean one.
+    const text = render(getEntityTool, result);
+    expect(text).not.toContain('No potential watchlist matches on the legal name');
+    expect(text).not.toContain('count basis');
+    expect(text).toMatch(/did not run/i);
+    expect(text).toMatch(/not a clearance/i);
   });
 
-  // Correct behavior is tracked by https://github.com/cyanheads/sanctions-screening-mcp-server/issues/17
-  it.skip('marks requested ownership node screening as unavailable', async () => {
+  it('marks requested ownership node screening as unavailable', async () => {
     global = await gleifOnly();
     const ctx = ctxFor(traceOwnershipTool.errors);
     const result = await traceOwnershipTool.handler(
@@ -508,6 +607,87 @@ describe('degraded cross-reference status', () => {
       ctx,
     );
     expect({ ...result, ...getEnrichment(ctx) }).toMatchObject({ screeningStatus: 'not_ready' });
+    expect(result.screenedNodeCount).toBe(0);
+    expect(render(traceOwnershipTool, result)).toMatch(/not run/i);
+
+    // Graph completeness is a separate axis: an unscreened node is still a fully
+    // known node, so an unavailable screen must not report the graph incomplete.
+    expect(result).toMatchObject({ complete: true, truncated: false, missingEntityLeis: [] });
+  });
+
+  it('leaves the ownership graph itself intact when screening is unavailable', async () => {
+    global = await gleifOnly();
+    const result = await traceOwnershipTool.handler(
+      traceOwnershipTool.input.parse({ lei: '5493001KJTIIGC8Y1R12', screenNodes: true }),
+      ctxFor(traceOwnershipTool.errors),
+    );
+    expect(result.nodes.map((node) => node.lei)).toEqual([
+      '5493001KJTIIGC8Y1R12',
+      '529900T8BM49AURSDO55',
+    ]);
+    for (const node of result.nodes) {
+      expect(node.sanctionsHits).toBeUndefined();
+      expect(node.sanctionsScreen).toBeUndefined();
+    }
+  });
+
+  it('reports a healthy screen as completed on both tools, with no degradation signal', async () => {
+    global = await seededGlobalService();
+
+    const entity = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: '5493001KJTIIGC8Y1R12' }),
+      ctxFor(getEntityTool.errors),
+    );
+    expect(entity.screeningStatus).toBe('screened');
+    expect(render(getEntityTool, entity)).not.toMatch(/did not run/i);
+
+    // A completed screen that finds nothing still reads as completed.
+    const unlisted = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: '529900T8BM49AURSDO55' }),
+      ctxFor(getEntityTool.errors),
+    );
+    expect(unlisted).toMatchObject({ screeningStatus: 'screened', sanctionsHits: [] });
+    expect(render(getEntityTool, unlisted)).toContain(
+      'No potential watchlist matches on the legal name (NOT a clearance).',
+    );
+
+    const graph = await traceOwnershipTool.handler(
+      traceOwnershipTool.input.parse({ lei: '5493001KJTIIGC8Y1R12', screenNodes: true }),
+      ctxFor(traceOwnershipTool.errors),
+    );
+    expect(graph.screeningStatus).toBe('screened');
+    expect(graph.screenedNodeCount).toBe(graph.nodes.length);
+  });
+
+  it('carries the ownership disclosure onto both response surfaces', async () => {
+    global = await gleifOnly();
+    const result = await runToolContract(traceOwnershipTool, {
+      lei: '5493001KJTIIGC8Y1R12',
+      screenNodes: true,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent as Record<string, unknown>).toMatchObject({
+      screeningStatus: 'not_ready',
+      complete: true,
+      truncated: false,
+      missingEntityLeis: [],
+    });
+    const text = contentText(result);
+    expect(text).toMatch(/NOT run/);
+    expect(text).toContain('**Graph coverage:** complete');
+  });
+
+  it('distinguishes screening never requested from screening unavailable', async () => {
+    global = await seededGlobalService();
+    const result = await traceOwnershipTool.handler(
+      traceOwnershipTool.input.parse({ lei: '5493001KJTIIGC8Y1R12', screenNodes: false }),
+      ctxFor(traceOwnershipTool.errors),
+    );
+    expect(result.screeningStatus).toBe('not_requested');
+    expect(result.screenedNodeCount).toBe(0);
+    for (const node of result.nodes) expect(node.sanctionsHits).toBeUndefined();
+    expect(render(traceOwnershipTool, result)).toMatch(/not requested/i);
   });
 });
 

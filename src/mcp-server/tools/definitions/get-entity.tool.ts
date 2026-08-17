@@ -2,7 +2,9 @@
  * @fileoverview `sanctions_get_entity` — the full GLEIF Level 1 record for one
  * LEI, plus any sanctions hits screened against the same legal name. Combines
  * the who-is-who reference data with a cross-reference screen so an agent sees
- * both "who is this entity" and "is its name on a watchlist" in one call.
+ * both "who is this entity" and "is its name on a watchlist" in one call. The
+ * cross-reference says what it could not do: `screeningStatus` reports whether
+ * it ran at all, and `sanctionsScreen` reports whether its hit list was capped.
  * @module mcp-server/tools/definitions/get-entity.tool
  */
 
@@ -14,10 +16,20 @@ import { SCREENING_CAVEAT } from './_shared.js';
 
 const LEI_RE = /^[A-Z0-9]{18}[0-9]{2}$/;
 
+/**
+ * Potential matches the cross-reference screen returns for the entity's legal
+ * name. The cross-reference sits beside a Level 1 record rather than replacing
+ * the screening surface, so its hit list is a preview, not the whole set:
+ * `sanctionsScreen` reports `totalAvailable` / `hasMore`, and an entity with
+ * more matches than this is re-screened in full with `sanctions_screen_name`
+ * on its legal name.
+ */
+const CROSS_REFERENCE_SCREEN_LIMIT = 25;
+
 export const getEntityTool = tool('sanctions_get_entity', {
   title: 'sanctions-screening-mcp-server: get entity',
   description:
-    'Fetch the full GLEIF Level 1 record for one LEI: legal name, other/trading names, legal and headquarters addresses, registration status, jurisdiction, registration authority and ID, and last-update date — plus any sanctions hits screened against the same legal name across all loaded watchlists. The screening cross-reference is a screening AID: a hit is a candidate to verify against the official source, and no hit is not a clearance. LEI must be a 20-character GLEIF identifier (18 alphanumerics + 2 check digits).',
+    'Fetch the full GLEIF Level 1 record for one LEI: legal name, other/trading names, legal and headquarters addresses, registration status, jurisdiction, registration authority and ID, and last-update date — plus any sanctions hits screened against the same legal name across all loaded watchlists. The screening cross-reference is a screening AID: a hit is a candidate to verify against the official source, and no hit is not a clearance. screeningStatus says whether that cross-reference actually ran — an empty sanctionsHits under not_ready means the sanctions mirror was unavailable, not that nothing matched. sanctionsScreen says whether the hit list is the whole set: it reports how many potential matches existed before the cap, so a capped cross-reference is distinguishable from a complete one. LEI must be a 20-character GLEIF identifier (18 alphanumerics + 2 check digits).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     lei: z
@@ -79,6 +91,34 @@ export const getEntityTool = tool('sanctions_get_entity', {
           ),
       )
       .describe("Sanctions screening cross-reference on the entity's legal name."),
+    sanctionsScreen: z
+      .object({
+        totalAvailable: z
+          .number()
+          .int()
+          .describe(
+            'Potential matches the cross-reference screen found before the cap was applied.',
+          ),
+        totalAvailableBasis: z
+          .enum(['exact', 'lower_bound'])
+          .describe(
+            'How to read totalAvailable: exact = the complete strict match set for this legal name; lower_bound = a bounded scan produced it, so more may exist.',
+          ),
+        hasMore: z
+          .boolean()
+          .describe(
+            'True when the potential matches were capped — screen the legal name with sanctions_screen_name to page through the rest.',
+          ),
+      })
+      .optional()
+      .describe(
+        "Disclosure for the cross-reference screen: how many potential matches existed before the cap, and whether sanctionsHits is the complete set. Present only when screeningStatus is 'screened'.",
+      ),
+    screeningStatus: z
+      .enum(['screened', 'not_ready'])
+      .describe(
+        "Whether the cross-reference ran: screened = the legal name was screened against every loaded watchlist; not_ready = the sanctions mirror has never synced, so no screening ran and the empty sanctionsHits says nothing about this entity. Read sanctionsHits only when this is 'screened'.",
+      ),
     caveat: z
       .string()
       .describe(
@@ -117,24 +157,26 @@ export const getEntityTool = tool('sanctions_get_entity', {
       });
     }
 
-    // Cross-reference screen on the legal name — only when the sanctions mirror is ready.
-    let sanctionsHits: Awaited<ReturnType<typeof svc.screenName>>['hits'] = [];
-    if (await svc.sanctionsReady()) {
-      const screen = await svc.screenName(
-        {
-          query: entity.legalName,
-          entityType: 'any',
-          matchMode: 'strict',
-          // Cross-reference screen: strict only. Auto-fuzzy on a generic legal
-          // name floods the result with single-common-token false positives.
-          autoFallback: false,
-          sources: [...SOURCE_CODES],
-          limit: 25,
-        },
-        ctx,
-      );
-      sanctionsHits = screen.hits;
-    }
+    // Cross-reference screen on the legal name — only when the sanctions mirror
+    // is ready. When it isn't, `screeningStatus` carries that: an empty
+    // `sanctionsHits` from a screen that never ran must not read like a clean one.
+    const sanctionsReady = await svc.sanctionsReady();
+    const screeningStatus: 'screened' | 'not_ready' = sanctionsReady ? 'screened' : 'not_ready';
+    const screen = sanctionsReady
+      ? await svc.screenName(
+          {
+            query: entity.legalName,
+            entityType: 'any',
+            matchMode: 'strict',
+            // Cross-reference screen: strict only. Auto-fuzzy on a generic legal
+            // name floods the result with single-common-token false positives.
+            autoFallback: false,
+            sources: [...SOURCE_CODES],
+            limit: CROSS_REFERENCE_SCREEN_LIMIT,
+          },
+          ctx,
+        )
+      : undefined;
 
     return {
       lei: entity.lei,
@@ -151,7 +193,7 @@ export const getEntityTool = tool('sanctions_get_entity', {
         ? { registrationAuthorityEntityId: entity.registrationAuthorityEntityId }
         : {}),
       ...(entity.lastUpdate ? { lastUpdate: entity.lastUpdate } : {}),
-      sanctionsHits: sanctionsHits.map((h) => ({
+      sanctionsHits: (screen?.hits ?? []).map((h) => ({
         source: h.source,
         sourceLabel: SOURCE_LABELS[h.source],
         sourceEntryId: h.sourceEntryId,
@@ -160,6 +202,18 @@ export const getEntityTool = tool('sanctions_get_entity', {
         matchType: h.matchType,
         ...(h.score !== undefined ? { score: h.score } : {}),
       })),
+      ...(screen
+        ? {
+            sanctionsScreen: {
+              totalAvailable: screen.totalAvailable,
+              totalAvailableBasis: screen.totalAvailableBasis,
+              // The cross-reference never pages, so whatever the cap left behind
+              // is everything past the hits returned here.
+              hasMore: screen.hits.length < screen.totalAvailable,
+            },
+          }
+        : {}),
+      screeningStatus,
       caveat: SCREENING_CAVEAT,
     };
   },
@@ -179,7 +233,11 @@ export const getEntityTool = tool('sanctions_get_entity', {
     if (r.lastUpdate) lines.push(`**Last update:** ${r.lastUpdate}`);
 
     lines.push('\n## Sanctions screening cross-reference');
-    if (r.sanctionsHits.length === 0) {
+    if (r.screeningStatus === 'not_ready') {
+      lines.push(
+        'The sanctions mirror has never synced, so this cross-reference did not run. No screening was performed — this is NOT a clearance. Check sanctions_list_sources for mirror readiness and retry.',
+      );
+    } else if (r.sanctionsHits.length === 0) {
       lines.push('No potential watchlist matches on the legal name (NOT a clearance).');
     } else {
       for (const h of r.sanctionsHits) {
@@ -188,6 +246,16 @@ export const getEntityTool = tool('sanctions_get_entity', {
           `- **${h.primaryName}** — ${h.sourceLabel} (\`${h.source}\`, entry ${h.sourceEntryId}), ${h.matchType}${scoreStr}, matched "${h.matchedName}"`,
         );
       }
+    }
+    if (r.sanctionsScreen) {
+      const s = r.sanctionsScreen;
+      lines.push(
+        `Screen coverage: showing ${r.sanctionsHits.length} of ${s.totalAvailable} potential match(es) (count basis: ${s.totalAvailableBasis}); more available: ${s.hasMore}${
+          s.hasMore
+            ? ` — screen "${r.legalName}" with sanctions_screen_name to page through the rest.`
+            : ''
+        }`,
+      );
     }
     lines.push(`\n> ${r.caveat}`);
     return [{ type: 'text', text: lines.join('\n') }];
