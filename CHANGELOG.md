@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.8](changelog/0.1.x/0.1.8.md) — 2026-08-16
+
+Make capped screening results page-retrievable with an honest exact-vs-lower_bound count, gate the designation and entity URI resources on mirror readiness, and restore per-source url/license on sanctions://sources
+
 ## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-07-04
 
 Fix a whole-string Jaro-Winkler prefix-inflation false positive in fuzzy screening admission with a folded-length-ratio guard shared by the sanctions and LEI fuzzy paths

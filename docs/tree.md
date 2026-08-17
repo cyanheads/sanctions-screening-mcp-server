@@ -1,28 +1,29 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-07-05 04:35:25
+Generated on: 2026-08-17 00:00:37
 
 ```text
 sanctions-screening-mcp-server/
-├── .agents/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
 │   ├── mcp.json
 │   └── plugin.json
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
 │   └── template.md
-├── data/
 ├── docs/
 │   └── design.md
 ├── scripts/
@@ -167,18 +168,31 @@ sanctions-screening-mcp-server/
 │   │       └── xml.ts
 │   └── index.ts
 ├── tests/
+│   ├── fuzz/
+│   │   ├── definition-surface.fuzz.test.ts
+│   │   └── ingest-and-matcher.fuzz.test.ts
+│   ├── integration/
+│   │   ├── matching-correctness.test.ts
+│   │   ├── ownership-correctness.test.ts
+│   │   ├── tool-state-contracts.test.ts
+│   │   └── upstream-boundaries.test.ts
 │   ├── prompts/
 │   │   └── vet-counterparty.prompt.test.ts
 │   ├── resources/
+│   │   └── resource-contracts.test.ts
 │   ├── services/
 │   │   ├── _helpers.ts
 │   │   ├── ingest-parsers.test.ts
 │   │   ├── screening-service.test.ts
 │   │   └── text-matching.test.ts
+│   ├── smoke/
+│   │   └── surface.smoke.test.ts
 │   └── tools/
+│       ├── format-parity.test.ts
 │       └── screening-tools.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md
