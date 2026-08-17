@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-08-16
+
+Stream every sanctions source instead of buffering the whole document — the mirror:init sanctions leg now peaks at 480 MiB where it previously OOM-killed the run — and drop records with no source identifier or no usable name rather than minting a fresh UUID each harvest
+
 ## [0.1.9](changelog/0.1.x/0.1.9.md) — 2026-08-16
 
 Rank fuzzy candidates that one shared exact token ties on query-token coverage, and disclose what the ownership graph and the cross-reference screens could not do — depth truncation, unhydrated nodes, unavailable screening, and capped hit lists

@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-08-17 00:00:37
+Generated on: 2026-08-17 02:15:00
 
 ```text
 sanctions-screening-mcp-server/
@@ -160,11 +160,13 @@ sanctions-screening-mcp-server/
 │   │   └── screening/
 │   │       ├── fixtures.ts
 │   │       ├── gleif-ingest.ts
+│   │       ├── ingest-validation.ts
 │   │       ├── sanctions-ingest.ts
 │   │       ├── schema.ts
 │   │       ├── screening-service.ts
 │   │       ├── text-matching.ts
 │   │       ├── types.ts
+│   │       ├── xml-stream.ts
 │   │       └── xml.ts
 │   └── index.ts
 ├── tests/
@@ -183,6 +185,7 @@ sanctions-screening-mcp-server/
 │   ├── services/
 │   │   ├── _helpers.ts
 │   │   ├── ingest-parsers.test.ts
+│   │   ├── sanctions-sync.test.ts
 │   │   ├── screening-service.test.ts
 │   │   └── text-matching.test.ts
 │   ├── smoke/

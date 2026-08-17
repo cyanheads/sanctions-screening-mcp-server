@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** sanctions-screening-mcp-server
-**Version:** 0.1.9
+**Version:** 0.1.10
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.5`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.29.0
@@ -267,12 +267,14 @@ src/
     screening/
       screening-service.ts              # Owns the local mirrors + matching engine (init/accessor pattern)
       schema.ts                         # Normalized designation/name/lei_entity/lei_relationship schema + MirrorService defs
-      sanctions-ingest.ts               # OFAC/EU/UK/UN sync ingesters (XML → normalized designations)
+      sanctions-ingest.ts               # OFAC/EU/UK/UN streaming ingesters (record-at-a-time XML → normalized designations)
       gleif-ingest.ts                   # GLEIF harvest — streaming golden-copy init + buffered deltas (L1/L2 records)
+      ingest-validation.ts              # Shared drop predicate + per-source rejection tally — no source identity or no usable name means no row
       text-matching.ts                  # Fold/tokenize, Jaro-Winkler, Double-Metaphone
       types.ts                          # Source codes, labels, domain types
       fixtures.ts                       # Synthetic fixture for mirror:seed / tests
       xml.ts                            # Attribute-preserving XML parser (fast-xml-parser wrapper)
+      xml-stream.ts                     # UTF-8 stream decoder + record-boundary scanner (bounds every ingest)
   mcp-server/
     tools/definitions/
       *.tool.ts                         # Six tools (screen-name, get-designation, resolve-entity, get-entity, trace-ownership, list-sources)

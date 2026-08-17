@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.9-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/sanctions-screening-mcp-server/releases/latest/download/sanctions-screening-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=sanctions-screening-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvc2FuY3Rpb25zLXNjcmVlbmluZy1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22sanctions-screening-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Fsanctions-screening-mcp-server%22%5D%7D)
 
@@ -143,7 +143,7 @@ The mirror is **not bundled** — the sanctions lists and the GLEIF golden copy 
 bun run mirror:init
 ```
 
-This harvests all four sanctions lists in full, rebuilds the per-alias name index, then streams the GLEIF golden copy (Level 1 entities + Level 2 ownership relationships). It is resumable and intended to run once, off the request path.
+This streams all five sanctions lists in full, rebuilds the per-alias name index, then streams the GLEIF golden copy (Level 1 entities + Level 2 ownership relationships). It is resumable and intended to run once, off the request path.
 
 | Script | Purpose |
 |:---|:---|
@@ -152,9 +152,9 @@ This harvests all four sanctions lists in full, rebuilds the per-alias name inde
 | `bun run mirror:verify` | Report mirror readiness and per-source record counts. |
 | `bun run mirror:seed` | Load a small synthetic fixture for local smoke tests (no downloads). |
 
-Set `SANCTIONS_INIT_SKIP_GLEIF=1` on `mirror:init` to load only the (small) sanctions lists and skip GLEIF.
+Set `SANCTIONS_INIT_SKIP_GLEIF=1` on `mirror:init` to load the sanctions lists only and skip GLEIF.
 
-> **GLEIF memory note:** the GLEIF Level 1 ingest is the heavy leg — the full golden copy is roughly 3.3M LEI records (~892 MB compressed, several GB decompressed). `mirror:init` streams and ingests it in bounded batches, so peak resident memory stays modest rather than scaling to the whole decompressed document. The four sanctions lists and the GLEIF deltas / Level 2 ownership data are light by comparison. Size disk for the mirror accordingly, or skip GLEIF with `SANCTIONS_INIT_SKIP_GLEIF=1` if you only need watchlist screening.
+> **Memory note:** every leg of `mirror:init` streams. The sanctions documents total roughly 172 MB, of which OFAC `SDN_ADVANCED.XML` is about 120 MB on its own; the GLEIF Level 1 golden copy is roughly 3.3M LEI records (~892 MB compressed, several GB decompressed). Each source is scanned one record at a time and ingested in bounded batches, so peak resident memory tracks the batch size rather than the size of any source document. Size **disk** for the mirror accordingly — GLEIF dominates there — or skip GLEIF with `SANCTIONS_INIT_SKIP_GLEIF=1` if you only need watchlist screening.
 
 ## Features
 
