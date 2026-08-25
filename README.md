@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.10-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.11-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 [![Install in Claude Desktop](https://img.shields.io/badge/Install_in-Claude_Desktop-D97757?style=for-the-badge&logo=anthropic&logoColor=white)](https://github.com/cyanheads/sanctions-screening-mcp-server/releases/latest/download/sanctions-screening-mcp-server.mcpb) [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=sanctions-screening-mcp-server&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBjeWFuaGVhZHMvc2FuY3Rpb25zLXNjcmVlbmluZy1tY3Atc2VydmVyIl19) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=for-the-badge&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect?url=vscode:mcp/install?%7B%22name%22%3A%22sanctions-screening-mcp-server%22%2C%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40cyanheads%2Fsanctions-screening-mcp-server%22%5D%7D)
 
@@ -56,7 +56,7 @@ The 80% entry point — "is this entity on a watchlist?"
 - Strict mode (default): exact-normalized equality, then all-tokens-present via FTS5 — handles word-order swaps and missing interior words with no fuzzy library
 - Fuzzy mode (opt-in, or automatic when strict finds nothing): adds Jaro-Winkler similarity and Double-Metaphone phonetic matching for transliteration-class misses
 - Hits labeled `exact` / `strong` / `approximate`; approximate hits carry the raw Jaro-Winkler score (0–1) plus `queryTokenCoverage` — how many query tokens the candidate explains, which ranks candidates that one shared exact token pins at the same score
-- Filter by entity type, source list subset, similarity floor (`min_score`), and result limit
+- Filter by entity type, source list subset, similarity floor (`minScore`), and result limit
 - Paged: `totalAvailable` and `hasMore` report matches beyond the returned page and `nextOffset` retrieves them, with `totalAvailableBasis` marking that count exact (strict) or a scanned-set floor (fuzzy)
 - On an empty result, returns guidance on how to broaden — and states explicitly that no match is **not** a clearance
 
@@ -66,7 +66,7 @@ The 80% entry point — "is this entity on a watchlist?"
 
 The drill-in after `sanctions_screen_name` surfaces a candidate.
 
-- Full normalized record by `source` + `entry_id` (the `sourceEntryId` from a screen hit)
+- Full normalized record by `source` + `entryId` (the `sourceEntryId` from a screen hit)
 - All published aliases, structured identifiers (passport / national ID / tax / registration), addresses, dates and places of birth, nationalities, sanctioning program, legal basis, and designation date
 - Preserves source sparsity — missing fields mean the source omitted them; the record is never padded with fabricated data
 
@@ -177,7 +177,7 @@ Sanctions-specific:
 
 Agent-friendly output:
 
-- Real signal, not synthetic confidence — approximate hits carry the raw Jaro-Winkler similarity (0–1) and a literal query-token coverage count, two separate measurements rather than one blended verdict; strict hits carry a `match_type` (`exact` / `strong`), never a fabricated percentage
+- Real signal, not synthetic confidence — approximate hits carry the raw Jaro-Winkler similarity (0–1) and a literal query-token coverage count, two separate measurements rather than one blended verdict; strict hits carry a `matchType` (`exact` / `strong`), never a fabricated percentage
 - Ranking a caller can account for — hits order by match type, then score, then coverage, then a stable identifier, and the coverage that broke the tie is on the hit itself
 - Provenance on every hit — source list, sanctioning program, designation date, the exact name/alias that matched, and its type (`primary` / `aka` / `fka` / `low-quality-aka`)
 - Decision-support caveat carried in every screening tool's output — a hit is a candidate to verify, an empty result is not a clearance
@@ -291,7 +291,7 @@ All sources are keyless — there is no required API key. Every variable below i
 |:---|:---|:---|
 | `SANCTIONS_MIRROR_PATH` | Filesystem path for the SQLite mirror; a persistent volume on a hosted deployment. | `./data/sanctions.db` |
 | `SANCTIONS_REFRESH_CRON` | Cron for the scheduled refresh of the sanctions lists + name index (HTTP transport only). GLEIF deltas are refreshed manually via `mirror:refresh`. | `0 4 * * *` |
-| `SANCTIONS_FUZZY_MIN_SCORE` | Default Jaro-Winkler similarity floor for fuzzy matches when `min_score` is omitted. | `0.85` |
+| `SANCTIONS_FUZZY_MIN_SCORE` | Default Jaro-Winkler similarity floor for fuzzy matches when `minScore` is omitted. | `0.85` |
 | `SANCTIONS_FUZZY_MAX_RESULTS` | Hard cap on fuzzy candidates scored per query, to bound work on short queries. | `50` |
 | `OFAC_SDN_URL` | Override for the OFAC SDN advanced-XML file. | official SLS URL |
 | `OFAC_CONSOLIDATED_URL` | Override for the OFAC Consolidated advanced-XML file. | official SLS URL |
@@ -300,6 +300,7 @@ All sources are keyless — there is no required API key. Every variable below i
 | `UN_SC_URL` | Override for the UN Security Council consolidated XML file. | official UN URL |
 | `GLEIF_GOLDEN_COPY_BASE_URL` | Override for the GLEIF golden-copy / delta download API. | `https://goldencopy.gleif.org` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
+| `MCP_SESSION_MODE` | Session mode: `auto` (resolves to stateful), `stateful`, or `stateless`. The shipped `.env.example` and Docker image pin stateless — no tool here needs a multi-round-trip input. | `stateless` |
 | `MCP_HTTP_PORT` | Port for the HTTP server. | `3010` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 

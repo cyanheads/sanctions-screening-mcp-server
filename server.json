@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/sanctions-screening-mcp-server",
     "source": "github"
   },
-  "version": "0.1.10",
+  "version": "0.1.11",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/sanctions-screening-mcp-server",
       "runtimeHint": "node",
-      "version": "0.1.10",
+      "version": "0.1.11",
       "packageArguments": [
         {
           "type": "positional",
@@ -47,7 +47,7 @@
         },
         {
           "name": "SANCTIONS_FUZZY_MIN_SCORE",
-          "description": "Default Jaro-Winkler similarity floor (0-1) for fuzzy matches when the caller omits min_score.",
+          "description": "Default Jaro-Winkler similarity floor (0-1) for fuzzy matches when the caller omits minScore.",
           "format": "string",
           "isRequired": false,
           "default": "0.85"
@@ -69,7 +69,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/sanctions-screening-mcp-server",
       "runtimeHint": "node",
-      "version": "0.1.10",
+      "version": "0.1.11",
       "packageArguments": [
         {
           "type": "positional",
@@ -132,7 +132,7 @@
         },
         {
           "name": "SANCTIONS_FUZZY_MIN_SCORE",
-          "description": "Default Jaro-Winkler similarity floor (0-1) for fuzzy matches when the caller omits min_score.",
+          "description": "Default Jaro-Winkler similarity floor (0-1) for fuzzy matches when the caller omits minScore.",
           "format": "string",
           "isRequired": false,
           "default": "0.85"

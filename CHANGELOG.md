@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-08-25
+
+Adopt @cyanheads/mcp-ts-core 0.12: tool inputs are strict at the root, so an undeclared argument key is rejected by name instead of silently ignored — and the docs that named parameters in snake_case now match the camelCase the schemas declare
+
 ## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-08-16
 
 Stream every sanctions source instead of buffering the whole document — the mirror:init sanctions leg now peaks at 480 MiB where it previously OOM-killed the run — and drop records with no source identifier or no usable name rather than minting a fresh UUID each harvest
