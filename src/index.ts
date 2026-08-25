@@ -28,6 +28,18 @@ await createApp({
   prompts: allPromptDefinitions,
   instructions:
     'Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, all fuzzy-matched offline over a local mirror. Start with sanctions_screen_name for "is this entity on a watchlist"; sanctions_resolve_entity → sanctions_get_entity → sanctions_trace_ownership for "who is this legal entity and who owns it." Every result is a screening AID, not a compliance determination — a hit is a candidate to verify against the official source, and an empty result is never a clearance. Check sanctions_list_sources for which lists are loaded and how fresh the mirror is.',
+  // The tool, resource, and prompt surface is fixed at startup — nothing
+  // registers or retires a definition at runtime — so a 2026-07-28 client may
+  // hold the listings for an hour. Shared caches may too: the same listings are
+  // already served unauthenticated on the landing page and the server card.
+  // Per-record read lifetimes live on the resource definitions themselves.
+  cacheHints: {
+    'tools/list': { ttlMs: 3_600_000, cacheScope: 'public' },
+    'prompts/list': { ttlMs: 3_600_000, cacheScope: 'public' },
+    'resources/list': { ttlMs: 3_600_000, cacheScope: 'public' },
+    'resources/templates/list': { ttlMs: 3_600_000, cacheScope: 'public' },
+    'server/discover': { ttlMs: 3_600_000, cacheScope: 'public' },
+  },
   landing: {
     requireAuth: false,
     tagline:

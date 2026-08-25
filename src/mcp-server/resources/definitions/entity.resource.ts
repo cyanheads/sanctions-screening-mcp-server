@@ -15,6 +15,9 @@ export const entityResource = resource('sanctions://entity/{lei}', {
   description:
     "Fetch one GLEIF Level 1 legal-entity record by LEI — a read-only URI mirror of sanctions_get_entity's entity payload. The sanctions cross-reference is available only via the tool.",
   mimeType: 'application/json',
+  // GLEIF Level 1 records change only when a delta is applied out-of-band.
+  // Private for the same reason as the designation resource.
+  cacheHint: { ttlMs: 3_600_000, cacheScope: 'private' },
   params: z.object({
     lei: z
       .string()

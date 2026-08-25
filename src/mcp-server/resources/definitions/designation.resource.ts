@@ -18,6 +18,11 @@ export const designationResource = resource('sanctions://designation/{source}/{e
   description:
     'Fetch one sanctions designation by source list + entry ID — a read-only URI mirror of sanctions_get_designation. The record is what the source published; a screening aid, not a determination.',
   mimeType: 'application/json',
+  // A designation only changes when its source list republishes, which this
+  // server picks up on the daily refresh cron. Scoped private, not public: the
+  // record is public-domain, but the deployment may be auth-gated and a shared
+  // cache would serve it past that gate.
+  cacheHint: { ttlMs: 3_600_000, cacheScope: 'private' },
   params: z.object({
     source: z
       .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])

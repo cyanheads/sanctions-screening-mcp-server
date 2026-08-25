@@ -249,10 +249,12 @@ export class ScreeningService {
             'Sanctions harvest — source complete',
             requestContextService.createRequestContext({
               operation: 'mirror.sync.source',
-              source: report.source,
-              accepted: report.accepted,
-              rejectedMissingIdentifier: report.rejected.missingIdentifier,
-              rejectedUnusableName: report.rejected.unusableName,
+              additionalContext: {
+                source: report.source,
+                accepted: report.accepted,
+                rejectedMissingIdentifier: report.rejected.missingIdentifier,
+                rejectedUnusableName: report.rejected.unusableName,
+              },
             }),
           ),
       }),

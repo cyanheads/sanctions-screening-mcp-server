@@ -23,6 +23,9 @@ export const sourcesResource = resource('sanctions://sources', {
   description:
     "List the sanctions watchlists and GLEIF datasets currently loaded in the local mirror, each with its record count and the mirror's as-of timestamp — a read-only URI mirror of sanctions_list_sources.",
   mimeType: 'application/json',
+  // Never cached: mirror readiness and the as-of timestamps ARE the payload, so
+  // a cached copy would report a stale mirror state as current.
+  cacheHint: { ttlMs: 0 },
   params: z.object({}),
 
   async handler(_params, _ctx) {

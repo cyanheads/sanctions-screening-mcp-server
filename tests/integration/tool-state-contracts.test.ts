@@ -46,13 +46,28 @@ function parseParams<P>(definition: { params?: { parse: (raw: unknown) => P } },
   return definition.params.parse(raw);
 }
 
-/** Minimal `ListExtra` for exercising a resource's `list()` provider. */
+/**
+ * Minimal `ListExtra` for exercising a resource's `list()` provider. `ListExtra`
+ * is the SDK v2 `ServerContext`, so the request scope lives under `mcpReq`; the
+ * server-to-client channels throw because no client is attached in-process.
+ */
 const listExtra = (): ListExtra => ({
-  signal: new AbortController().signal,
-  requestId: 'test-list',
-  sendNotification: async () => {},
-  sendRequest: async () => {
-    throw new Error('sendRequest is not available in this test harness');
+  mcpReq: {
+    id: 'test-list',
+    method: 'resources/list',
+    signal: new AbortController().signal,
+    requestState: () => undefined,
+    notify: async () => {},
+    send: async () => {
+      throw new Error('send is not available in this test harness');
+    },
+    log: async () => {},
+    elicitInput: async () => {
+      throw new Error('elicitInput is not available in this test harness');
+    },
+    requestSampling: async () => {
+      throw new Error('requestSampling is not available in this test harness');
+    },
   },
 });
 
