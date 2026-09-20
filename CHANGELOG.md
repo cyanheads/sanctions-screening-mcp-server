@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-09-20 · ⚠️ Breaking
+
+Adopts mcp-ts-core 0.13.6: an out-of-schema tool call now returns InvalidParams instead of ValidationError, and snake_case/kebab-case argument spellings are rewritten instead of rejected. Also declares node-cron so the scheduled sanctions-mirror refresh registers on HTTP boot (#28).
+
 ## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-08-25
 
 Adopt @cyanheads/mcp-ts-core 0.12: tool inputs are strict at the root, so an undeclared argument key is rejected by name instead of silently ignored — and the docs that named parameters in snake_case now match the camelCase the schemas declare
