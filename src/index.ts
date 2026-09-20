@@ -23,6 +23,10 @@ import {
 await createApp({
   name: 'sanctions-screening-mcp-server',
   title: 'sanctions-screening-mcp-server',
+  // Every read is answered from the local mirror and no tool calls
+  // `ctx.requestInput`, so nothing here needs a session to come back to.
+  // `MCP_SESSION_MODE` still overrides this when a deployment sets it.
+  sessionMode: 'stateless',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
@@ -62,6 +66,12 @@ await createApp({
   setup() {
     initScreeningService();
     scheduleRefresh();
+  },
+  // The service holds open SQLite handles for both mirrors. Releasing them here
+  // closes prepared statements with the file rather than leaving it pinned
+  // until garbage collection.
+  async teardown() {
+    await getScreeningService().close();
   },
 });
 

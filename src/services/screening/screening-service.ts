@@ -272,8 +272,9 @@ export class ScreeningService {
 
   /**
    * Open the designation mirror's raw handle, ensuring the auxiliary `name` index
-   * + FTS exist first. The framework's migration runner skips migrations on a
-   * fresh DB, so the aux DDL is applied here (idempotently) on first use.
+   * + FTS exist first. This service owns that DDL rather than the store's
+   * `migrations` (see `schema.ts`), so it is applied here — idempotently — on
+   * first use.
    */
   private async designationHandle(): Promise<SqliteHandle> {
     const raw = await this.designationMirror.raw();

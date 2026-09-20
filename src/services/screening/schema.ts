@@ -6,10 +6,10 @@
  * the primary tables + their FTS + sync state via `sqliteMirrorStore`; the
  * auxiliary tables below are created idempotently on the raw handle.
  *
- * Why not the store's `migrations`: the framework's migration runner skips ALL
- * migrations on a brand-new DB (it stamps the current version without running
- * them, since there is no older data to transform). Auxiliary DDL therefore must
- * be applied directly — every statement here is `CREATE … IF NOT EXISTS`, so
+ * Why not the store's `migrations`: these objects are standing schema, not a
+ * one-time transformation of older data, and the mirror lifecycle scripts reach
+ * the raw handle on paths the store's sync never runs. Owning the DDL here gives
+ * both paths one definition — every statement is `CREATE … IF NOT EXISTS`, so
  * `ensureAuxSchema` is safe to run on every open.
  * @module services/screening/schema
  */

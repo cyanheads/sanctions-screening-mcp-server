@@ -204,15 +204,16 @@ describe('strict root inputs', () => {
     it(`${definition.name} rejects an undeclared argument by name`, async () => {
       const result = await runToolContract(definition, {
         ...MINIMAL_INPUTS[definition.name],
-        // The shape a caller lands on from a snake_case reading of the surface.
-        min_score: 0.9,
+        // Undeclared on every tool, and no case-fold of it names a declared
+        // key — so nothing rewrites it and the strict root rejects it.
+        match_threshold: 0.9,
       } as never);
 
       expect(result.isError).toBe(true);
       const envelope = result.structuredContent as { error: { code: number; message: string } };
-      expect(envelope.error.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(envelope.error.code).toBe(JsonRpcErrorCode.InvalidParams);
       // Named, not silently stripped — the caller can see which key was wrong.
-      expect(envelope.error.message).toContain('min_score');
+      expect(envelope.error.message).toContain('match_threshold');
     });
   }
 
@@ -223,6 +224,20 @@ describe('strict root inputs', () => {
       minScore: 0.9,
     });
     expect(result.isError).toBeFalsy();
+  });
+
+  it('accepts a snake_case spelling of a declared argument', async () => {
+    // The shape a caller lands on from a snake_case reading of the surface.
+    // A one-to-one case fold is rewritten to the declared key rather than
+    // rejected, so the same call that used to fail now screens.
+    const result = await runToolContract(screenNameTool, {
+      name: 'Ivan Testovich Volkov',
+      match_mode: 'fuzzy',
+      min_score: 0.9,
+    } as never);
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { hits: unknown[] }).hits.length).toBeGreaterThan(0);
   });
 });
 
