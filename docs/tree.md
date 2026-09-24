@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-09-20 20:03:30
+Generated on: 2026-09-24 18:47:01
 
 ```text
 sanctions-screening-mcp-server/
@@ -25,6 +25,7 @@ sanctions-screening-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -180,6 +181,7 @@ sanctions-screening-mcp-server/
 │   ├── integration/
 │   │   ├── matching-correctness.test.ts
 │   │   ├── ownership-correctness.test.ts
+│   │   ├── refresh-pruning.test.ts
 │   │   ├── scheduled-refresh.test.ts
 │   │   ├── sdk-v2-contracts.test.ts
 │   │   ├── tool-state-contracts.test.ts

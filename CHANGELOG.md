@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-09-24 · ⚠️ Breaking · 🛡️ Security
+
+Native-script names are indexed and screenable, XML entities are decoded at parse time, sanctions_get_designation returns the details each list publishes, and a refresh removes delisted designations. Both name tools now reject unmatchable and oversized names.
+
 ## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-09-20 · ⚠️ Breaking
 
 Adopts mcp-ts-core 0.13.6: an out-of-schema tool call now returns InvalidParams instead of ValidationError, and snake_case/kebab-case argument spellings are rewritten instead of rejected. Also declares node-cron so the scheduled sanctions-mirror refresh registers on HTTP boot (#28).
