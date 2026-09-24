@@ -10,6 +10,8 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getScreeningService } from '@/services/screening/screening-service.js';
+import { fold, tokenize } from '@/services/screening/text-matching.js';
+import { MAX_NAME_CHARS, MAX_NAME_WORDS } from './_shared.js';
 
 export const resolveEntityTool = tool('sanctions_resolve_entity', {
   title: 'sanctions-screening-mcp-server: resolve entity',
@@ -17,7 +19,12 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     'Resolve a company or organization name (with an optional ISO 3166-1 alpha-2 jurisdiction) to candidate GLEIF Legal Entity Identifiers (LEIs), ranked. This turns a free-text counterparty name into a stable global identifier that sanctions_get_entity and sanctions_trace_ownership key off. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler scoring labeled approximate with a raw 0–1 score plus the count of query tokens the matched name covers, which orders candidates that tie on score. Results are paged: totalAvailable and hasMore report candidates beyond the returned page, and nextOffset retrieves them. Returns potential matches to confirm against the GLEIF record — name resolution is a candidate ranking, not an authoritative identification.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
-    name: z.string().min(1).describe('The company / organization name to resolve to an LEI.'),
+    name: z
+      .string()
+      .min(1)
+      .describe(
+        `The company / organization name to resolve to an LEI, in any script. It must contain at least one letter or digit, and at most ${MAX_NAME_WORDS} words and ${MAX_NAME_CHARS} characters.`,
+      ),
     jurisdiction: z
       .union([
         z.literal(''),
@@ -141,6 +148,19 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
   },
   errors: [
     {
+      reason: 'name_not_searchable',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'The name contains no letter or digit, so nothing in it can be matched.',
+      recovery:
+        'Pass a name that contains at least one letter or digit; punctuation, symbols, and whitespace alone match nothing.',
+    },
+    {
+      reason: 'name_too_long',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: `The name is longer than ${MAX_NAME_WORDS} words or ${MAX_NAME_CHARS} characters.`,
+      recovery: `Pass one name of at most ${MAX_NAME_WORDS} words and ${MAX_NAME_CHARS} characters; resolve several names with one call each.`,
+    },
+    {
       reason: 'mirror_not_ready',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The GLEIF (LEI) mirror has never completed an initial sync.',
@@ -151,6 +171,19 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
   ],
 
   async handler(input, ctx) {
+    const words = tokenize(fold(input.name)).length;
+    if (words === 0) {
+      throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.', {
+        ...ctx.recoveryFor('name_not_searchable'),
+      });
+    }
+    if (words > MAX_NAME_WORDS || input.name.length > MAX_NAME_CHARS) {
+      throw ctx.fail(
+        'name_too_long',
+        `The name is past the ${MAX_NAME_WORDS}-word / ${MAX_NAME_CHARS}-character bound (words: ${words}, characters: ${input.name.length}).`,
+        { ...ctx.recoveryFor('name_too_long') },
+      );
+    }
     const svc = getScreeningService();
     if (!(await svc.leiReady())) {
       throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.', {

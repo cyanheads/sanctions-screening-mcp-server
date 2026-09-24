@@ -11,8 +11,9 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getScreeningService } from '@/services/screening/screening-service.js';
+import { fold, tokenize } from '@/services/screening/text-matching.js';
 import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
-import { SCREENING_CAVEAT } from './_shared.js';
+import { MAX_NAME_CHARS, MAX_NAME_WORDS, SCREENING_CAVEAT } from './_shared.js';
 
 const SOURCE_ENUM = z.enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un']);
 
@@ -76,7 +77,9 @@ export const screenNameTool = tool('sanctions_screen_name', {
     name: z
       .string()
       .min(1)
-      .describe('The name to screen (person, organization, vessel, or aircraft).'),
+      .describe(
+        `The name to screen (person, organization, vessel, or aircraft), in any script. It must contain at least one letter or digit, and at most ${MAX_NAME_WORDS} words and ${MAX_NAME_CHARS} characters.`,
+      ),
     entityType: z
       .enum(['any', 'person', 'organization', 'vessel', 'aircraft'])
       .default('any')
@@ -159,6 +162,19 @@ export const screenNameTool = tool('sanctions_screen_name', {
   },
   errors: [
     {
+      reason: 'name_not_searchable',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'The name contains no letter or digit, so nothing in it can be matched.',
+      recovery:
+        'Pass a name that contains at least one letter or digit; punctuation, symbols, and whitespace alone match nothing.',
+    },
+    {
+      reason: 'name_too_long',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: `The name is longer than ${MAX_NAME_WORDS} words or ${MAX_NAME_CHARS} characters.`,
+      recovery: `Pass one name of at most ${MAX_NAME_WORDS} words and ${MAX_NAME_CHARS} characters; screen several names with one call each.`,
+    },
+    {
       reason: 'mirror_not_ready',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The sanctions mirror has never completed an initial sync.',
@@ -169,6 +185,19 @@ export const screenNameTool = tool('sanctions_screen_name', {
   ],
 
   async handler(input, ctx) {
+    const words = tokenize(fold(input.name)).length;
+    if (words === 0) {
+      throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.', {
+        ...ctx.recoveryFor('name_not_searchable'),
+      });
+    }
+    if (words > MAX_NAME_WORDS || input.name.length > MAX_NAME_CHARS) {
+      throw ctx.fail(
+        'name_too_long',
+        `The name is past the ${MAX_NAME_WORDS}-word / ${MAX_NAME_CHARS}-character bound (words: ${words}, characters: ${input.name.length}).`,
+        { ...ctx.recoveryFor('name_too_long') },
+      );
+    }
     const svc = getScreeningService();
     if (!(await svc.sanctionsReady())) {
       throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.', {

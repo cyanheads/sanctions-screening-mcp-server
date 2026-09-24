@@ -3,23 +3,57 @@
  * name folding/normalization, tokenization, Double-Metaphone phonetic keys, and
  * Jaro-Winkler similarity. These produce the *real signal* the matching engine
  * surfaces — Jaro-Winkler returns a genuine 0–1 measurement, never a fabricated
- * composite "confidence". The fold layer matches the FTS tokenizer's behavior
- * (`unicode61 remove_diacritics 2`) so the index and the query agree.
+ * composite "confidence". The index and the query are both folded before the FTS5
+ * tokenizer (`unicode61 remove_diacritics 2`) sees them, and the tokenizer splits a
+ * folded name into exactly its {@link tokenize} tokens, so the two agree.
  * @module services/screening/text-matching
  */
 
+/** Runs of combining marks (`\p{M}`), stripped by {@link fold}. */
+const COMBINING_MARKS = /\p{M}+/gu;
+
 /**
- * Fold a raw name to its normalized form: lowercase, NFKD-decompose, strip
- * combining diacritics, collapse non-alphanumeric runs to single spaces, and
- * trim. Mirrors the FTS5 `unicode61 remove_diacritics 2` tokenizer so a query
- * folded here matches the indexed `normalized` column.
+ * Runs {@link fold} collapses to one space: anything outside `[\p{L}\p{N}]`, plus
+ * the Spacing Modifier Letters block (U+02B0–U+02FF). What survives NFKD in that
+ * block (`ʼ`, `ʻ`, `ʹ`, `ˮ`, …) is a letter to Unicode but an apostrophe, prime,
+ * or quote to the reader, who types an ASCII `'` in its place.
+ */
+const SEPARATOR_RUNS = /(?:[^\p{L}\p{N}]|[ʰ-˿])+/gu;
+
+/** A token written entirely in Latin script (digits allowed) — the only kind Double Metaphone keys. */
+const LATIN_TOKEN = /^[\p{Script=Latin}\p{N}]+$/u;
+
+/**
+ * Fold a raw name to its normalized form: NFKD-decompose, strip every combining
+ * mark (`\p{M}`), lowercase, map final sigma `ς` to `σ`, drop Arabic tatweel
+ * (U+0640, which only stretches a word), collapse each run of characters outside
+ * `[\p{L}\p{N}]` — or inside the Spacing Modifier Letters block — to one space,
+ * and trim. Letters and digits of every script survive, so a native-script name
+ * is indexed and queryable as published; a name whose fold is ASCII folds
+ * exactly as it always has.
+ *
+ * The fold normalizes more than the tokenizer does (unicode61 keeps non-Latin
+ * diacritics such as Cyrillic `й`), which is harmless because both sides are
+ * folded first. Final sigma is the one place unicode61 would otherwise disagree:
+ * it folds `ς` to `σ` itself, so without that step the tokenizer would split a
+ * folded Greek name into different tokens than {@link tokenize}.
+ *
+ * Marks are also stripped BEFORE `normalize()`: NFKD reorders a run of combining
+ * marks with an insertion sort, which is quadratic in the run's length, and a
+ * caller can send one. No `\p{M}` character decomposes to a non-mark, so the
+ * early strip leaves the result unchanged; the only non-marks that decompose to
+ * marks (half-width katakana voicing, U+FF9E/U+FF9F) share one combining class,
+ * so the normalizer never reorders a long run.
  */
 export function fold(raw: string): string {
   return raw
+    .replace(COMBINING_MARKS, '')
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(COMBINING_MARKS, '')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/ς/g, 'σ')
+    .replace(/ـ/g, '')
+    .replace(SEPARATOR_RUNS, ' ')
     .trim();
 }
 
@@ -41,13 +75,46 @@ export function buildFtsMatch(rawQuery: string): string | null {
 }
 
 // ─── Jaro-Winkler ─────────────────────────────────────────────────────────────
+//
+// Every length and position below counts code points, not UTF-16 code units. A
+// supplementary-plane letter (CJK Extension B, e.g. `𠀀`) is two code units, and
+// every letter in one 1,024-character block shares its high surrogate, so a
+// code-unit measure counts those shared halves as matching characters and
+// inflates the score (`𠀀𠀁𠀃` / `𠀀𠀁𠀂` scored 0.9333 against 0.8222 for its
+// code-point twin `abd` / `abc`). Text with no surrogate is already a code-point
+// sequence and is indexed as a string, so a BMP name scores exactly as before.
+
+/** Characters a similarity measure indexes: a BMP string, or a code-point array. */
+type CodePoints = string | readonly string[];
+
+/** True when `s` holds a UTF-16 surrogate, i.e. a supplementary-plane character. */
+function hasSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const unit = s.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdfff) return true;
+  }
+  return false;
+}
+
+/**
+ * `s` as an indexable code-point sequence. A string without surrogates already
+ * is one and is returned unchanged; only text holding a supplementary-plane
+ * character pays for the split.
+ */
+function codePoints(s: string): CodePoints {
+  return hasSurrogate(s) ? Array.from(s) : s;
+}
 
 /**
  * Jaro similarity of two strings (0–1). The symmetric matching-window
- * comparison underlying Jaro-Winkler.
+ * comparison underlying Jaro-Winkler, over code points.
  */
 export function jaro(a: string, b: string): number {
-  if (a === b) return 1;
+  return a === b ? 1 : jaroOf(codePoints(a), codePoints(b));
+}
+
+/** {@link jaro} over two code-point sequences already known to differ. */
+function jaroOf(a: CodePoints, b: CodePoints): number {
   const lenA = a.length;
   const lenB = b.length;
   if (lenA === 0 || lenB === 0) return 0;
@@ -86,16 +153,19 @@ export function jaro(a: string, b: string): number {
 
 /**
  * Jaro-Winkler similarity (0–1) — Jaro boosted for a shared prefix (up to 4
- * chars), which suits the short, prefix-weighted name strings sanctions
+ * code points), which suits the short, prefix-weighted name strings sanctions
  * screening deals in. `prefixScale` defaults to the standard 0.1.
  */
 export function jaroWinkler(a: string, b: string, prefixScale = 0.1): number {
-  const j = jaro(a, b);
+  if (a === b) return 1;
+  const x = codePoints(a);
+  const y = codePoints(b);
+  const j = jaroOf(x, y);
   if (j === 0) return 0;
   let prefix = 0;
-  const maxPrefix = Math.min(4, a.length, b.length);
+  const maxPrefix = Math.min(4, x.length, y.length);
   for (let i = 0; i < maxPrefix; i++) {
-    if (a[i] === b[i]) prefix++;
+    if (x[i] === y[i]) prefix++;
     else break;
   }
   return j + prefix * prefixScale * (1 - j);
@@ -143,7 +213,7 @@ export function tokenCoverage(
 }
 
 /**
- * Length ratio of two strings — the shorter length over the longer, in [0, 1].
+ * Length ratio of two strings in code points — the shorter length over the longer, in [0, 1].
  * 1.0 means equal-length strings; a small value means one is far shorter than the
  * other. Two empty strings score 1 (identical); empty-vs-nonempty scores 0.
  *
@@ -155,9 +225,11 @@ export function tokenCoverage(
  * ratio measures exactly that.
  */
 export function lengthRatio(a: string, b: string): number {
-  const longer = Math.max(a.length, b.length);
+  const lenA = codePoints(a).length;
+  const lenB = codePoints(b).length;
+  const longer = Math.max(lenA, lenB);
   if (longer === 0) return 1;
-  return Math.min(a.length, b.length) / longer;
+  return Math.min(lenA, lenB) / longer;
 }
 
 // ─── Double Metaphone (single primary key) ─────────────────────────────────────
@@ -168,11 +240,16 @@ export function lengthRatio(a: string, b: string): number {
  * transliteration-class fuzzy hits this is meant to catch. Per-word keys are
  * concatenated with a space so a multi-word name's words each contribute.
  *
+ * Only all-Latin tokens are keyed. Double Metaphone encodes English-oriented
+ * Latin spelling; a non-Latin token has no key, and a mixed token (a Cyrillic
+ * name carrying one Latin homoglyph) would key its Latin residue alone — `A` for
+ * a stray `i`, which would block it against every name that starts with a vowel.
+ *
  * This is a compact, well-tested implementation of the primary Double-Metaphone
  * code (Lawrence Philips' algorithm), adapted to emit only the primary encoding.
  */
 export function doubleMetaphone(folded: string): string {
-  const words = tokenize(folded);
+  const words = tokenize(folded).filter((w) => LATIN_TOKEN.test(w));
   return words
     .map((w) => encodeWord(w))
     .filter(Boolean)

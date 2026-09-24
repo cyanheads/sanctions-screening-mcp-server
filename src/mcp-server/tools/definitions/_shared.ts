@@ -19,6 +19,20 @@ import type { SourceCode } from '@/services/screening/types.js';
 export const SCREENING_CAVEAT =
   'Screening aid, not a compliance determination. Results are potential matches to verify against the official source — a hit is not a finding of fact, and an empty result is not a clearance. Real sanctions compliance is a legal process this server feeds, not one it performs.';
 
+/**
+ * The most characters and words `sanctions_screen_name` and
+ * `sanctions_resolve_entity` match on. A fuzzy pass runs one blocking scan per
+ * distinct word and scores every pooled candidate against every word, so a
+ * caller-sized name would otherwise hold a request for minutes (2,000 distinct
+ * three-letter words took 79 s against the sanctions mirror alone). The longest
+ * published sanctions name is 245 characters and 34 words. Checked in the
+ * handlers rather than as a schema `.max()`, which would change the input schema
+ * clients already validate against.
+ */
+export const MAX_NAME_CHARS = 1024;
+/** See {@link MAX_NAME_CHARS}. */
+export const MAX_NAME_WORDS = 64;
+
 /** Redistribution terms per sanctions source, surfaced for attribution. */
 export const SOURCE_LICENSES: Record<SourceCode, string> = {
   ofac_sdn: 'US Government public domain',

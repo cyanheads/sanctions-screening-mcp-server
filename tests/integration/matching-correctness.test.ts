@@ -8,6 +8,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
+import { tokenize } from '@/services/screening/text-matching.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
 import { freshService, type SeededService, seededService } from '../services/_helpers.js';
@@ -324,5 +325,128 @@ describe('designation merge and deduplication', () => {
     expect((await standalone.service.getDesignation('ofac_sdn', 'DUP-1'))?.program).toBe(
       'OFAC-PROGRAM',
     );
+  });
+});
+
+// ─── Native-script names (issue #20) ────────────────────────────────────────────
+
+const nativeScriptDesignation = (
+  id: string,
+  primaryName: string,
+  aliases: string[],
+): NormalizedDesignation => {
+  const [source, sourceEntryId] = id.split(':') as [NormalizedDesignation['source'], string];
+  return {
+    id,
+    source,
+    sourceEntryId,
+    entityType: 'organization',
+    primaryName,
+    payload: {
+      aliases: aliases.map((name) => ({ name, nameType: 'aka' as const })),
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+    },
+  };
+};
+
+const nativeScriptDesignations: NormalizedDesignation[] = [
+  nativeScriptDesignation('eu:514', 'عبد المنان آغا', ['Abdul Manan Agha']),
+  nativeScriptDesignation('eu:327', 'Comité de soutien afghan', ['Αφγανική Επιτροπή Στήριξης']),
+  nativeScriptDesignation('ofac_sdn:16819', 'WANG, Guoying', ['王 国英']),
+  nativeScriptDesignation('ofac_sdn:22986', 'Hwaryo Bank', ['화려은행']),
+  // Each of the next three carries a Latin homoglyph or digit run inside another
+  // script: a Latin `i` in `Валерiївна`, Latin `OOO`, and `2021`.
+  nativeScriptDesignation('eu:118627', 'Ольга Валерiївна ПОЗДНЯКОВА', []),
+  nativeScriptDesignation('eu:129952', 'OOO «Ромашка»', []),
+  nativeScriptDesignation('eu:130001', 'Интер Трейд 2021', []),
+];
+
+describe('native-script names (issue #20)', () => {
+  let standalone: SeededService;
+
+  beforeEach(async () => {
+    standalone = await freshService();
+    await standalone.service.ingestDesignations(nativeScriptDesignations);
+    await standalone.service.markSanctionsReady(nativeScriptDesignations.length);
+  });
+
+  afterEach(async () => {
+    await standalone.cleanup();
+  });
+
+  it.each([
+    ['عبد المنان آغا', 'eu:514'],
+    ['Αφγανική Επιτροπή Στήριξης', 'eu:327'],
+    ['ΑΦΓΑΝΙΚΉ ΕΠΙΤΡΟΠΉ ΣΤΉΡΙΞΗΣ', 'eu:327'],
+    ['王 国英', 'ofac_sdn:16819'],
+    ['화려은행', 'ofac_sdn:22986'],
+  ])('matches %j exactly on its published name', async (query, designationId) => {
+    const result = await standalone.service.screenName({ ...defaults, query }, createMockContext());
+    expect(result.normalizedQuery).not.toBe('');
+    expect(result.modeUsed).toBe('strict');
+    expect(result.hits[0]).toMatchObject({ designationId, matchType: 'exact' });
+  });
+
+  it('indexes every published name, primaries and aliases alike', async () => {
+    const handle = await standalone.service.designations.raw();
+    const published = nativeScriptDesignations.reduce(
+      (n, d) => n + 1 + d.payload.aliases.length,
+      0,
+    );
+    expect(handle.prepare<{ n: number }>('SELECT COUNT(*) AS n FROM name').get()?.n).toBe(
+      published,
+    );
+  });
+
+  it('splits every folded name into exactly its fold tokens in the FTS5 index', async () => {
+    const handle = await standalone.service.designations.raw();
+    handle.exec(
+      `CREATE VIRTUAL TABLE temp.name_terms USING fts5vocab(main, 'name_fts', 'instance')`,
+    );
+    const terms = handle.prepare<{ term: string }>(
+      'SELECT term FROM temp.name_terms WHERE doc = ? ORDER BY "offset"',
+    );
+    const indexed = handle
+      .prepare<{ rowid: number; normalized: string }>('SELECT rowid, normalized FROM name')
+      .all();
+    expect(indexed).toHaveLength(11);
+    for (const row of indexed) {
+      expect(
+        terms.all(row.rowid).map((t) => t.term),
+        row.normalized,
+      ).toEqual(tokenize(row.normalized));
+    }
+  });
+
+  it.each(['i', 'ooo', '2021'])(
+    'never reports %j as an exact match on a name whose other letters were erased',
+    async (query) => {
+      const result = await standalone.service.screenName(
+        { ...defaults, query, autoFallback: false },
+        createMockContext(),
+      );
+      expect(result.hits.filter((hit) => hit.matchType === 'exact')).toEqual([]);
+    },
+  );
+
+  it('keys no homoglyph residue: a mixed-script name carries no phonetic key', async () => {
+    const handle = await standalone.service.designations.raw();
+    const row = handle
+      .prepare<{ phonetic: string }>(`SELECT phonetic FROM name WHERE designation_id = 'eu:118627'`)
+      .get();
+    expect(row?.phonetic).toBe('');
+  });
+
+  it('runs a native-script fuzzy query as fuzzy', async () => {
+    const result = await standalone.service.screenName(
+      { ...defaults, query: 'Αφγανική Επιτροπή Στηριξης', matchMode: 'fuzzy' },
+      createMockContext(),
+    );
+    expect(result.modeUsed).toBe('fuzzy');
+    expect(result.normalizedQuery).toBe('αφγανικη επιτροπη στηριξησ');
+    expect(result.hits.some((hit) => hit.designationId === 'eu:327')).toBe(true);
   });
 });
