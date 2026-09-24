@@ -96,6 +96,14 @@ const ROOT_START_TAG = new RegExp(
 const MAX_ROOT_SEARCH = 65_536;
 
 /**
+ * An end tag with nothing after it but what XML allows after the root element,
+ * running to the end of the text. Captures the tag's qualified name, which the
+ * caller compares to the root's. The leftmost match is the document's last real
+ * end tag: any `</…>` after it sits inside a trailing comment or instruction.
+ */
+const TRAILING_END_TAG = new RegExp(String.raw`</([A-Za-z_][\w.:-]*)\s*>(?:${MISC})*$`);
+
+/**
  * Characters of the stream's end kept for the root-close check — room for the
  * closing tag plus trailing whitespace and comments.
  */
@@ -146,9 +154,7 @@ export async function* requireCompleteDocument(
     throw serviceUnavailable(`${label} ended before its XML root element opened.`);
   }
   if (root.selfClosing) return;
-  const name = root.name.replace(/[.]/g, '\\.');
-  const closed = new RegExp(String.raw`</${name}\s*>(?:${MISC})*$`);
-  if (!closed.test(tail)) {
+  if (TRAILING_END_TAG.exec(tail)?.[1] !== root.name) {
     throw serviceUnavailable(
       `${label} document ended before its closing </${root.name}> tag — the transfer was truncated.`,
     );

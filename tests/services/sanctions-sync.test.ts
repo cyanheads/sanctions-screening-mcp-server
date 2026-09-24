@@ -468,6 +468,21 @@ describe('sanctions harvest — document completeness', () => {
     expect((await harvestOutcome('eu')).error).toMatch(/truncated/i);
   });
 
+  it('closes the root only with an end tag of exactly its name', async () => {
+    const open = '<?xml version="1.0"?>\n<a.b-c:root>';
+    for (const end of ['</a.b-c:root>\n', '</a.b-c:root><!-- </other> -->']) {
+      serveEuChunks([open, EU_ENTITY, end]);
+      expect(await harvestOutcome('eu')).toEqual({ ids: ['eu:EU-1'] });
+    }
+
+    // A name that differs only where a pattern would be lenient (`.` as any
+    // character), a longer name, and a root close written inside a trailing comment.
+    for (const end of ['</aXb-c:root>', '</a.b-c:rootx>', '</other><!-- </a.b-c:root> -->']) {
+      serveEuChunks([open, EU_ENTITY, end]);
+      expect((await harvestOutcome('eu')).error).toMatch(/truncated/i);
+    }
+  });
+
   it('reads a prolog and an epilog of many comments without backtracking on them', async () => {
     // Each run is judged while it is still incomplete: the prolog before the root
     // tag has arrived, and an epilog cut inside a comment. A pattern that lets one
