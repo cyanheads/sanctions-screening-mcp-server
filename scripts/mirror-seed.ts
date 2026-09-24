@@ -8,6 +8,7 @@
  * @module scripts/mirror-seed
  */
 
+import { withExtra } from '@cyanheads/mcp-ts-core/utils';
 import {
   FIXTURE_DESIGNATIONS,
   FIXTURE_LEI_ENTITIES,
@@ -16,16 +17,19 @@ import {
 import { bootstrap } from './_mirror-context.js';
 
 async function main(): Promise<void> {
-  const { service, log } = await bootstrap();
+  const { service, log, ctx } = await bootstrap('mirror:seed');
   await service.seedFixtures({
     designations: FIXTURE_DESIGNATIONS,
     leiEntities: FIXTURE_LEI_ENTITIES,
     leiRelationships: FIXTURE_LEI_RELATIONSHIPS,
   });
-  log.notice('mirror:seed — synthetic fixture loaded (NOT real sanctions data)', {
-    designations: FIXTURE_DESIGNATIONS.length,
-    leiEntities: FIXTURE_LEI_ENTITIES.length,
-  });
+  log.notice(
+    'mirror:seed — synthetic fixture loaded (NOT real sanctions data)',
+    withExtra(ctx, {
+      designations: FIXTURE_DESIGNATIONS.length,
+      leiEntities: FIXTURE_LEI_ENTITIES.length,
+    }),
+  );
   await service.close();
 }
 

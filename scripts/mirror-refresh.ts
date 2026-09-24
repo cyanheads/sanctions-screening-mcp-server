@@ -1,8 +1,9 @@
 /**
  * @fileoverview `mirror:refresh` — incremental out-of-band refresh. Re-harvests
  * the sanctions lists in full — streamed, so the ~120 MB OFAC SDN document is
- * never held whole — and rebuilds the name index, then applies the GLEIF 8-hour
- * deltas, which are small enough for the buffered parse. The HTTP server runs
+ * never held whole — removing each list's designations its complete document no
+ * longer publishes, and rebuilds the name index, then applies the last day of
+ * GLEIF deltas, which are small enough for the buffered parse. The HTTP server runs
  * the sanctions half of this on a cron automatically; stdio operators run this
  * manually. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to refresh only the sanctions
  * lists.
@@ -11,6 +12,7 @@
  * @module scripts/mirror-refresh
  */
 
+import { withExtra } from '@cyanheads/mcp-ts-core/utils';
 import {
   harvestLeiLevel1,
   harvestLeiLevel2,
@@ -20,21 +22,28 @@ import { createRejections } from '@/services/screening/ingest-validation.js';
 import { bootstrap, longRunSignal } from './_mirror-context.js';
 
 async function main(): Promise<void> {
-  const { service, log } = await bootstrap();
+  const { service, log, ctx } = await bootstrap('mirror:refresh');
   const signal = longRunSignal(4);
 
-  log.info('mirror:refresh — re-harvesting sanctions lists');
+  log.info('mirror:refresh — re-harvesting sanctions lists', ctx);
   const sanctions = await service.designations.runSync({ mode: 'refresh', signal });
   await service.rebuildNameIndex();
-  log.info('mirror:refresh — sanctions refreshed', { records: sanctions.recordsApplied });
+  log.info(
+    'mirror:refresh — sanctions refreshed',
+    withExtra(ctx, {
+      records: sanctions.recordsApplied,
+      removed: sanctions.tombstonesApplied,
+      total: sanctions.total,
+    }),
+  );
 
   if (process.env.SANCTIONS_REFRESH_SKIP_GLEIF === '1') {
-    log.notice('mirror:refresh — SANCTIONS_REFRESH_SKIP_GLEIF set; skipping GLEIF deltas');
+    log.notice('mirror:refresh — SANCTIONS_REFRESH_SKIP_GLEIF set; skipping GLEIF deltas', ctx);
     await service.close();
     return;
   }
 
-  log.info('mirror:refresh — applying GLEIF deltas (LastDay)');
+  log.info('mirror:refresh — applying GLEIF deltas (LastDay)', ctx);
   const [l1Url, l2Url] = await Promise.all([
     resolveGleifFileUrl('lei2-delta', signal, 'LastDay'),
     resolveGleifFileUrl('rr-delta', signal, 'LastDay'),
@@ -44,27 +53,33 @@ async function main(): Promise<void> {
   await service.ingestLeiEntities(entities);
   const relationships = await harvestLeiLevel2(l2Url, signal);
   await service.ingestLeiRelationships(relationships);
-  log.info('mirror:refresh — GLEIF deltas applied', {
-    entities: entities.length,
-    relationships: relationships.length,
-    rejectedMissingIdentifier: leiRejections.missingIdentifier,
-    rejectedUnusableName: leiRejections.unusableName,
-  });
+  log.info(
+    'mirror:refresh — GLEIF deltas applied',
+    withExtra(ctx, {
+      entities: entities.length,
+      relationships: relationships.length,
+      rejectedMissingIdentifier: leiRejections.missingIdentifier,
+      rejectedUnusableName: leiRejections.unusableName,
+    }),
+  );
 
   // Advance GLEIF freshness so sanctions_list_sources reports the data just loaded.
   // Guarded: a delta on a never-initialized mirror is not completion, so freshness
   // advances only when the mirror is already ready — otherwise run mirror:init.
   const freshness = await service.advanceLeiFreshnessIfReady();
   if (freshness.advanced) {
-    log.info('mirror:refresh — GLEIF freshness advanced', { leiEntities: freshness.entityCount });
+    log.info(
+      'mirror:refresh — GLEIF freshness advanced',
+      withExtra(ctx, { leiEntities: freshness.entityCount }),
+    );
   } else {
     log.notice(
       'mirror:refresh — GLEIF mirror not yet initialized; applied deltas but left freshness unset. Run mirror:init to complete the initial GLEIF load.',
-      { leiEntities: freshness.entityCount },
+      withExtra(ctx, { leiEntities: freshness.entityCount }),
     );
   }
 
-  log.info('mirror:refresh — complete');
+  log.info('mirror:refresh — complete', ctx);
   await service.close();
 }
 

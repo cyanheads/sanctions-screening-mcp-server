@@ -8,7 +8,7 @@
  */
 
 import { config } from '@cyanheads/mcp-ts-core/config';
-import { logger } from '@cyanheads/mcp-ts-core/utils';
+import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { buildScreeningService } from '@/services/screening/screening-service.js';
 
 /**
@@ -18,10 +18,18 @@ import { buildScreeningService } from '@/services/screening/screening-service.js
  * path, but the lifecycle scripts bypass `createApp()`, so it must happen here.
  * Honors `MCP_LOG_LEVEL` via the framework config; classifies as stdio (logs to
  * stderr, the honest transport for a CLI run).
+ *
+ * `ctx` is the run's request context — one `requestId` correlates every line of
+ * the run. A line's fields go in through `withExtra(ctx, { … })`: the logger
+ * prints a context's canonical keys and its `extra` bag, and drops any other key.
  */
-export async function bootstrap() {
+export async function bootstrap(operation: string) {
   await logger.initialize(config.logLevel, 'stdio');
-  return { service: buildScreeningService(), log: logger };
+  return {
+    service: buildScreeningService(),
+    log: logger,
+    ctx: requestContextService.createRequestContext({ operation }),
+  };
 }
 
 /** A long, abortable signal for hours-long init runs (caps a runaway harvest). */
