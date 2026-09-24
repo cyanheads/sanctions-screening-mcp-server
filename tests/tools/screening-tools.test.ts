@@ -5,8 +5,8 @@
  * @module tests/tools/screening-tools.test
  */
 
-import type { ErrorContract } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
@@ -14,6 +14,8 @@ import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.too
 import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
+import { parseEu, parseOfac, parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
+import { parseXml } from '@/services/screening/xml.js';
 import {
   emptyGlobalService,
   type SeededService,
@@ -221,6 +223,485 @@ describe('query-token coverage on both client surfaces (issue #15)', () => {
     expect(result.matches[0]?.matchType).toBe('exact');
     expect(result.matches[0]?.queryTokenCoverage).toBeUndefined();
     expect(renderFormat(resolveEntityTool, result)).not.toContain('query tokens');
+  });
+});
+
+describe('names with no searchable token (issue #20)', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  const unsearchable = ['   ', '---', '«»', '̖́'];
+
+  it.each(unsearchable)(
+    'screen_name rejects %j with the declared reason and recovery',
+    async (name) => {
+      await expect(
+        screenNameTool.handler(screenNameTool.input.parse({ name }), ctxFor(screenNameTool.errors)),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'name_not_searchable',
+          recovery: { hint: expect.stringMatching(/letter or digit/) },
+        },
+      });
+    },
+  );
+
+  it.each(unsearchable)(
+    'resolve_entity rejects %j with the declared reason and recovery',
+    async (name) => {
+      await expect(
+        resolveEntityTool.handler(
+          resolveEntityTool.input.parse({ name }),
+          ctxFor(resolveEntityTool.errors),
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.InvalidParams,
+        data: {
+          reason: 'name_not_searchable',
+          recovery: { hint: expect.stringMatching(/letter or digit/) },
+        },
+      });
+    },
+  );
+
+  it('reports the rejection on the wire as an error, never as a zero-hit success', async () => {
+    for (const tool of [screenNameTool, resolveEntityTool]) {
+      const result = await runToolContract(tool, { name: '---' });
+      expect(result.isError, tool.name).toBe(true);
+      const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+      expect(text, tool.name).toMatch(/letter or digit/);
+      expect(JSON.stringify(result.structuredContent ?? {}), tool.name).not.toContain(
+        '"normalizedQuery":""',
+      );
+    }
+  });
+
+  it('leaves the internal cross-reference screen of a symbol-only legal name to answer empty', async () => {
+    await seeded.service.ingestLeiEntities([
+      { lei: '529900SYMBOLONLY0001', legalName: '***', otherNames: [] },
+    ]);
+    const result = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: '529900SYMBOLONLY0001' }),
+      ctxFor(getEntityTool.errors),
+    );
+    expect(result.legalName).toBe('***');
+    expect(result.sanctionsHits).toEqual([]);
+  });
+
+  it('declares the reason on both name tools', () => {
+    for (const tool of [screenNameTool, resolveEntityTool]) {
+      expect(tool.errors?.find((e) => e.reason === 'name_not_searchable')?.code, tool.name).toBe(
+        JsonRpcErrorCode.InvalidParams,
+      );
+    }
+  });
+
+  it('still screens a native-script name on both surfaces', async () => {
+    await seeded.service.ingestDesignations([
+      {
+        id: 'eu:514',
+        source: 'eu',
+        sourceEntryId: '514',
+        entityType: 'person',
+        primaryName: 'عبد المنان آغا',
+        payload: {
+          aliases: [],
+          identifiers: [],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+        },
+      },
+    ]);
+    const ctx = ctxFor(screenNameTool.errors);
+    const result = await screenNameTool.handler(
+      screenNameTool.input.parse({ name: 'عبد المنان آغا' }),
+      ctx,
+    );
+    expect(result.hits[0]).toMatchObject({ sourceEntryId: '514', matchType: 'exact' });
+    expect(getEnrichment(ctx)).toMatchObject({ normalizedQuery: 'عبد المنان اغا' });
+    expect(renderFormat(screenNameTool, result)).toContain('### عبد المنان آغا — exact');
+  });
+
+  it('keeps the not-a-clearance notice on a native-script query that matches nothing', async () => {
+    const ctx = ctxFor(screenNameTool.errors);
+    const result = await screenNameTool.handler(
+      screenNameTool.input.parse({ name: 'Несуществующий Человек', matchMode: 'fuzzy' }),
+      ctx,
+    );
+    expect(result.hits).toHaveLength(0);
+    expect(getEnrichment(ctx)).toMatchObject({
+      matchModeUsed: 'fuzzy',
+      normalizedQuery: 'несуществующии человек',
+    });
+    expect(getEnrichment(ctx).notice).toMatch(/NOT a clearance/);
+  });
+});
+
+describe('names past the matching bound', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  /** `n` distinct words, so each one would cost its own fuzzy blocking scan. */
+  const words = (n: number): string => Array.from({ length: n }, (_, i) => `w${i}q`).join(' ');
+  const tooLong: [label: string, name: string][] = [
+    ['65 words', words(65)],
+    ['1,025 characters', 'a'.repeat(1025)],
+  ];
+  const tooLongError = {
+    code: JsonRpcErrorCode.InvalidParams,
+    data: { reason: 'name_too_long', recovery: { hint: expect.stringMatching(/64 words/) } },
+  };
+
+  it.each(tooLong)(
+    'screen_name rejects %s with the declared reason and recovery',
+    async (_l, name) => {
+      await expect(
+        screenNameTool.handler(screenNameTool.input.parse({ name }), ctxFor(screenNameTool.errors)),
+      ).rejects.toMatchObject(tooLongError);
+    },
+  );
+
+  it.each(tooLong)(
+    'resolve_entity rejects %s with the declared reason and recovery',
+    async (_l, name) => {
+      await expect(
+        resolveEntityTool.handler(
+          resolveEntityTool.input.parse({ name }),
+          ctxFor(resolveEntityTool.errors),
+        ),
+      ).rejects.toMatchObject(tooLongError);
+    },
+  );
+
+  it('matches a name at the bound on both tools', async () => {
+    for (const name of [words(64), 'a'.repeat(1024)]) {
+      const screened = await screenNameTool.handler(
+        screenNameTool.input.parse({ name, matchMode: 'fuzzy' }),
+        ctxFor(screenNameTool.errors),
+      );
+      expect(screened.caveat).toBeTruthy();
+      const resolved = await resolveEntityTool.handler(
+        resolveEntityTool.input.parse({ name, matchMode: 'fuzzy' }),
+        ctxFor(resolveEntityTool.errors),
+      );
+      expect(resolved.matches).toBeInstanceOf(Array);
+    }
+  });
+
+  it('reports the rejection on the wire as an error', async () => {
+    for (const tool of [screenNameTool, resolveEntityTool]) {
+      const result = await runToolContract(tool, { name: words(65) });
+      expect(result.isError, tool.name).toBe(true);
+      const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+      expect(text, tool.name).toMatch(/64 words/);
+    }
+  });
+
+  it('declares the reason on both name tools', () => {
+    for (const tool of [screenNameTool, resolveEntityTool]) {
+      expect(tool.errors?.find((e) => e.reason === 'name_too_long')?.code, tool.name).toBe(
+        JsonRpcErrorCode.InvalidParams,
+      );
+    }
+  });
+});
+
+describe('decoded entity references on both surfaces (issue #21)', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+    // Parsed from source-shaped XML, so the decode under test is the parser's own.
+    await seeded.service.ingestDesignations([
+      ...parseOfac(
+        parseXml(`<Sanctions>
+          <ReferenceValueSets><AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues></ReferenceValueSets>
+          <DistinctParties><DistinctParty FixedRef="40972"><Profile ID="40972"><Identity ID="1">
+            <Alias AliasTypeID="1403" Primary="true"><DocumentedName ID="1">
+              <DocumentedNamePart><NamePartValue>Greenland Oil &amp; Gas Trading FZE</NamePartValue></DocumentedNamePart>
+            </DocumentedName></Alias>
+            <Alias AliasTypeID="1403" Primary="false"><DocumentedName ID="2">
+              <DocumentedNamePart><NamePartValue>جرينلاند اويل &amp; غاز تريدينغ م م ح</NamePartValue></DocumentedNamePart>
+            </DocumentedName></Alias>
+          </Identity></Profile></DistinctParty></DistinctParties>
+        </Sanctions>`),
+        'ofac_sdn',
+      ),
+      ...parseEu(
+        parseXml(`<export><sanctionEntity logicalId="140494">
+          <subjectType code="enterprise"/><nameAlias wholeName="ПАО &quot;КАМАЗ&quot;" strong="true"/>
+        </sanctionEntity></export>`),
+      ),
+      ...parseUk(
+        parseXml(`<Designations><Designation><UniqueID>AQD0011</UniqueID>
+          <Names><Name><Name6>AL-HARAMAIN &amp; AL MASJED AL-AQSA</Name6><NameType>Primary Name</NameType></Name></Names>
+          <OtherInformation>Formerly A &amp; B</OtherInformation>
+        </Designation></Designations>`),
+      ),
+    ]);
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  it.each([
+    ['ofac_sdn', '40972', 'Greenland Oil & Gas Trading FZE'],
+    ['eu', '140494', 'ПАО "КАМАЗ"'],
+    ['uk', 'AQD0011', 'AL-HARAMAIN & AL MASJED AL-AQSA'],
+  ] as const)(
+    'get_designation returns %s/%s decoded on both surfaces',
+    async (source, entryId, primaryName) => {
+      const result = await getDesignationTool.handler(
+        getDesignationTool.input.parse({ source, entryId }),
+        ctxFor(getDesignationTool.errors),
+      );
+      expect(result.primaryName).toBe(primaryName);
+      expect(JSON.stringify(result)).not.toMatch(/&(amp|quot);/);
+      const text = renderFormat(getDesignationTool, result);
+      expect(text).toContain(primaryName);
+      expect(text).not.toMatch(/&(amp|quot);/);
+    },
+  );
+
+  it('get_designation decodes the remarks on both surfaces', async () => {
+    const result = await getDesignationTool.handler(
+      getDesignationTool.input.parse({ source: 'uk', entryId: 'AQD0011' }),
+      ctxFor(getDesignationTool.errors),
+    );
+    expect(result.remarks).toBe('Formerly A & B');
+    expect(renderFormat(getDesignationTool, result)).toContain('**Remarks:** Formerly A & B');
+  });
+
+  it('screen_name reaches exact on the correctly spelled name', async () => {
+    const result = await screenNameTool.handler(
+      screenNameTool.input.parse({ name: 'Greenland Oil & Gas Trading FZE' }),
+      ctxFor(screenNameTool.errors),
+    );
+    expect(result.hits[0]).toMatchObject({
+      sourceEntryId: '40972',
+      matchType: 'exact',
+      matchedName: 'Greenland Oil & Gas Trading FZE',
+    });
+    expect(renderFormat(screenNameTool, result)).toContain(
+      'Matched on:** "Greenland Oil & Gas Trading FZE" (primary)',
+    );
+  });
+
+  it.each(['amp', 'quot'])('screen_name %j matches no name through an entity', async (name) => {
+    const result = await screenNameTool.handler(
+      screenNameTool.input.parse({ name, matchMode: 'fuzzy' }),
+      ctxFor(screenNameTool.errors),
+    );
+    const decodedIds = new Set(['40972', '140494', 'AQD0011']);
+    expect(result.hits.filter((hit) => decodedIds.has(hit.sourceEntryId))).toEqual([]);
+  });
+});
+
+describe('published designation details on both surfaces (issue #22)', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+    // Parsed from source-shaped XML, so each group is the normalizer's own read.
+    await seeded.service.ingestDesignations([
+      ...parseOfac(
+        parseXml(`<Sanctions>
+          <ReferenceValueSets>
+            <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+            <CountryValues><Country ID="11216" ISO2="VE">Venezuela</Country></CountryValues>
+            <FeatureTypeValues>
+              <FeatureType ID="8">Birthdate</FeatureType><FeatureType ID="9">Place of Birth</FeatureType>
+              <FeatureType ID="11">Citizenship Country</FeatureType><FeatureType ID="25">Location</FeatureType>
+            </FeatureTypeValues>
+            <IDRegDocTypeValues><IDRegDocType ID="1570">Cedula No.</IDRegDocType></IDRegDocTypeValues>
+            <LocPartTypeValues>
+              <LocPartType ID="1">Unknown</LocPartType><LocPartType ID="1454">CITY</LocPartType><LocPartType ID="1455">STATE/PROVINCE</LocPartType>
+            </LocPartTypeValues>
+          </ReferenceValueSets>
+          <Locations>
+            <Location ID="34442"><LocationCountry CountryID="11216" CountryRelevanceID="1413" />
+              <LocationPart LocPartTypeID="1454"><LocationPartValue Primary="true"><Value>Caracas</Value></LocationPartValue></LocationPart>
+              <LocationPart LocPartTypeID="1455"><LocationPartValue Primary="true"><Value>Capital District</Value></LocationPartValue></LocationPart>
+            </Location>
+            <Location ID="186216"><LocationPart LocPartTypeID="1"><LocationPartValue Primary="true"><Value>Venezuela</Value></LocationPartValue></LocationPart></Location>
+          </Locations>
+          <IDRegDocuments>
+            <IDRegDocument ID="14375" IDRegDocTypeID="1570" IdentityID="14494" IssuedBy-CountryID="11216" ValidityID="1"><IDRegistrationNo>5892464</IDRegistrationNo></IDRegDocument>
+          </IDRegDocuments>
+          <DistinctParties>
+            <DistinctParty FixedRef="22790"><Profile ID="22790"><Identity ID="14494">
+              <Alias AliasTypeID="1403" Primary="true"><DocumentedName ID="1">
+                <DocumentedNamePart><NamePartValue>MADURO MOROS</NamePartValue></DocumentedNamePart>
+                <DocumentedNamePart><NamePartValue>Nicolas</NamePartValue></DocumentedNamePart>
+              </DocumentedName></Alias></Identity>
+              <Feature FeatureTypeID="8"><FeatureVersion ID="1"><DatePeriod><Start><From><Year>1962</Year><Month>11</Month><Day>23</Day></From></Start></DatePeriod></FeatureVersion></Feature>
+              <Feature FeatureTypeID="9"><FeatureVersion ID="2"><VersionDetail DetailTypeID="1432">Caracas, Venezuela</VersionDetail></FeatureVersion></Feature>
+              <Feature FeatureTypeID="11"><FeatureVersion ID="3"><VersionLocation LocationID="186216" /></FeatureVersion></Feature>
+              <Feature FeatureTypeID="25"><FeatureVersion ID="4"><VersionLocation LocationID="34442" /></FeatureVersion></Feature>
+            </Profile></DistinctParty>
+            <DistinctParty FixedRef="30002"><Profile ID="30002"><Identity ID="7001">
+              <Alias AliasTypeID="1403" Primary="true"><DocumentedName ID="2"><DocumentedNamePart><NamePartValue>SPARSE Party</NamePartValue></DocumentedNamePart></DocumentedName></Alias>
+              </Identity>
+              <Feature FeatureTypeID="25"><FeatureVersion ID="5"><VersionLocation LocationID="424242" /></FeatureVersion></Feature>
+            </Profile></DistinctParty>
+          </DistinctParties>
+        </Sanctions>`),
+        'ofac_sdn',
+      ),
+      ...parseEu(
+        parseXml(`<export><sanctionEntity logicalId="507" euReferenceNumber="EU.513.75">
+          <subjectType code="person" classificationCode="P"/>
+          <nameAlias wholeName="Abdul Rahman Yasin" strong="true"/>
+          <citizenship countryIso2Code="US" countryDescription="UNITED STATES"/>
+          <birthdate city="Bloomington, Indiana" birthdate="1960-04-10" year="1960" region="" place="" countryIso2Code="US" countryDescription="UNITED STATES"/>
+          <address city="" street="" poBox="" zipCode="" region="" place="" countryIso2Code="00" countryDescription="UNKNOWN"/>
+          <identification number="27082171" identificationTypeDescription="National passport" countryIso2Code="US" countryDescription="UNITED STATES"/>
+        </sanctionEntity></export>`),
+      ),
+      ...parseUk(
+        parseXml(`<Designations><Designation><UniqueID>AFG0055</UniqueID>
+          <Names><Name><Name1>NAJIBULLAH</Name1><Name2>HAQQANI</Name2><NameType>Primary Name</NameType></Name></Names>
+          <IndividualEntityShip>Individual</IndividualEntityShip>
+          <Addresses><Address><AddressLine1>Kabul</AddressLine1><AddressCountry>Afghanistan</AddressCountry></Address></Addresses>
+          <IndividualDetails><Individual>
+            <DOBs><DOB>dd/mm/1971</DOB><DOB>24/10/1972</DOB></DOBs>
+            <PassportDetails><Passport><PassportNumber>D0009871</PassportNumber></Passport></PassportDetails>
+            <Nationalities><Nationality>Afghanistan</Nationality></Nationalities>
+            <BirthDetails><Location><TownOfBirth>Moni village</TownOfBirth><CountryOfBirth>Afghanistan</CountryOfBirth></Location></BirthDetails>
+          </Individual></IndividualDetails>
+        </Designation></Designations>`),
+      ),
+      ...parseUn(
+        parseXml(`<CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL>
+          <DATAID>6908002</DATAID><FIRST_NAME>IRUTA DOUGLAS</FIRST_NAME><SECOND_NAME>MPAMO</SECOND_NAME>
+          <NATIONALITY><VALUE>Democratic Republic of the Congo</VALUE></NATIONALITY>
+          <INDIVIDUAL_ADDRESS><CITY>Gisenyi</CITY><COUNTRY>Rwanda</COUNTRY></INDIVIDUAL_ADDRESS>
+          <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>EXACT</TYPE_OF_DATE><DATE>1965-12-28</DATE></INDIVIDUAL_DATE_OF_BIRTH>
+          <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>EXACT</TYPE_OF_DATE><DATE>1965-12-29</DATE></INDIVIDUAL_DATE_OF_BIRTH>
+          <INDIVIDUAL_PLACE_OF_BIRTH><CITY>Goma</CITY><COUNTRY>Democratic Republic of the Congo</COUNTRY></INDIVIDUAL_PLACE_OF_BIRTH>
+          <INDIVIDUAL_DOCUMENT/>
+        </INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>`),
+      ),
+    ]);
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  const getDesignation = (source: 'ofac_sdn' | 'eu' | 'uk' | 'un', entryId: string) =>
+    getDesignationTool.handler(
+      getDesignationTool.input.parse({ source, entryId }),
+      ctxFor(getDesignationTool.errors),
+    );
+
+  it.each([
+    [
+      'ofac_sdn',
+      '22790',
+      {
+        identifiers: [{ type: 'Cedula No.', value: '5892464', country: 'Venezuela' }],
+        addresses: [{ full: 'Caracas, Capital District, Venezuela', country: 'Venezuela' }],
+        datesOfBirth: [{ date: '1962-11-23', place: 'Caracas, Venezuela' }],
+        nationalities: ['Venezuela'],
+      },
+      [
+        '**Cedula No.:** 5892464 (Venezuela)',
+        '- Caracas, Capital District, Venezuela\n',
+        '- 1962-11-23 at Caracas, Venezuela',
+        '**Nationalities:** Venezuela',
+      ],
+    ],
+    [
+      'eu',
+      '507',
+      {
+        identifiers: [{ type: 'National passport', value: '27082171', country: 'UNITED STATES' }],
+        addresses: [],
+        datesOfBirth: [{ date: '1960-04-10', place: 'Bloomington, Indiana, UNITED STATES' }],
+        nationalities: ['UNITED STATES'],
+      },
+      [
+        '**National passport:** 27082171 (UNITED STATES)',
+        '- 1960-04-10 at Bloomington, Indiana, UNITED STATES',
+      ],
+    ],
+    [
+      'uk',
+      'AFG0055',
+      {
+        identifiers: [{ type: 'Passport', value: 'D0009871' }],
+        addresses: [{ full: 'Kabul, Afghanistan', country: 'Afghanistan' }],
+        datesOfBirth: [
+          { date: 'dd/mm/1971' },
+          { date: '24/10/1972' },
+          { place: 'Moni village, Afghanistan' },
+        ],
+        nationalities: ['Afghanistan'],
+      },
+      [
+        '**Passport:** D0009871',
+        '- Kabul, Afghanistan\n',
+        '- dd/mm/1971\n',
+        '- Born in Moni village, Afghanistan',
+        '**Nationalities:** Afghanistan',
+      ],
+    ],
+    [
+      'un',
+      '6908002',
+      {
+        identifiers: [],
+        addresses: [{ full: 'Gisenyi, Rwanda', country: 'Rwanda' }],
+        datesOfBirth: [
+          { date: '1965-12-28' },
+          { date: '1965-12-29' },
+          { place: 'Goma, Democratic Republic of the Congo' },
+        ],
+        nationalities: ['Democratic Republic of the Congo'],
+      },
+      ['- Gisenyi, Rwanda\n', '- 1965-12-29\n', '- Born in Goma, Democratic Republic of the Congo'],
+    ],
+  ] as const)(
+    'get_designation returns %s/%s with every published group on both surfaces',
+    async (source, entryId, groups, lines) => {
+      const result = await getDesignation(source, entryId);
+      expect({
+        identifiers: result.identifiers,
+        addresses: result.addresses,
+        datesOfBirth: result.datesOfBirth,
+        nationalities: result.nationalities,
+      }).toEqual(groups);
+      const text = renderFormat(getDesignationTool, result);
+      for (const line of lines) expect(text).toContain(line);
+      // content[] carries no placeholder the structured record does not.
+      expect(text).not.toContain('Unknown date');
+    },
+  );
+
+  it('get_designation returns every group empty for a sparse record, and format() renders none', async () => {
+    const headings = ['## Identifiers', '## Addresses', '## Dates of birth', 'Nationalities:'];
+    const sparse = await getDesignation('ofac_sdn', '30002');
+    expect(sparse).toMatchObject({
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+    });
+    const text = renderFormat(getDesignationTool, sparse);
+    for (const heading of headings) expect(text).not.toContain(heading);
+    // The populated sibling from the same document renders every group.
+    const full = renderFormat(getDesignationTool, await getDesignation('ofac_sdn', '22790'));
+    for (const heading of headings) expect(full).toContain(heading);
   });
 });
 

@@ -123,7 +123,11 @@ describe('sanctions_get_designation format()', () => {
         { type: 'Tax ID', value: 'TIN-88' },
       ],
       addresses: [{ full: '1 Tverskaya St, Moscow', country: 'RU' }, { full: 'PO Box 9' }],
-      datesOfBirth: [{ date: '1971-04-02', place: 'Leningrad' }, { place: 'Unknown city' }],
+      datesOfBirth: [
+        { date: '1971-04-02', place: 'Leningrad' },
+        { date: '1972' },
+        { place: 'Kazan, Tatarstan' },
+      ],
       nationalities: ['RU', 'CY'],
       remarks: 'Linked to a designated entity.',
     });
@@ -140,9 +144,31 @@ describe('sanctions_get_designation format()', () => {
     expect(text).toContain('- 1 Tverskaya St, Moscow — RU');
     expect(text).toContain('- PO Box 9');
     expect(text).toContain('- 1971-04-02 at Leningrad');
-    expect(text).toContain('- Unknown date at Unknown city');
+    // A date alone and a place alone render as published, with no placeholder
+    // for the half the source did not publish.
+    expect(text.split('\n')).toContain('- 1972');
+    expect(text.split('\n')).toContain('- Born in Kazan, Tatarstan');
+    expect(text).not.toMatch(/unknown/i);
     expect(text).toContain('Nationalities:** RU, CY');
     expect(text).toContain('Remarks:** Linked to a designated entity.');
+  });
+
+  it('names an address country once, whether or not the rendered address already ends with it', () => {
+    const lines = render(getDesignationTool, {
+      ...base,
+      addresses: [
+        { full: 'Kabul, Afghanistan', country: 'Afghanistan' },
+        { full: 'Afghanistan', country: 'Afghanistan' },
+        // A country that only ends the last component is not that component.
+        { full: 'Port Moresby, Papua New Guinea', country: 'Guinea' },
+        { full: '1 Tverskaya St, Moscow', country: 'RU' },
+      ],
+    }).split('\n');
+
+    expect(lines).toContain('- Kabul, Afghanistan');
+    expect(lines).toContain('- Afghanistan');
+    expect(lines).toContain('- Port Moresby, Papua New Guinea — Guinea');
+    expect(lines).toContain('- 1 Tverskaya St, Moscow — RU');
   });
 
   it('drops every optional section when the source published none', () => {

@@ -5,7 +5,9 @@
  * common {@link NormalizedDesignation} schema. The {@link createSanctionsSync}
  * factory wires them into the MirrorService `sync` generator: each refresh
  * re-harvests every source in full (the combined corpus is tens of thousands of
- * rows — no delta logic needed), yielding bounded pages as records arrive.
+ * rows — no delta logic needed), yielding bounded pages as records arrive, then
+ * removes each source's stored designations its complete document no longer
+ * published.
  *
  * **Why streaming.** `SDN_ADVANCED.XML` is ~120 MiB of the ~172 MiB sanctions
  * corpus. Buffering a document and DOM-parsing it held the XML string, the
@@ -21,7 +23,11 @@
  * `<DistinctParty>`. A single forward pass cannot attach those fields inline.
  * Both columns are nullable, so parties stream out as they are read and the
  * programme fields are collected behind them into {@link DeferredDesignationFields},
- * applied by the sync as an UPDATE once the source's rows have landed.
+ * applied by the sync as an UPDATE once the source's rows have landed. The other
+ * direction is forward: a party's addresses, nationalities, and identity
+ * documents point back into `<Locations>` and `<IDRegDocuments>`, which the
+ * schema publishes before the parties, so those blocks fold into a small index of
+ * rendered strings as they stream past.
  *
  * The XML shapes differ wildly across sources; each parser is defensive about
  * sparsity and arrays-of-one (fast-xml-parser collapses single children to
@@ -50,7 +56,11 @@ import type {
   SourceCode,
 } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
-import { decodeUtf8Stream, scanRecordFragments } from '@/services/screening/xml-stream.js';
+import {
+  decodeUtf8Stream,
+  requireCompleteDocument,
+  scanRecordFragments,
+} from '@/services/screening/xml-stream.js';
 
 /**
  * Columns a source can only publish after the records they belong to — keyed by
@@ -144,12 +154,108 @@ function opt<K extends string>(key: K, value: string | undefined): Record<K, str
   return value ? { [key]: value } : {};
 }
 
+// ─── Detail groups ──────────────────────────────────────────────────────────────
+//
+// Shared by every normalizer's identifiers, addresses, dates and places of birth,
+// and nationalities. Absence stays absence: a component that carries no letter or
+// digit, or that is a placeholder, is not published; an entry with no published
+// component is skipped; and nothing is inferred from another group.
+
+/**
+ * Whole values the sources write where they have nothing to publish: the EU's
+ * `UNKNOWN` country and the UN's `na`. Matched case-insensitively against the
+ * whole component only. Names never pass through here, so a name part such as the
+ * surname `Na` is untouched; and no detail read takes a country *code* (every
+ * country is read by name), so Namibia's ISO code `NA` never reaches this test.
+ */
+const PLACEHOLDER_VALUES = new Set(['na', 'unknown']);
+
+/**
+ * One published detail component: text carrying a letter or digit that is not a
+ * placeholder, so a lone `-`, `UNKNOWN`, or `na` reads as absent.
+ */
+function componentText(value: unknown): string | undefined {
+  const text = asText(value);
+  if (!text || PLACEHOLDER_VALUES.has(text.toLowerCase())) return;
+  return /[\p{L}\p{N}]/u.test(text) ? text : undefined;
+}
+
+/**
+ * The elements at `path` below `node` (one element, or an array of them),
+ * flattened into one array. Any step may be a single element, a repeated one, or
+ * absent, as fast-xml-parser shapes it.
+ */
+function elementsAt(node: unknown, ...path: string[]): unknown[] {
+  let current = asArray(node);
+  for (const key of path) {
+    current = current.flatMap((n) =>
+      typeof n === 'object' && n !== null ? asArray((n as Record<string, unknown>)[key]) : [],
+    );
+  }
+  return current;
+}
+
+/** The published text of every element at `path` below `node`. */
+function textsAt(node: unknown, ...path: string[]): string[] {
+  return elementsAt(node, ...path)
+    .map(componentText)
+    .filter((x): x is string => Boolean(x));
+}
+
+/** Collapse exact duplicates within one group, keeping first-published order. */
+function dedupe<T>(items: readonly T[]): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = JSON.stringify(item);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** Published components joined with `, `, most specific first; undefined when none. */
+function joinParts(parts: readonly (string | undefined)[]): string | undefined {
+  const published = parts.filter((p): p is string => Boolean(p));
+  return published.length ? published.join(', ') : undefined;
+}
+
+/**
+ * Render one address: its components most specific first, the country last, and
+ * `country` set when published. Undefined when the source published neither.
+ */
+function toAddress(
+  parts: readonly (string | undefined)[],
+  country: string | undefined,
+): AddressRecord | undefined {
+  const full = joinParts([...parts, country]);
+  return full ? { full, ...opt('country', country) } : undefined;
+}
+
+/**
+ * Dates and places of birth a source publishes as two separate lists. The source
+ * links a date to a place only when it publishes exactly one of each; any other
+ * shape emits every date and every place as its own entry, since pairing them by
+ * position would assert a link the source never made.
+ */
+function birthRecords(dates: readonly string[], places: readonly string[]): DobRecord[] {
+  const uniqueDates = dedupe(dates);
+  const uniquePlaces = dedupe(places);
+  const [date] = uniqueDates;
+  const [place] = uniquePlaces;
+  if (date && place && uniqueDates.length === 1 && uniquePlaces.length === 1) {
+    return [{ date, place }];
+  }
+  return [...uniqueDates.map((d) => ({ date: d })), ...uniquePlaces.map((p) => ({ place: p }))];
+}
+
 /**
  * Open a source document as a stream of decoded text chunks: browser UA, retry
  * around the request, and the HTML-error-page guard applied to the head of the
  * body rather than the whole document. The retry covers establishing the
  * response; a mid-transfer failure surfaces on the consuming iteration, as it
- * does on the GLEIF streaming path.
+ * does on the GLEIF streaming path — and so does a document that ends before its
+ * root element closes ({@link requireCompleteDocument}), so a harvest that
+ * returns normally has read its whole document.
  */
 function openSourceTextStream(
   url: string,
@@ -183,7 +289,7 @@ function openSourceTextStream(
       if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(head)) {
         throw serviceUnavailable(`${source} returned HTML instead of XML — likely rate-limited.`);
       }
-      return replayTextStream(head, iterator, drained);
+      return requireCompleteDocument(replayTextStream(head, iterator, drained), source);
     },
     { operation: `harvest:${source}`, baseDelayMs: 2000, signal },
   );
@@ -282,11 +388,15 @@ function buildStreamingIngester(spec: StreamingSourceSpec): SanctionsIngester {
 /**
  * Record elements the OFAC scanner lifts out, covering both published schemas.
  * `<ReferenceValueSets>` (the head of an advanced document) resolves the numeric
- * type ids every party carries; `<SanctionsEntry>` (its tail) supplies the
- * deferred programme fields.
+ * type ids every party carries; `<Location>` and `<IDRegDocument>` (the two
+ * blocks between the head and the parties) are what a party's addresses,
+ * nationalities, and identifiers point at; `<SanctionsEntry>` (the tail)
+ * supplies the deferred programme fields.
  */
 const OFAC_RECORD_TAGS = [
   'ReferenceValueSets',
+  'Location',
+  'IDRegDocument',
   'DistinctParty',
   'SanctionsEntry',
   'sdnEntry',
@@ -298,13 +408,19 @@ const OFAC_RECORD_TAGS = [
  * the standard `<sdnEntry>` shape rides the same scan, so a deployment that
  * overrides the URL to a standard-schema file streams too.
  *
- * Document order does the sequencing: the reference sets arrive before the first
- * party and the programme entries after the last one, so a party normalizes with
- * its type ids resolved while its programme fields accumulate in
- * `state.deferredFields` for the sync to apply afterwards.
+ * Document order does the sequencing, and the schema fixes it: the root
+ * `xsd:sequence` puts `<ReferenceValueSets>`, `<Locations>`, and
+ * `<IDRegDocuments>` before `<DistinctParties>`, and `<SanctionsEntries>` after.
+ * So the reference sets resolve every type id, then each location and document
+ * folds into a cross-reference index as rendered strings, then each party
+ * normalizes against both while its programme fields accumulate in
+ * `state.deferredFields` for the sync to apply afterwards. The index lives only
+ * for this call; it grows with the two cross-referenced blocks, not with the
+ * party count.
  *
- * Shares {@link parseOfacAdvanced} / {@link parseOfacStandard} with the buffered
- * {@link parseOfac}, so both paths normalize a record identically.
+ * Shares {@link parseOfacAdvanced} / {@link parseOfacStandard} and the fold
+ * helpers with the buffered {@link parseOfac}, so both paths normalize a record
+ * identically.
  */
 export async function* streamOfacFromText(
   textChunks: AsyncIterable<string>,
@@ -312,20 +428,27 @@ export async function* streamOfacFromText(
   state: HarvestState,
 ): AsyncGenerator<NormalizedDesignation> {
   let refs = emptyOfacReferenceSets();
+  const xrefs = emptyOfacCrossReferences();
   for await (const fragment of scanRecordFragments(textChunks, OFAC_RECORD_TAGS)) {
     const body = recordBody(parseXml<Record<string, unknown>>(fragment.xml), fragment.name);
-    if (fragment.name === 'ReferenceValueSets') {
-      refs = buildOfacReferenceSets(body);
-      continue;
-    }
-    if (fragment.name === 'SanctionsEntry') {
-      foldOfacSanctionsEntry(body, state.deferredFields);
-      continue;
+    switch (fragment.name) {
+      case 'ReferenceValueSets':
+        refs = buildOfacReferenceSets(body);
+        continue;
+      case 'Location':
+        foldOfacLocation(body, refs, xrefs);
+        continue;
+      case 'IDRegDocument':
+        foldOfacIdRegDocument(body, refs, xrefs);
+        continue;
+      case 'SanctionsEntry':
+        foldOfacSanctionsEntry(body, state.deferredFields);
+        continue;
     }
     const record =
       fragment.name === 'sdnEntry'
         ? parseOfacStandard(body, source, state.rejections)
-        : parseOfacAdvanced(body, source, refs, EMPTY_PROGRAM_INDEX, state.rejections);
+        : parseOfacAdvanced(body, source, refs, xrefs, EMPTY_PROGRAM_INDEX, state.rejections);
     if (record) yield record;
   }
 }
@@ -364,25 +487,49 @@ export function parseOfac(
   const refs = buildOfacReferenceSets(
     (sanctions.ReferenceValueSets ?? {}) as Record<string, unknown>,
   );
+  const xrefs = emptyOfacCrossReferences();
+  for (const location of elementsAt(sanctions, 'Locations', 'Location')) {
+    foldOfacLocation(location as Record<string, unknown>, refs, xrefs);
+  }
+  for (const document of elementsAt(sanctions, 'IDRegDocuments', 'IDRegDocument')) {
+    foldOfacIdRegDocument(document as Record<string, unknown>, refs, xrefs);
+  }
   const programsByProfile = buildOfacProgramIndex(sanctions);
-  const parties = sanctions.DistinctParties as Record<string, unknown> | undefined;
-  return asArray(parties?.DistinctParty as unknown)
+  return elementsAt(sanctions, 'DistinctParties', 'DistinctParty')
     .map((p) =>
-      parseOfacAdvanced(p as Record<string, unknown>, source, refs, programsByProfile, rejections),
+      parseOfacAdvanced(
+        p as Record<string, unknown>,
+        source,
+        refs,
+        xrefs,
+        programsByProfile,
+        rejections,
+      ),
     )
     .filter(Boolean) as NormalizedDesignation[];
 }
 
 /**
- * The OFAC advanced schema encodes entity type, alias type, and feature type as
- * numeric IDs that resolve through `<ReferenceValueSets>`. This collects the
- * three lookups the party parser needs.
+ * The OFAC advanced schema encodes entity, alias, feature, country, location-part,
+ * and identity-document types as numeric IDs that resolve through
+ * `<ReferenceValueSets>`. This collects the lookups the fold helpers and the
+ * party parser need; each resolves an ID to the label the document publishes,
+ * so the parsers match on labels rather than on IDs.
  */
 interface OfacReferenceSets {
   /** AliasType ID → label (1400 = A.K.A., 1401 = F.K.A., …). */
   aliasType: Map<string, string>;
-  /** FeatureType ID → label (8 = Birthdate, 9 = Place of Birth, …). */
+  /**
+   * Country ID → name (11216 = Venezuela). OFAC's `undetermined` placeholder
+   * country is left out, so a reference to it reads as absence.
+   */
+  country: Map<string, string>;
+  /** FeatureType ID → label (8 = Birthdate, 9 = Place of Birth, 25 = Location, …). */
   featureType: Map<string, string>;
+  /** IDRegDocType ID → label (1570 = Cedula No., …). */
+  idRegDocType: Map<string, string>;
+  /** LocPartType ID → label (1451 = ADDRESS1, 1454 = CITY, 1 = Unknown, …). */
+  locPartType: Map<string, string>;
   /** PartySubType ID → label (Vessel / Aircraft / Unknown). */
   subTypeLabel: Map<string, string>;
   /** PartySubType ID → its PartyType ID (1 = Individual, 2 = Entity, 4 = Transport). */
@@ -393,10 +540,108 @@ interface OfacReferenceSets {
 function emptyOfacReferenceSets(): OfacReferenceSets {
   return {
     aliasType: new Map(),
+    country: new Map(),
     featureType: new Map(),
+    idRegDocType: new Map(),
+    locPartType: new Map(),
     subTypeToPartyType: new Map(),
     subTypeLabel: new Map(),
   };
+}
+
+/**
+ * What an advanced party's addresses, nationalities, and identifiers point at,
+ * held as rendered strings: the `<Location>` and `<IDRegDocument>` elements are
+ * parsed one at a time and discarded, so the index never retains a parse tree.
+ * A location that publishes no component has no entry, and a reference to it
+ * resolves to nothing — as does a reference to an ID the document never
+ * published.
+ */
+interface OfacCrossReferences {
+  /** IdentityID → the identity documents published for it, in document order. */
+  documents: Map<string, IdentifierRecord[]>;
+  /** Location ID → the location rendered with the address rule. */
+  locations: Map<string, AddressRecord>;
+}
+
+function emptyOfacCrossReferences(): OfacCrossReferences {
+  return { documents: new Map(), locations: new Map() };
+}
+
+/**
+ * The order an address's parts render in, most specific first, by
+ * `LocPartType` label. A part type outside this list (the `Unknown` part that
+ * names a nationality target's country) follows them in document order.
+ */
+const OFAC_ADDRESS_PART_ORDER = [
+  'ADDRESS1',
+  'ADDRESS2',
+  'ADDRESS3',
+  'CITY',
+  'STATE/PROVINCE',
+  'POSTAL CODE',
+  'REGION',
+];
+
+/**
+ * Fold one `<Location>` into the cross-reference index. Each part contributes its
+ * `Primary="true"` value (original-script variants are non-primary), in
+ * {@link OFAC_ADDRESS_PART_ORDER}, and the `LocationCountry` name comes last.
+ * OFAC's no-address placeholder — a location holding only the `undetermined`
+ * area code — renders to nothing and gets no entry. Shared by the buffered
+ * {@link parseOfac} and the streaming scan.
+ */
+function foldOfacLocation(
+  location: Record<string, unknown>,
+  refs: OfacReferenceSets,
+  index: OfacCrossReferences,
+): void {
+  const id = asText(location['@_ID']);
+  if (!id) return;
+  const rank = (label: string | undefined) => {
+    const at = OFAC_ADDRESS_PART_ORDER.indexOf(label ?? '');
+    return at === -1 ? OFAC_ADDRESS_PART_ORDER.length : at;
+  };
+  const parts = asArray(location.LocationPart as unknown)
+    .map((raw) => {
+      const part = raw as Record<string, unknown>;
+      const primary = asArray(part.LocationPartValue as unknown).find(
+        (v) => asText((v as Record<string, unknown>)['@_Primary']) === 'true',
+      ) as Record<string, unknown> | undefined;
+      return {
+        rank: rank(refs.locPartType.get(asText(part['@_LocPartTypeID']) ?? '')),
+        value: componentText(primary?.Value),
+      };
+    })
+    .sort((a, b) => a.rank - b.rank)
+    .map((p) => p.value);
+  const country = elementsAt(location, 'LocationCountry')
+    .map((c) => refs.country.get(asText((c as Record<string, unknown>)['@_CountryID']) ?? ''))
+    .find(Boolean);
+  const address = toAddress(parts, country);
+  if (address) index.locations.set(id, address);
+}
+
+/**
+ * Fold one `<IDRegDocument>` into the cross-reference index under the
+ * `IdentityID` it belongs to: its type label, `IDRegistrationNo`, and issuing
+ * country name. A document whose type ID resolves to no label is a dangling
+ * reference and is dropped, like a dangling location. Shared by the buffered
+ * {@link parseOfac} and the streaming scan.
+ */
+function foldOfacIdRegDocument(
+  document: Record<string, unknown>,
+  refs: OfacReferenceSets,
+  index: OfacCrossReferences,
+): void {
+  const identityId = asText(document['@_IdentityID']);
+  const type = refs.idRegDocType.get(asText(document['@_IDRegDocTypeID']) ?? '');
+  const value = componentText(document.IDRegistrationNo);
+  if (!identityId || !type || !value) return;
+  const country = refs.country.get(asText(document['@_IssuedBy-CountryID']) ?? '');
+  const documents = index.documents.get(identityId) ?? [];
+  documents.push({ type, value, ...opt('country', country) });
+  index.documents.set(identityId, documents);
 }
 
 /**
@@ -407,27 +652,9 @@ function emptyOfacReferenceSets(): OfacReferenceSets {
 const EMPTY_PROGRAM_INDEX: DeferredDesignationFields = new Map();
 
 function buildOfacReferenceSets(sets: Record<string, unknown>): OfacReferenceSets {
-  const aliasType = new Map<string, string>();
-  for (const a of asArray(
-    (sets.AliasTypeValues as Record<string, unknown> | undefined)?.AliasType as unknown,
-  )) {
-    const id = asText((a as Record<string, unknown>)['@_ID']);
-    const label = asText((a as Record<string, unknown>)['#text'] ?? a);
-    if (id && label) aliasType.set(id, label);
-  }
-  const featureType = new Map<string, string>();
-  for (const f of asArray(
-    (sets.FeatureTypeValues as Record<string, unknown> | undefined)?.FeatureType as unknown,
-  )) {
-    const id = asText((f as Record<string, unknown>)['@_ID']);
-    const label = asText((f as Record<string, unknown>)['#text'] ?? f);
-    if (id && label) featureType.set(id, label);
-  }
   const subTypeToPartyType = new Map<string, string>();
   const subTypeLabel = new Map<string, string>();
-  for (const s of asArray(
-    (sets.PartySubTypeValues as Record<string, unknown> | undefined)?.PartySubType as unknown,
-  )) {
+  for (const s of elementsAt(sets, 'PartySubTypeValues', 'PartySubType')) {
     const sub = s as Record<string, unknown>;
     const id = asText(sub['@_ID']);
     if (!id) continue;
@@ -436,7 +663,33 @@ function buildOfacReferenceSets(sets: Record<string, unknown>): OfacReferenceSet
     const label = asText(sub['#text'] ?? sub);
     if (label) subTypeLabel.set(id, label);
   }
-  return { aliasType, featureType, subTypeToPartyType, subTypeLabel };
+  const country = ofacLabels(sets, 'CountryValues', 'Country');
+  for (const [id, name] of country) if (name.toLowerCase() === 'undetermined') country.delete(id);
+  return {
+    aliasType: ofacLabels(sets, 'AliasTypeValues', 'AliasType'),
+    country,
+    featureType: ofacLabels(sets, 'FeatureTypeValues', 'FeatureType'),
+    idRegDocType: ofacLabels(sets, 'IDRegDocTypeValues', 'IDRegDocType'),
+    locPartType: ofacLabels(sets, 'LocPartTypeValues', 'LocPartType'),
+    subTypeToPartyType,
+    subTypeLabel,
+  };
+}
+
+/** One `<…Values>` reference set as an `ID → element text` map. */
+function ofacLabels(
+  sets: Record<string, unknown>,
+  container: string,
+  item: string,
+): Map<string, string> {
+  const labels = new Map<string, string>();
+  for (const raw of elementsAt(sets, container, item)) {
+    const value = raw as Record<string, unknown>;
+    const id = asText(value['@_ID']);
+    const label = asText(value['#text'] ?? value);
+    if (id && label) labels.set(id, label);
+  }
+  return labels;
 }
 
 /**
@@ -533,53 +786,38 @@ function parseOfacStandard(
     })
     .filter((a) => isUsableName(a.name));
 
-  const identifiers: IdentifierRecord[] = asArray(
-    (e.idList as Record<string, unknown> | undefined)?.id as unknown,
-  )
-    .map((id) => {
+  const identifiers = dedupe(
+    elementsAt(e, 'idList', 'id').flatMap((id): IdentifierRecord[] => {
       const i = id as Record<string, unknown>;
-      return {
-        type: asText(i.idType) ?? 'ID',
-        value: asText(i.idNumber) ?? '',
-        ...opt('country', asText(i.idCountry)),
-      };
-    })
-    .filter((i) => i.value);
+      const value = componentText(i.idNumber);
+      return value
+        ? [{ type: asText(i.idType) ?? 'ID', value, ...opt('country', componentText(i.idCountry)) }]
+        : [];
+    }),
+  );
 
-  const addresses: AddressRecord[] = asArray(
-    (e.addressList as Record<string, unknown> | undefined)?.address as unknown,
-  )
-    .map((addr) => {
+  const addresses = dedupe(
+    elementsAt(e, 'addressList', 'address').flatMap((addr) => {
       const a = addr as Record<string, unknown>;
-      const parts = [
-        asText(a.address1),
-        asText(a.address2),
-        asText(a.city),
-        asText(a.stateOrProvince),
-        asText(a.postalCode),
-        asText(a.country),
-      ].filter(Boolean);
-      return {
-        full: parts.join(', '),
-        ...opt('country', asText(a.country)),
-      };
-    })
-    .filter((a) => a.full);
+      const address = toAddress(
+        [a.address1, a.address2, a.address3, a.city, a.stateOrProvince, a.postalCode].map(
+          componentText,
+        ),
+        componentText(a.country),
+      );
+      return address ? [address] : [];
+    }),
+  );
 
-  const dobs: DobRecord[] = asArray(
-    (e.dateOfBirthList as Record<string, unknown> | undefined)?.dateOfBirthItem as unknown,
-  )
-    .map((d) => {
-      const dd = d as Record<string, unknown>;
-      return opt('date', asText(dd.dateOfBirth)) as DobRecord;
-    })
-    .filter((d) => d.date);
+  const datesOfBirth = birthRecords(
+    textsAt(e, 'dateOfBirthList', 'dateOfBirthItem', 'dateOfBirth'),
+    textsAt(e, 'placeOfBirthList', 'placeOfBirthItem', 'placeOfBirth'),
+  );
 
-  const nationalities = asArray(
-    (e.nationalityList as Record<string, unknown> | undefined)?.nationality as unknown,
-  )
-    .map((n) => asText((n as Record<string, unknown>).country))
-    .filter((x): x is string => Boolean(x));
+  const nationalities = dedupe([
+    ...textsAt(e, 'nationalityList', 'nationality', 'country'),
+    ...textsAt(e, 'citizenshipList', 'citizenship', 'country'),
+  ]);
 
   const remarks = asText(e.remarks);
   const designationDate = remarks ? extractDateFromRemarks(remarks) : undefined;
@@ -589,13 +827,15 @@ function parseOfacStandard(
     sourceEntryId: uid,
     entityType: mapOfacType(sdnType),
     primaryName,
-    ...opt('program', asText(e.program)),
+    // Every `programList/program`, joined as the advanced schema joins a
+    // SanctionsEntry's measures.
+    ...opt('program', joinParts(elementsAt(e, 'programList', 'program').map(asText))),
     ...(designationDate ? { designationDate } : {}),
     payload: {
       aliases,
       identifiers,
       addresses,
-      datesOfBirth: dobs,
+      datesOfBirth,
       nationalities,
       ...opt('remarks', remarks),
     },
@@ -613,15 +853,19 @@ interface OfacAliasName {
  * Parse one advanced-schema `<DistinctParty>`. With attributes available this
  * reads the stable `FixedRef` entry id, the entity type (via `PartySubTypeID` →
  * `PartyType`), the primary name and typed aliases (via `AliasTypeID` /
- * `LowQuality`), and dates/places of birth (via `Feature` type ids). The
- * programme + designation date come from the `<SanctionsEntries>` index, keyed by
- * profile id. Resilient to the deep nesting and to sparse records; null when the
- * party carries neither a `FixedRef` nor an `ID`, or no usable name.
+ * `LowQuality`), the detail groups (via `Feature` type labels and the
+ * cross-reference index), and the identity documents joined on the party's
+ * `<Identity ID>`. The programme + designation date come from the
+ * `<SanctionsEntries>` index, keyed by profile id. Resilient to the deep nesting
+ * and to sparse records; null when the party carries neither a `FixedRef` nor an
+ * `ID`, or no usable name. A dangling cross-reference drops only the entry it
+ * would have produced.
  */
 function parseOfacAdvanced(
   p: Record<string, unknown>,
   source: SourceCode,
   refs: OfacReferenceSets,
+  xrefs: OfacCrossReferences,
   programsByProfile: DeferredDesignationFields,
   rejections: IngestRejections,
 ): NormalizedDesignation | null {
@@ -632,8 +876,9 @@ function parseOfacAdvanced(
     return null;
   }
 
+  const identities = asArray((profile?.Identity ?? profile?.identity) as unknown);
   const collected: OfacAliasName[] = [];
-  for (const ident of asArray((profile?.Identity ?? profile?.identity) as unknown)) {
+  for (const ident of identities) {
     for (const aliasRaw of asArray((ident as Record<string, unknown>).Alias as unknown)) {
       const alias = aliasRaw as Record<string, unknown>;
       const aliasLabel = refs.aliasType.get(asText(alias['@_AliasTypeID']) ?? '');
@@ -671,7 +916,13 @@ function parseOfacAdvanced(
     .filter((n) => n !== primaryEntry)
     .map((n) => ({ name: n.name, nameType: n.nameType }));
 
-  const { datesOfBirth, placesOfBirth } = extractOfacFeatures(profile, refs);
+  const features = extractOfacFeatures(profile, refs, xrefs);
+  const identifiers = dedupe(
+    identities.flatMap(
+      (ident) =>
+        xrefs.documents.get(asText((ident as Record<string, unknown>)['@_ID']) ?? '') ?? [],
+    ),
+  );
   const program = programsByProfile.get(id);
 
   return {
@@ -684,11 +935,10 @@ function parseOfacAdvanced(
     ...(program?.designationDate ? { designationDate: program.designationDate } : {}),
     payload: {
       aliases,
-      identifiers: [],
-      addresses: [],
-      datesOfBirth:
-        datesOfBirth.length || placesOfBirth.length ? mergeDobPob(datesOfBirth, placesOfBirth) : [],
-      nationalities: [],
+      identifiers,
+      addresses: dedupe(features.addresses),
+      datesOfBirth: birthRecords(features.datesOfBirth, features.placesOfBirth),
+      nationalities: dedupe(features.nationalities),
     },
   };
 }
@@ -723,56 +973,71 @@ function mapOfacPartySubType(subTypeId: string | undefined, refs: OfacReferenceS
   return 'unknown';
 }
 
-/** Birthdate / place-of-birth feature values pulled from a profile's `<Feature>`s. */
+/** The detail-group values a profile's `<Feature>`s publish, before dedupe and birth pairing. */
+interface OfacFeatureValues {
+  addresses: AddressRecord[];
+  datesOfBirth: string[];
+  nationalities: string[];
+  placesOfBirth: string[];
+}
+
+/**
+ * Pull the detail-group values out of a profile's `<Feature>`s, matched by
+ * feature-type label. A birthdate is a `DatePeriod`; a place of birth is free
+ * text in the `VersionDetail`; an address, nationality, or citizenship is a
+ * `VersionLocation` resolved through the cross-reference index — a nationality
+ * or citizenship target renders to its one country-name part. Every other
+ * feature (gender, title, vessel flag, registration country, …) has no
+ * normalized field.
+ */
 function extractOfacFeatures(
   profile: Record<string, unknown> | undefined,
   refs: OfacReferenceSets,
-): { datesOfBirth: string[]; placesOfBirth: string[] } {
-  const datesOfBirth: string[] = [];
-  const placesOfBirth: string[] = [];
+  xrefs: OfacCrossReferences,
+): OfacFeatureValues {
+  const values: OfacFeatureValues = {
+    addresses: [],
+    datesOfBirth: [],
+    nationalities: [],
+    placesOfBirth: [],
+  };
   for (const featRaw of asArray(profile?.Feature as unknown)) {
     const feat = featRaw as Record<string, unknown>;
     const label = refs.featureType.get(asText(feat['@_FeatureTypeID']) ?? '')?.toLowerCase();
-    if (label === 'birthdate') {
-      const date = ofacFeatureDate(feat);
-      if (date) datesOfBirth.push(date);
-    } else if (label === 'place of birth') {
-      const place = asText(
-        (feat.FeatureVersion as Record<string, unknown> | undefined)?.VersionLocation,
-      );
-      // Place often lives as free text in the VersionDetail; capture what's there.
-      const detail = asText(
-        (
-          (feat.FeatureVersion as Record<string, unknown> | undefined)?.VersionDetail as Record<
-            string,
-            unknown
-          >
-        )?.['#text'] ?? (feat.FeatureVersion as Record<string, unknown> | undefined)?.VersionDetail,
-      );
-      const pob = detail ?? place;
-      if (pob) placesOfBirth.push(pob);
+    for (const versionRaw of asArray(feat.FeatureVersion as unknown)) {
+      const version = versionRaw as Record<string, unknown>;
+      const locations = elementsAt(version, 'VersionLocation').flatMap((vl) => {
+        const location = xrefs.locations.get(
+          asText((vl as Record<string, unknown>)['@_LocationID']) ?? '',
+        );
+        return location ? [location] : [];
+      });
+      switch (label) {
+        case 'birthdate': {
+          const date = composeOfacDate(
+            elementsAt(version, 'DatePeriod', 'Start', 'From')[0] as
+              | Record<string, unknown>
+              | undefined,
+          );
+          if (date) values.datesOfBirth.push(date);
+          break;
+        }
+        case 'place of birth': {
+          const place = componentText(version.VersionDetail);
+          if (place) values.placesOfBirth.push(place);
+          break;
+        }
+        case 'location':
+          values.addresses.push(...locations);
+          break;
+        case 'nationality country':
+        case 'citizenship country':
+          values.nationalities.push(...locations.map((l) => l.full));
+          break;
+      }
     }
   }
-  return { datesOfBirth, placesOfBirth };
-}
-
-/** Pull an ISO-ish birthdate out of a `<Feature>`'s nested `DatePeriod`. */
-function ofacFeatureDate(feat: Record<string, unknown>): string | undefined {
-  const version = (feat.FeatureVersion ?? {}) as Record<string, unknown>;
-  const period = (version.DatePeriod ?? {}) as Record<string, unknown>;
-  const start = (period.Start ?? {}) as Record<string, unknown>;
-  const from = (start.From ?? {}) as Record<string, unknown>;
-  return composeOfacDate(from);
-}
-
-/** Zip parallel DOB and POB lists into DobRecords (best-effort pairing by index). */
-function mergeDobPob(dates: string[], places: string[]): DobRecord[] {
-  const len = Math.max(dates.length, places.length);
-  const out: DobRecord[] = [];
-  for (let i = 0; i < len; i++) {
-    out.push({ ...opt('date', dates[i]), ...opt('place', places[i]) } as DobRecord);
-  }
-  return out.filter((d) => d.date || d.place);
+  return values;
 }
 
 function mapOfacType(t: string | undefined): EntityType {
@@ -857,12 +1122,10 @@ function parseEuEntity(
     rejections.unusableName += 1;
     return null;
   }
-  const birthdates = asArray(e.birthdate as unknown)
-    .map((b) => asText((b as Record<string, unknown>)['@_birthdate']))
-    .filter((x): x is string => Boolean(x));
-  const citizenships = asArray(e.citizenship as unknown)
-    .map((c) => asText((c as Record<string, unknown>)['@_countryDescription']))
-    .filter((x): x is string => Boolean(x));
+  const citizenships = asArray(e.citizenship as unknown).flatMap((c) => {
+    const country = euText(c, 'countryDescription');
+    return country ? [country] : [];
+  });
 
   return {
     id: `eu:${id}`,
@@ -883,12 +1146,54 @@ function parseEuEntity(
         name: n.name,
         nameType: (n.strong ? 'aka' : 'low-quality-aka') as NameRecord['nameType'],
       })),
-      identifiers: [],
-      addresses: [],
-      datesOfBirth: birthdates.map((d) => ({ date: d })),
-      nationalities: citizenships,
+      identifiers: dedupe(asArray(e.identification as unknown).flatMap(euIdentifier)),
+      addresses: dedupe(asArray(e.address as unknown).flatMap(euAddress)),
+      datesOfBirth: dedupe(asArray(e.birthdate as unknown).flatMap(euBirth)),
+      nationalities: dedupe(citizenships),
     },
   };
+}
+
+/**
+ * One EU attribute value as published. The list writes `UNKNOWN` (with country
+ * code `00`) where it has no country; the shared placeholder rule reads that as
+ * absence.
+ */
+function euText(element: unknown, attribute: string): string | undefined {
+  return componentText((element as Record<string, unknown>)[`@_${attribute}`]);
+}
+
+/** An EU `<identification>`: its type description, number, and issuing country. */
+function euIdentifier(element: unknown): IdentifierRecord[] {
+  const type = euText(element, 'identificationTypeDescription');
+  const value = euText(element, 'number');
+  if (!type || !value) return [];
+  return [{ type, value, ...opt('country', euText(element, 'countryDescription')) }];
+}
+
+/** An EU `<address>`, skipped when it publishes nothing but the `UNKNOWN` country. */
+function euAddress(element: unknown): AddressRecord[] {
+  const address = toAddress(
+    ['street', 'poBox', 'place', 'city', 'region', 'zipCode'].map((a) => euText(element, a)),
+    euText(element, 'countryDescription'),
+  );
+  return address ? [address] : [];
+}
+
+/**
+ * An EU `<birthdate>`: the full date, else the year (with the month when the
+ * list publishes one), and the birthplace published on the same element. The
+ * date and place are one published fact, so they stay one entry.
+ */
+function euBirth(element: unknown): DobRecord[] {
+  const year = euText(element, 'year');
+  const month = euText(element, 'monthOfYear');
+  const date =
+    euText(element, 'birthdate') ?? (year && month ? `${year}-${month.padStart(2, '0')}` : year);
+  const place = joinParts(
+    ['place', 'city', 'region', 'countryDescription'].map((a) => euText(element, a)),
+  );
+  return date || place ? [{ ...opt('date', date), ...opt('place', place) } as DobRecord] : [];
 }
 
 function mapEuType(code: string | undefined): EntityType {
@@ -979,6 +1284,9 @@ function parseUkDesignation(
     rejections.unusableName += 1;
     return null;
   }
+  // Person-only details (dates, birthplaces, nationalities, passports, national
+  // IDs) are published under IndividualDetails, never directly on Designation.
+  const individuals = elementsAt(d, 'IndividualDetails', 'Individual');
 
   return {
     id: `uk:${id}`,
@@ -993,17 +1301,64 @@ function parseUkDesignation(
         name: n.name,
         nameType: 'aka' as NameRecord['nameType'],
       })),
-      identifiers: [],
-      addresses: [],
-      datesOfBirth: [],
-      nationalities: asArray(
-        (d.Nationalities as Record<string, unknown> | undefined)?.Nationality as unknown,
-      )
-        .map((x) => asText(x))
-        .filter((x): x is string => Boolean(x)),
+      identifiers: dedupe([
+        ...ukIdentifiers('Passport', individuals, 'PassportDetails', 'Passport', 'PassportNumber'),
+        ...ukIdentifiers(
+          'National Identifier',
+          individuals,
+          'NationalIdentifierDetails',
+          'NationalIdentifier',
+          'NationalIdentifierNumber',
+        ),
+        ...ukIdentifiers(
+          'Business Registration Number',
+          d,
+          'EntityDetails',
+          'Entity',
+          'BusinessRegistrationNumbers',
+          'BusinessRegistrationNumber',
+        ),
+        ...ukIdentifiers('IMO Number', d, 'ShipDetails', 'Ship', 'IMONumbers', 'IMONumber'),
+      ]),
+      addresses: dedupe(
+        elementsAt(d, 'Addresses', 'Address').flatMap((raw) => {
+          const a = raw as Record<string, unknown>;
+          const address = toAddress(
+            [
+              a.AddressLine1,
+              a.AddressLine2,
+              a.AddressLine3,
+              a.AddressLine4,
+              a.AddressLine5,
+              a.AddressLine6,
+              a.AddressPostalCode,
+            ].map(componentText),
+            componentText(a.AddressCountry),
+          );
+          return address ? [address] : [];
+        }),
+      ),
+      datesOfBirth: birthRecords(
+        textsAt(individuals, 'DOBs', 'DOB'),
+        elementsAt(individuals, 'BirthDetails', 'Location').flatMap((raw) => {
+          const l = raw as Record<string, unknown>;
+          const place = joinParts([componentText(l.TownOfBirth), componentText(l.CountryOfBirth)]);
+          return place ? [place] : [];
+        }),
+      ),
+      nationalities: dedupe(textsAt(individuals, 'Nationalities', 'Nationality')),
       ...opt('remarks', asText(d.OtherInformation)),
     },
   };
+}
+
+/**
+ * UKSL identifiers carry no type field and no issuing country — each kind sits in
+ * its own element, so the element names the type. The issuing country appears
+ * only inside free-text `…AdditionalInformation`, which is not parsed.
+ */
+function ukIdentifiers(type: string, node: unknown, ...path: string[]): IdentifierRecord[] {
+  return textsAt(node, ...path).map((value) => ({ type, value }));
 }
 
 function mapUkType(t: string | undefined): EntityType {
@@ -1092,18 +1447,23 @@ function parseUnEntry(
     })
     .filter((a) => isUsableName(a.name));
 
-  const dobs: DobRecord[] = asArray(e.INDIVIDUAL_DATE_OF_BIRTH)
-    .map((d) => {
-      const dd = d as Record<string, unknown>;
-      return opt('date', asText(dd.DATE) ?? asText(dd.YEAR)) as DobRecord;
-    })
-    .filter((d) => d.date);
+  // A BETWEEN date publishes only its year range; it renders as an ISO 8601
+  // interval (`1973/1974`).
+  const dates = asArray(e.INDIVIDUAL_DATE_OF_BIRTH).flatMap((d) => {
+    const dd = d as Record<string, unknown>;
+    const date =
+      componentText(dd.DATE) ??
+      componentText(dd.YEAR) ??
+      [componentText(dd.FROM_YEAR), componentText(dd.TO_YEAR)].filter(Boolean).join('/');
+    return date ? [date] : [];
+  });
+  const places = asArray(e.INDIVIDUAL_PLACE_OF_BIRTH).flatMap((p) => {
+    const pp = p as Record<string, unknown>;
+    const place = joinParts([pp.STREET, pp.CITY, pp.STATE_PROVINCE, pp.COUNTRY].map(componentText));
+    return place ? [place] : [];
+  });
 
-  const nationalities = asArray(
-    (e.NATIONALITY as Record<string, unknown> | undefined)?.VALUE as unknown,
-  )
-    .map((v) => asText(v))
-    .filter((x): x is string => Boolean(x));
+  const nationalities = dedupe(textsAt(e, 'NATIONALITY', 'VALUE'));
 
   return {
     id: `un:${id}`,
@@ -1115,18 +1475,28 @@ function parseUnEntry(
     ...opt('designationDate', asText(e.LISTED_ON)),
     payload: {
       aliases,
-      identifiers: asArray(e.INDIVIDUAL_DOCUMENT)
-        .map((d) => {
+      identifiers: dedupe(
+        asArray(e.INDIVIDUAL_DOCUMENT).flatMap((d): IdentifierRecord[] => {
           const dd = d as Record<string, unknown>;
-          return {
-            type: asText(dd.TYPE_OF_DOCUMENT) ?? 'Document',
-            value: asText(dd.NUMBER) ?? '',
-            ...opt('country', asText(dd.ISSUING_COUNTRY)),
-          };
-        })
-        .filter((x) => x.value),
-      addresses: [],
-      datesOfBirth: dobs,
+          const value = componentText(dd.NUMBER);
+          if (!value) return [];
+          const country = componentText(dd.ISSUING_COUNTRY) ?? componentText(dd.COUNTRY_OF_ISSUE);
+          return [
+            { type: asText(dd.TYPE_OF_DOCUMENT) ?? 'Document', value, ...opt('country', country) },
+          ];
+        }),
+      ),
+      addresses: dedupe(
+        [...asArray(e.INDIVIDUAL_ADDRESS), ...asArray(e.ENTITY_ADDRESS)].flatMap((a) => {
+          const aa = a as Record<string, unknown>;
+          const address = toAddress(
+            [aa.STREET, aa.CITY, aa.STATE_PROVINCE, aa.ZIP_CODE].map(componentText),
+            componentText(aa.COUNTRY),
+          );
+          return address ? [address] : [];
+        }),
+      ),
+      datesOfBirth: birthRecords(dates, places),
       nationalities,
       ...opt('remarks', asText(e.COMMENTS1)),
     },
@@ -1147,6 +1517,30 @@ export function buildSanctionsIngesters(): SanctionsIngester[] {
   ];
 }
 
+/** One source's harvest report plus what the sync removed for it. */
+export interface SourceSyncReport extends SourceHarvestReport {
+  /** Stored designations of this source its document no longer published, removed. */
+  pruned: number;
+  /**
+   * Stored designations its document no longer published but that the sync kept,
+   * because removing them would have crossed {@link MAX_PRUNE_SHARE}.
+   */
+  withheld: number;
+}
+
+/**
+ * The largest share of a source's stored designations one run may remove. The
+ * completeness check proves a document arrived whole, not that it is the whole
+ * list: a well-formed file that publishes a fraction of the list (a delta or test
+ * file behind a URL override, a partial upstream publication) or an upstream
+ * schema change that makes the ingest reject most records would otherwise empty
+ * the source. Real delistings move a few percent of a list at a time. A run over
+ * the bound removes nothing for that source, keeps its upserted records, and
+ * reports the ids it withheld; a genuine mass delisting is then applied by
+ * rebuilding the sanctions mirror from scratch.
+ */
+export const MAX_PRUNE_SHARE = 0.5;
+
 /** Wiring {@link createSanctionsSync} needs from the service that owns the mirror. */
 export interface SanctionsSyncOptions {
   /**
@@ -1157,10 +1551,15 @@ export interface SanctionsSyncOptions {
   applyDeferredFields(source: SourceCode, fields: DeferredDesignationFields): Promise<void>;
   /** Ingesters to harvest. Defaults to {@link buildSanctionsIngesters}. */
   ingesters?: SanctionsIngester[];
-  /** Called once per source, after its records and deferred columns are applied. */
-  onSourceReport?(report: SourceHarvestReport): void;
-  /** Designations per yielded page. Defaults to {@link SYNC_PAGE_SIZE}. */
+  /** Called once per source, after its records, deferred columns, and removals are applied. */
+  onSourceReport?(report: SourceSyncReport): void;
+  /** Designations (or removed ids) per yielded page. Defaults to {@link SYNC_PAGE_SIZE}. */
   pageSize?: number;
+  /**
+   * The ids of a source's stored designations that are not in `kept` — the rows
+   * its current document no longer publishes.
+   */
+  staleDesignationIds(source: SourceCode, kept: ReadonlySet<string>): Promise<string[]>;
 }
 
 /**
@@ -1172,21 +1571,42 @@ export interface SanctionsSyncOptions {
  *
  * After a source drains, its deferred columns (the OFAC programme fields, which
  * the source publishes after every party) are applied to the rows just written.
- * The mirror upserts the `designation` rows; the per-alias `name` index is
- * rebuilt from `designation.payload` afterwards by the service's
- * `rebuildNameIndex()`, which the lifecycle scripts and the refresh cron call.
+ * Then the source's stored designations its document no longer published are
+ * yielded as tombstones, so a delisting leaves the mirror on the next run.
+ *
+ * Pruning is per source and guarded, because a wrongly-emptied list is the worst
+ * failure a screening aid can have. It runs only once the source's harvest has
+ * returned normally — which means the document was fetched, arrived whole (a
+ * transfer cut short fails on its missing root close), and was parsed to its end
+ * — and only when the removal stays within {@link MAX_PRUNE_SHARE} of the
+ * source's stored rows, which also holds back a document that yielded no
+ * accepted record. A harvest that throws ends the run before its source prunes.
+ * The kept set is the ids the harvest accepted, so a designation the source now
+ * publishes only in a form the ingest rejects is removed like a delisted one.
+ * That set is the only state the loop keeps per source: one id per published
+ * designation.
+ *
+ * The mirror upserts the `designation` rows and deletes the tombstoned ones; the
+ * per-alias `name` index is rebuilt from `designation` afterwards by the
+ * service's `rebuildNameIndex()`, which the lifecycle scripts and the refresh
+ * cron call. Until then a removed designation's `name` rows join to no
+ * `designation` row, so no screen can surface it.
  */
 export function createSanctionsSync(options: SanctionsSyncOptions) {
   const pageSize = options.pageSize ?? SYNC_PAGE_SIZE;
-  return async function* sync(ctx: {
-    signal: AbortSignal;
-  }): AsyncGenerator<{ checkpoint?: string; records: Record<string, string | number | null>[] }> {
+  return async function* sync(ctx: { signal: AbortSignal }): AsyncGenerator<{
+    checkpoint?: string;
+    records: Record<string, string | number | null>[];
+    tombstones?: string[];
+  }> {
     const ingesters = options.ingesters ?? buildSanctionsIngesters();
     const stamp = new Date().toISOString();
     for (const ingester of ingesters) {
       if (ctx.signal.aborted) return;
+      const kept = new Set<string>();
       let page: Record<string, string | number | null>[] = [];
       for await (const designation of ingester.harvest(ctx.signal)) {
+        kept.add(designation.id);
         page.push(toDesignationRow(designation));
         if (page.length >= pageSize) {
           yield { records: page, checkpoint: stamp };
@@ -1200,7 +1620,20 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
 
       const deferred = ingester.deferredFields();
       if (deferred.size > 0) await options.applyDeferredFields(ingester.source, deferred);
-      options.onSourceReport?.(ingester.report());
+
+      const stale = await options.staleDesignationIds(ingester.source, kept);
+      // Every kept id was just upserted, so the source now stores kept + stale rows.
+      // A document that yielded no record would remove all of them, so it never passes.
+      const withinBound = stale.length <= MAX_PRUNE_SHARE * (kept.size + stale.length);
+      const pruned = withinBound ? stale : [];
+      for (let at = 0; at < pruned.length; at += pageSize) {
+        yield { records: [], tombstones: pruned.slice(at, at + pageSize), checkpoint: stamp };
+      }
+      options.onSourceReport?.({
+        ...ingester.report(),
+        pruned: pruned.length,
+        withheld: stale.length - pruned.length,
+      });
     }
   };
 }

@@ -206,11 +206,12 @@ const STRICT_RAW_ROW_CAP = 5000;
 const LEI_STRICT_RAW_ROW_CAP = 2000;
 
 /**
- * Designation rows read per slice by {@link ScreeningService.rebuildNameIndex}.
- * Bounds the rows, their JSON payloads, and one insert transaction — the whole
- * corpus was previously resident at once.
+ * Designation rows read per keyset slice by {@link ScreeningService.rebuildNameIndex}
+ * and {@link ScreeningService.staleDesignationIds}. Bounds the rows (and, for the
+ * rebuild, their JSON payloads) resident at once — the whole corpus was
+ * previously materialized.
  */
-const NAME_INDEX_SLICE = 2000;
+const DESIGNATION_READ_SLICE = 2000;
 
 /** A bounded strict scan: its ordered results plus whether the row cap bound. */
 interface BoundedScan<T> {
@@ -244,19 +245,28 @@ export class ScreeningService {
       // the sync patches them through the service rather than re-stating rows.
       sync: createSanctionsSync({
         applyDeferredFields: (source, fields) => this.applyDeferredFields(source, fields),
-        onSourceReport: (report) =>
-          logger.info(
-            'Sanctions harvest — source complete',
-            requestContextService.createRequestContext({
-              operation: 'mirror.sync.source',
-              additionalContext: {
-                source: report.source,
-                accepted: report.accepted,
-                rejectedMissingIdentifier: report.rejected.missingIdentifier,
-                rejectedUnusableName: report.rejected.unusableName,
-              },
-            }),
-          ),
+        staleDesignationIds: (source, kept) => this.staleDesignationIds(source, kept),
+        onSourceReport: (report) => {
+          const context = requestContextService.createRequestContext({
+            operation: 'mirror.sync.source',
+            additionalContext: {
+              source: report.source,
+              accepted: report.accepted,
+              pruned: report.pruned,
+              withheld: report.withheld,
+              rejectedMissingIdentifier: report.rejected.missingIdentifier,
+              rejectedUnusableName: report.rejected.unusableName,
+            },
+          });
+          if (report.withheld > 0) {
+            logger.warning(
+              'Sanctions harvest — source complete; removal withheld: its document dropped more than half of the stored list. Check the source URL and the document, or rebuild the sanctions mirror if the delisting is real.',
+              context,
+            );
+          } else {
+            logger.info('Sanctions harvest — source complete', context);
+          }
+        },
       }),
     });
 
@@ -396,11 +406,33 @@ export class ScreeningService {
   }
 
   /**
+   * The ids of `source`'s stored designations absent from `kept` — the rows its
+   * latest complete document no longer published, which the sanctions sync
+   * removes. Walks the source's rows in keyset slices so only the stale ids are
+   * retained; `kept` is the one full-size set, held by the caller.
+   */
+  async staleDesignationIds(source: SourceCode, kept: ReadonlySet<string>): Promise<string[]> {
+    const handle = await this.designationHandle();
+    const slice = handle.prepare<{ id: string }>(
+      `SELECT id FROM designation WHERE source = ? AND id > ? ORDER BY id LIMIT ${DESIGNATION_READ_SLICE}`,
+    );
+    const stale: string[] = [];
+    let cursor = '';
+    for (;;) {
+      const rows = slice.all(source, cursor);
+      if (rows.length === 0) return stale;
+      for (const { id } of rows) if (!kept.has(id)) stale.push(id);
+      cursor = rows[rows.length - 1]?.id ?? cursor;
+    }
+  }
+
+  /**
    * Rebuild the per-alias `name` index from the current `designation` table.
    * The MirrorService `sync` path only writes the primary `designation` rows, so
    * after a `runSync` the lifecycle scripts (and the refresh cron) call this to
    * regenerate the matching index — including the Double-Metaphone phonetic keys
-   * that can't be computed in SQL. Idempotent: clears and repopulates `name`.
+   * that can't be computed in SQL. Idempotent: clears and repopulates `name`,
+   * which is also what drops the names of a designation the sync removed.
    *
    * The designation table is walked in keyset slices ordered by `id` rather than
    * materialized: `SELECT … .all()` over the whole corpus, plus a `JSON.parse`
@@ -413,7 +445,7 @@ export class ScreeningService {
     const handle = await this.designationHandle();
     const slice = handle.prepare<{ id: string; payload: string; primary_name: string }>(
       `SELECT id, primary_name, payload FROM designation
-       WHERE id > ? ORDER BY id LIMIT ${NAME_INDEX_SLICE}`,
+       WHERE id > ? ORDER BY id LIMIT ${DESIGNATION_READ_SLICE}`,
     );
     const insertName = handle.prepare(
       `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type)
@@ -757,9 +789,7 @@ export class ScreeningService {
                 d.primary_name, d.program, d.designation_date
          FROM ${NAME_TABLE} n
          JOIN designation d ON d.id = n.designation_id`;
-    const prefixes = [
-      ...new Set(args.queryTokens.map((t) => t.slice(0, 3)).filter((p) => p.length >= 2)),
-    ];
+    const prefixes = blockingPrefixes(args.queryTokens);
     // Per-strategy budget keeps total work bounded while guaranteeing fair
     // representation; the final scored set is still capped to `args.cap`.
     const perStrategyLimit = Math.max(args.cap * 4, 200);
@@ -1047,9 +1077,7 @@ export class ScreeningService {
     // merge deduped by LEI. Blocking on only the first token starved the pool
     // when the first token wasn't the entity's leading word (order swaps) or was
     // a common word that exhausted the cap before the distinctive token's rows.
-    const prefixes = [
-      ...new Set(args.queryTokens.map((t) => t.slice(0, 3)).filter((p) => p.length >= 2)),
-    ];
+    const prefixes = blockingPrefixes(args.queryTokens);
     const perStrategyLimit = Math.max(args.cap * 4, 200);
     const byLei = new Map<string, LeiCandidateRow>();
     for (const prefix of prefixes) {
@@ -1241,6 +1269,22 @@ export class ScreeningService {
   async close(): Promise<void> {
     await Promise.allSettled([this.designationMirror.close(), this.leiMirror.close()]);
   }
+}
+
+/**
+ * The distinct leading-trigram blocking prefixes of a query's tokens, shared by
+ * both fuzzy paths. Counted in code points, not UTF-16 code units: a code-unit
+ * slice cuts a supplementary-plane letter (CJK Extension B, e.g. `𠀀`) in half,
+ * and the lone surrogate reaches SQLite as U+FFFD, a `LIKE` pattern that matches
+ * nothing. A token shorter than two code points blocks nothing. For BMP tokens
+ * code points and code units coincide, so their prefixes are unchanged.
+ */
+function blockingPrefixes(tokens: readonly string[]): string[] {
+  const prefixes = tokens
+    .map((token) => [...token].slice(0, 3))
+    .filter((codePoints) => codePoints.length >= 2)
+    .map((codePoints) => codePoints.join(''));
+  return [...new Set(prefixes)];
 }
 
 /** Rank for sorting match types (exact > strong > approximate). */

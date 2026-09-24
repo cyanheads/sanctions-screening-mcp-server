@@ -12,7 +12,15 @@ import {
   streamLeiLevel1FromBytes,
   streamLeiLevel1FromText,
 } from '@/services/screening/gleif-ingest.js';
-import { parseEu, parseOfac, parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
+import { createRejections } from '@/services/screening/ingest-validation.js';
+import {
+  createHarvestState,
+  parseEu,
+  parseOfac,
+  parseUk,
+  parseUn,
+  streamOfacFromText,
+} from '@/services/screening/sanctions-ingest.js';
 import {
   buildFtsMatch,
   doubleMetaphone,
@@ -20,7 +28,12 @@ import {
   jaro,
   jaroWinkler,
 } from '@/services/screening/text-matching.js';
-import type { NormalizedDesignation } from '@/services/screening/types.js';
+import type {
+  AddressRecord,
+  DesignationPayload,
+  IdentifierRecord,
+  NormalizedDesignation,
+} from '@/services/screening/types.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 import { freshService, type SeededService } from '../services/_helpers.js';
@@ -49,7 +62,10 @@ describe('text matcher fuzz invariants', () => {
     for (const value of values) {
       const normalized = fold(value);
       const reversed = [...normalized].reverse().join('');
-      expect(normalized).toMatch(/^(?:[a-z0-9]+(?: [a-z0-9]+)*)?$/);
+      // Letters and digits of any script, single-spaced — no marks, no case, no final sigma.
+      expect(normalized).toMatch(/^(?:[\p{L}\p{N}]+(?: [\p{L}\p{N}]+)*)?$/u);
+      expect(normalized).not.toMatch(/[\p{M}ς]/u);
+      expect(normalized).toBe(normalized.toLowerCase());
       expect(doubleMetaphone(normalized)).toMatch(/^(?:[A-Z]+(?: [A-Z]+)*)?$/);
       expect(jaro(normalized, reversed)).toBeGreaterThanOrEqual(0);
       expect(jaro(normalized, reversed)).toBeLessThanOrEqual(1);
@@ -59,7 +75,7 @@ describe('text matcher fuzz invariants', () => {
 
       const match = buildFtsMatch(value);
       if (match)
-        expect(match.split(' AND ').every((token) => /^"[a-z0-9]+"$/.test(token))).toBe(true);
+        expect(match.split(' AND ').every((token) => /^"[\p{L}\p{N}]+"$/u.test(token))).toBe(true);
     }
   });
 });
@@ -225,6 +241,45 @@ describe('ingest parser fuzz invariants', () => {
     expect(await collect(streamLeiLevel1FromBytes(bytes()))).toHaveLength(0);
   });
 
+  it('resolves OFAC cross-references that exist and drops only the dangling or partial ones', async () => {
+    const random = mulberry32(0x0fac22);
+    for (let round = 0; round < 40; round++) {
+      const doc = randomOfacCrossReferenceDocument(random);
+      const rejections = createRejections();
+      const buffered = parseOfac(parseXml(doc.xml), 'ofac_sdn', rejections);
+
+      // Every party ingests; a bad reference is never a rejection.
+      expect(
+        buffered.map((d) => d.sourceEntryId),
+        `round ${round}`,
+      ).toEqual(doc.partyIds);
+      expect(rejections, `round ${round}`).toEqual({ missingIdentifier: 0, unusableName: 0 });
+      for (const [index, designation] of buffered.entries()) {
+        const expected = doc.expected[index];
+        expect(designation.payload.addresses, `round ${round} party ${index}`).toEqual(
+          expected?.addresses,
+        );
+        expect(designation.payload.nationalities, `round ${round} party ${index}`).toEqual(
+          expected?.nationalities,
+        );
+        expect(designation.payload.identifiers, `round ${round} party ${index}`).toEqual(
+          expected?.identifiers,
+        );
+      }
+
+      const streamed: NormalizedDesignation[] = [];
+      const state = createHarvestState();
+      for await (const record of streamOfacFromText(
+        chunks(doc.xml, 1 + (round % 13)),
+        'ofac_sdn',
+        state,
+      )) {
+        streamed.push(record);
+      }
+      expect(streamed, `round ${round} streamed`).toEqual(buffered);
+    }
+  });
+
   it('keeps GLEIF Level 1 output identical across repeat parses, dropping unusable records', () => {
     const xml = `<LEIData><LEIRecords>
       <LEIRecord><LEI>5493001KJTIIGC8Y1R12</LEI><Entity><LegalName>Fictional Trading Company LLC</LegalName></Entity></LEIRecord>
@@ -320,6 +375,157 @@ function oneEditVariants(value: string): string[] {
     variants.push(`${value.slice(0, index)}${replacement}${value.slice(index + 1)}`);
   }
   return variants;
+}
+
+interface CrossReferenceDocument {
+  /** Per party, the detail groups a correct resolution produces. */
+  expected: Pick<DesignationPayload, 'addresses' | 'identifiers' | 'nationalities'>[];
+  partyIds: string[];
+  xml: string;
+}
+
+/**
+ * An OFAC advanced document whose parties point at a random mix of published,
+ * never-published, placeholder, and partial `<Location>`s and `<IDRegDocument>`s,
+ * with the detail groups a correct resolution yields computed alongside it.
+ */
+function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceDocument {
+  const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+  const countries = new Map([
+    ['1', 'Aland'],
+    ['2', 'Borduria'],
+    ['3', 'Carpania'],
+  ]);
+  const part = (type: string, value: string, primary = true) =>
+    `<LocationPart LocPartTypeID="${type}"><LocationPartValue Primary="${primary}"><Comment /><Value>${value}</Value></LocationPartValue></LocationPart>`;
+
+  // Location IDs 1–6 may be published; 7 and 8 never are.
+  const rendered = new Map<string, AddressRecord>();
+  const locations: string[] = [];
+  for (let id = 1; id <= 6; id++) {
+    const lid = String(id);
+    const countryId = pick(['1', '2', '3']);
+    const country = countries.get(countryId) as string;
+    switch (pick(['full', 'name', 'undetermined', 'partial', 'placeholder-country', 'absent'])) {
+      case 'full':
+        locations.push(
+          `<Location ID="${lid}"><LocationCountry CountryID="${countryId}" />${part('1454', `City ${lid}`)}${part('1451', `${lid} Main St`)}</Location>`,
+        );
+        rendered.set(lid, { full: `${lid} Main St, City ${lid}, ${country}`, country });
+        break;
+      case 'name':
+        locations.push(`<Location ID="${lid}">${part('1', country)}</Location>`);
+        rendered.set(lid, { full: country });
+        break;
+      case 'undetermined':
+        locations.push(`<Location ID="${lid}"><LocationAreaCode AreaCodeID="9" /></Location>`);
+        break;
+      case 'partial':
+        locations.push(
+          `<Location ID="${lid}"><LocationCountry CountryID="77" />${part('1454', 'Variant Only', false)}</Location>`,
+        );
+        break;
+      case 'placeholder-country':
+        locations.push(
+          `<Location ID="${lid}"><LocationCountry CountryID="9" />${part('1456', `PC-${lid}`)}</Location>`,
+        );
+        rendered.set(lid, { full: `PC-${lid}` });
+        break;
+    }
+  }
+
+  const documents: string[] = [];
+  const parties: string[] = [];
+  const partyIds: string[] = [];
+  const expected: CrossReferenceDocument['expected'] = [];
+  for (let p = 1; p <= 4; p++) {
+    const identityId = `70${p}`;
+    const identifiers: IdentifierRecord[] = [];
+    const documentCount = Math.floor(random() * 4);
+    for (let d = 0; d < documentCount; d++) {
+      const number = `N${p}-${Math.floor(random() * 3)}`;
+      switch (pick(['good', 'good-no-country', 'no-number', 'unknown-type', 'orphan'])) {
+        case 'good':
+          documents.push(
+            `<IDRegDocument IDRegDocTypeID="1570" IdentityID="${identityId}" IssuedBy-CountryID="2"><IDRegistrationNo>${number}</IDRegistrationNo></IDRegDocument>`,
+          );
+          identifiers.push({ type: 'Passport', value: number, country: 'Borduria' });
+          break;
+        case 'good-no-country':
+          documents.push(
+            `<IDRegDocument IDRegDocTypeID="1570" IdentityID="${identityId}" IssuedBy-CountryID="9"><IDRegistrationNo>${number}</IDRegistrationNo></IDRegDocument>`,
+          );
+          identifiers.push({ type: 'Passport', value: number });
+          break;
+        case 'no-number':
+          documents.push(
+            `<IDRegDocument IDRegDocTypeID="1570" IdentityID="${identityId}"><Comment /></IDRegDocument>`,
+          );
+          break;
+        case 'unknown-type':
+          documents.push(
+            `<IDRegDocument IDRegDocTypeID="999" IdentityID="${identityId}"><IDRegistrationNo>${number}</IDRegistrationNo></IDRegDocument>`,
+          );
+          break;
+        case 'orphan':
+          documents.push(
+            `<IDRegDocument IDRegDocTypeID="1570" IdentityID="9999"><IDRegistrationNo>${number}</IDRegistrationNo></IDRegDocument>`,
+          );
+          break;
+      }
+    }
+
+    const features: string[] = [];
+    const addresses: AddressRecord[] = [];
+    const nationalities: string[] = [];
+    const featureCount = Math.floor(random() * 5);
+    for (let f = 0; f < featureCount; f++) {
+      const lid = String(1 + Math.floor(random() * 8));
+      const nationality = random() < 0.4;
+      features.push(
+        `<Feature FeatureTypeID="${nationality ? '10' : '25'}"><FeatureVersion><VersionLocation LocationID="${lid}" /></FeatureVersion></Feature>`,
+      );
+      const target = rendered.get(lid);
+      if (target && nationality) nationalities.push(target.full);
+      if (target && !nationality) addresses.push(target);
+    }
+
+    const fixedRef = `900${p}`;
+    partyIds.push(fixedRef);
+    parties.push(
+      `<DistinctParty FixedRef="${fixedRef}"><Profile ID="${fixedRef}"><Identity ID="${identityId}"><Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>Party ${p}</NamePartValue></DocumentedNamePart></DocumentedName></Alias></Identity>${features.join('')}</Profile></DistinctParty>`,
+    );
+    expected.push({
+      addresses: uniqueJson(addresses),
+      identifiers: uniqueJson(identifiers),
+      nationalities: uniqueJson(nationalities),
+    });
+  }
+
+  const xml = `<Sanctions>
+    <ReferenceValueSets>
+      <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+      <CountryValues>${[...countries].map(([id, name]) => `<Country ID="${id}">${name}</Country>`).join('')}<Country ID="9">undetermined</Country></CountryValues>
+      <FeatureTypeValues><FeatureType ID="10">Nationality Country</FeatureType><FeatureType ID="25">Location</FeatureType></FeatureTypeValues>
+      <IDRegDocTypeValues><IDRegDocType ID="1570">Passport</IDRegDocType></IDRegDocTypeValues>
+      <LocPartTypeValues><LocPartType ID="1">Unknown</LocPartType><LocPartType ID="1451">ADDRESS1</LocPartType><LocPartType ID="1454">CITY</LocPartType><LocPartType ID="1456">POSTAL CODE</LocPartType></LocPartTypeValues>
+    </ReferenceValueSets>
+    <Locations>${locations.join('')}</Locations>
+    <IDRegDocuments>${documents.join('')}</IDRegDocuments>
+    <DistinctParties>${parties.join('')}</DistinctParties>
+  </Sanctions>`;
+  return { expected, partyIds, xml };
+}
+
+/** Exact-duplicate collapse in first-seen order — the expected-value side of the dedupe rule. */
+function uniqueJson<T>(items: T[]): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = JSON.stringify(item);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function mulberry32(seed: number): () => number {

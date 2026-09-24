@@ -167,12 +167,20 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     }
     if (r.addresses.length > 0) {
       lines.push('\n## Addresses');
-      for (const a of r.addresses) lines.push(`- ${a.full}${a.country ? ` — ${a.country}` : ''}`);
+      // A normalized address renders its country as its last component; name the
+      // country separately only when it is not that component.
+      for (const a of r.addresses) {
+        const inFull = a.full === a.country || a.full.endsWith(`, ${a.country}`);
+        lines.push(`- ${a.full}${a.country && !inFull ? ` — ${a.country}` : ''}`);
+      }
     }
     if (r.datesOfBirth.length > 0) {
       lines.push('\n## Dates of birth');
+      // Render only what the entry publishes: a source that lists dates and places
+      // separately yields date-only and place-only entries.
       for (const d of r.datesOfBirth) {
-        lines.push(`- ${d.date ?? 'Unknown date'}${d.place ? ` at ${d.place}` : ''}`);
+        if (d.date) lines.push(`- ${d.date}${d.place ? ` at ${d.place}` : ''}`);
+        else if (d.place) lines.push(`- Born in ${d.place}`);
       }
     }
     if (r.nationalities.length > 0)

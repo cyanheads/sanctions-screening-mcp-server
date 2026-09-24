@@ -6,11 +6,12 @@
  * @module tests/services/screening-service.test
  */
 
+import type { SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseOfac } from '@/services/screening/sanctions-ingest.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
-import { SOURCE_CODES } from '@/services/screening/types.js';
+import { type NormalizedDesignation, SOURCE_CODES } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 import { freshService, type SeededService, seededService } from './_helpers.js';
 
@@ -827,5 +828,161 @@ describe('re-harvest idempotence (issue #14)', () => {
       ctx,
     );
     expect(rejected.hits).toHaveLength(0);
+  });
+});
+
+// ─── Fuzzy blocking prefixes (issue #31) ───────────────────────────────────────
+
+/**
+ * Every `LIKE` pattern the fuzzy paths bind during `run` — the blocking prefixes
+ * as SQLite receives them, read at the statement boundary.
+ */
+async function likePatterns(handle: SqliteHandle, run: () => Promise<unknown>): Promise<string[]> {
+  const original = handle.prepare.bind(handle);
+  const patterns: string[] = [];
+  handle.prepare = ((sql: string) => {
+    const statement = original(sql);
+    if (!/\bLIKE \?/.test(sql)) return statement;
+    return {
+      ...statement,
+      all: (...params: Parameters<typeof statement.all>) => {
+        patterns.push(String(params[0]));
+        return statement.all(...params);
+      },
+    };
+  }) as typeof handle.prepare;
+  try {
+    await run();
+  } finally {
+    handle.prepare = original;
+  }
+  return patterns;
+}
+
+/** One designation whose only name is `name`. */
+function namedDesignation(entryId: string, name: string): NormalizedDesignation {
+  return {
+    id: `un:${entryId}`,
+    source: 'un',
+    sourceEntryId: entryId,
+    entityType: 'person',
+    primaryName: name,
+    payload: { aliases: [], identifiers: [], addresses: [], datesOfBirth: [], nationalities: [] },
+  };
+}
+
+describe('fuzzy blocking prefixes — BMP tokens', () => {
+  it('blocks the designation path on each token’s leading three characters, dropping one-letter tokens', async () => {
+    const handle = await svc.designations.raw();
+    const patterns = await likePatterns(handle, () =>
+      svc.screenName(
+        { ...screenDefaults, matchMode: 'fuzzy', query: 'Nikolas al Maduro X Moros' },
+        ctx,
+      ),
+    );
+    expect(patterns).toEqual(['%nik%', '%al%', '%mad%', '%mor%']);
+  });
+
+  it('blocks the LEI path the same way', async () => {
+    const handle = await svc.leiEntities.raw();
+    const patterns = await likePatterns(handle, () =>
+      svc.resolveEntity(
+        { query: 'Fictionall Tradng Co X', matchMode: 'fuzzy', limit: 10, status: 'any' },
+        ctx,
+      ),
+    );
+    expect(patterns).toEqual(['%fic%', '%tra%', '%co%']);
+  });
+});
+
+describe('fuzzy blocking prefixes — supplementary-plane letters (issue #31)', () => {
+  // U+20000–U+20004 (CJK Extension B): each is one code point, two UTF-16 units.
+  const STORED = '𠀀𠀁𠀂𠀃';
+  const QUERY = '𠀀𠀁𠀂𠀄'; // shares its first three code points with STORED
+
+  let astral: SeededService;
+  afterEach(async () => {
+    await astral.cleanup();
+  });
+
+  it('pools and admits a designation on its supplementary-plane prefix', async () => {
+    astral = await freshService();
+    const service = astral.service;
+    await service.ingestDesignations([namedDesignation('ASTRAL-1', STORED)]);
+
+    const handle = await service.designations.raw();
+    let hits: string[] = [];
+    const patterns = await likePatterns(handle, async () => {
+      const res = await service.screenName(
+        { ...screenDefaults, matchMode: 'fuzzy', query: QUERY },
+        ctx,
+      );
+      hits = res.hits.map((h) => h.designationId);
+    });
+
+    expect(patterns).toEqual(['%𠀀𠀁𠀂%']);
+    expect(patterns.every((p) => p.isWellFormed())).toBe(true);
+    expect(hits).toEqual(['un:ASTRAL-1']);
+  });
+
+  it('pools and admits an LEI entity on its supplementary-plane prefix', async () => {
+    astral = await freshService();
+    const service = astral.service;
+    await service.ingestLeiEntities([
+      { lei: '5493001KJTIIGC8Y1R12', legalName: STORED, otherNames: [] },
+    ]);
+
+    const handle = await service.leiEntities.raw();
+    let leis: string[] = [];
+    const patterns = await likePatterns(handle, async () => {
+      const res = await service.resolveEntity(
+        { query: QUERY, matchMode: 'fuzzy', limit: 10, status: 'any' },
+        ctx,
+      );
+      leis = res.matches.map((m) => m.lei);
+    });
+
+    expect(patterns).toEqual(['%𠀀𠀁𠀂%']);
+    expect(patterns.every((p) => p.isWellFormed())).toBe(true);
+    expect(leis).toEqual(['5493001KJTIIGC8Y1R12']);
+  });
+
+  it('counts a token’s length in code points, so a lone supplementary letter blocks nothing', async () => {
+    astral = await freshService();
+    const service = astral.service;
+    await service.ingestDesignations([namedDesignation('ASTRAL-2', 'ab𠀀xyz')]);
+
+    const handle = await service.designations.raw();
+    const patterns = await likePatterns(handle, () =>
+      service.screenName({ ...screenDefaults, matchMode: 'fuzzy', query: '𠀀 ab𠀀x' }, ctx),
+    );
+
+    // `𠀀` is one code point (two code units) — too short to block on, like any
+    // one-letter token; `ab𠀀x` blocks on its first three code points, whole.
+    expect(patterns).toEqual(['%ab𠀀%']);
+  });
+
+  it('admits a supplementary-plane candidate exactly when its BMP twin is admitted', async () => {
+    // `𠀀𠀁𠀂𠀃𠀄𠀅` / `𠀀𠀁𠀂𠀗𠀘𠀙` is the code-point image of `abcdef` / `abcxyz`: three
+    // shared letters of six score 0.7667, under the 0.85 floor, in either plane.
+    // Counted in UTF-16 code units, the shared high surrogates lift it to 0.90.
+    astral = await freshService();
+    const service = astral.service;
+    await service.ingestDesignations([
+      namedDesignation('BMP-TWIN', 'abcxyz'),
+      namedDesignation('ASTRAL-TWIN', '𠀀𠀁𠀂𠀗𠀘𠀙'),
+    ]);
+    const screen = (query: string) =>
+      service.screenName({ ...screenDefaults, matchMode: 'fuzzy', query }, ctx);
+
+    expect((await screen('abcdef')).hits).toEqual([]);
+    expect((await screen('𠀀𠀁𠀂𠀃𠀄𠀅')).hits).toEqual([]);
+
+    // A genuine near-miss still admits in both planes, at the same score.
+    const bmp = await screen('abcxyw');
+    const sup = await screen('𠀀𠀁𠀂𠀗𠀘𠀖');
+    expect(bmp.hits.map((h) => h.designationId)).toEqual(['un:BMP-TWIN']);
+    expect(sup.hits.map((h) => h.designationId)).toEqual(['un:ASTRAL-TWIN']);
+    expect(sup.hits[0]?.score).toBe(bmp.hits[0]?.score);
   });
 });

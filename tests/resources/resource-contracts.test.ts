@@ -15,12 +15,15 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { designationResource } from '@/mcp-server/resources/definitions/designation.resource.js';
 import { entityResource } from '@/mcp-server/resources/definitions/entity.resource.js';
 import { sourcesResource } from '@/mcp-server/resources/definitions/sources.resource.js';
+import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import {
   FIXTURE_DESIGNATIONS,
   FIXTURE_LEI_ENTITIES,
   FIXTURE_LEI_RELATIONSHIPS,
 } from '@/services/screening/fixtures.js';
+import { parseOfac } from '@/services/screening/sanctions-ingest.js';
+import { parseXml } from '@/services/screening/xml.js';
 import {
   emptyGlobalService,
   type SeededService,
@@ -107,6 +110,58 @@ describe('sanctions://designation/{source}/{entryId} readiness gate', () => {
       'designation_not_found',
       'mirror_not_ready',
     ]);
+  });
+
+  it('returns the same published detail groups as sanctions_get_designation', async () => {
+    global = await seededGlobalService();
+    // An OFAC advanced party whose groups resolve through the cross-referenced blocks.
+    await global.service.ingestDesignations(
+      parseOfac(
+        parseXml(`<Sanctions>
+          <ReferenceValueSets>
+            <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+            <CountryValues><Country ID="11216">Venezuela</Country></CountryValues>
+            <FeatureTypeValues><FeatureType ID="10">Nationality Country</FeatureType><FeatureType ID="25">Location</FeatureType></FeatureTypeValues>
+            <IDRegDocTypeValues><IDRegDocType ID="1570">Cedula No.</IDRegDocType></IDRegDocTypeValues>
+            <LocPartTypeValues><LocPartType ID="1">Unknown</LocPartType><LocPartType ID="1454">CITY</LocPartType></LocPartTypeValues>
+          </ReferenceValueSets>
+          <Locations>
+            <Location ID="1"><LocationCountry CountryID="11216" CountryRelevanceID="1413" />
+              <LocationPart LocPartTypeID="1454"><LocationPartValue Primary="true"><Value>Caracas</Value></LocationPartValue></LocationPart>
+            </Location>
+            <Location ID="2"><LocationPart LocPartTypeID="1"><LocationPartValue Primary="true"><Value>Venezuela</Value></LocationPartValue></LocationPart></Location>
+          </Locations>
+          <IDRegDocuments>
+            <IDRegDocument ID="1" IDRegDocTypeID="1570" IdentityID="14494" IssuedBy-CountryID="11216"><IDRegistrationNo>5892464</IDRegistrationNo></IDRegDocument>
+          </IDRegDocuments>
+          <DistinctParties><DistinctParty FixedRef="22790"><Profile ID="22790"><Identity ID="14494">
+            <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>MADURO MOROS Nicolas</NamePartValue></DocumentedNamePart></DocumentedName></Alias>
+            </Identity>
+            <Feature FeatureTypeID="25"><FeatureVersion ID="1"><VersionLocation LocationID="1" /></FeatureVersion></Feature>
+            <Feature FeatureTypeID="10"><FeatureVersion ID="2"><VersionLocation LocationID="2" /></FeatureVersion></Feature>
+          </Profile></DistinctParty></DistinctParties>
+        </Sanctions>`),
+        'ofac_sdn',
+      ),
+    );
+    const params = { source: 'ofac_sdn', entryId: '22790' } as const;
+    const payload = (await designationResource.handler(
+      parseParams(designationResource, params),
+      ctxFor(designationResource.errors),
+    )) as Record<string, unknown>;
+    const tool = await getDesignationTool.handler(
+      getDesignationTool.input.parse(params),
+      ctxFor(getDesignationTool.errors),
+    );
+
+    const groups = {
+      identifiers: [{ type: 'Cedula No.', value: '5892464', country: 'Venezuela' }],
+      addresses: [{ full: 'Caracas, Venezuela', country: 'Venezuela' }],
+      datesOfBirth: [],
+      nationalities: ['Venezuela'],
+    };
+    expect(payload).toMatchObject(groups);
+    expect(tool).toMatchObject(groups);
   });
 });
 

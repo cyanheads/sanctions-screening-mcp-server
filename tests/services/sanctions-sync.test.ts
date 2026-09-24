@@ -19,6 +19,7 @@ import { DEFAULT_SOURCE_URLS, resetServerConfig } from '@/config/server-config.j
 import {
   buildSanctionsIngesters,
   createSanctionsSync,
+  type SourceSyncReport,
 } from '@/services/screening/sanctions-ingest.js';
 import { NAME_TABLE } from '@/services/screening/schema.js';
 import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
@@ -139,21 +140,44 @@ async function collect<T>(source: AsyncIterable<T>): Promise<T[]> {
   return out;
 }
 
+interface DrainedPage {
+  checkpoint?: string | undefined;
+  records: Record<string, unknown>[];
+  tombstones?: string[] | undefined;
+}
+
 /** Drive a sync generator to exhaustion, keeping every page. */
 async function drainSync(
   sync: ReturnType<typeof createSanctionsSync>,
   signal = new AbortController().signal,
-): Promise<{ checkpoint?: string | undefined; records: Record<string, unknown>[] }[]> {
-  const pages: { checkpoint?: string | undefined; records: Record<string, unknown>[] }[] = [];
+): Promise<DrainedPage[]> {
+  const pages: DrainedPage[] = [];
   for await (const page of sync({ signal })) {
-    pages.push({ records: page.records, checkpoint: page.checkpoint });
+    pages.push({ records: page.records, checkpoint: page.checkpoint, tombstones: page.tombstones });
   }
   return pages;
 }
 
-/** The no-op deferred-field sink; the sanctions sync requires one. */
+/** Mirror-side wiring that stores nothing: no deferred columns, no stored rows to prune. */
+const NO_MIRROR = {
+  applyDeferredFields: async () => {},
+  staleDesignationIds: async () => [],
+};
+
 function noopSync(): ReturnType<typeof createSanctionsSync> {
-  return createSanctionsSync({ applyDeferredFields: async () => {} });
+  return createSanctionsSync(NO_MIRROR);
+}
+
+/** The ids a harvest yielded, and the error that ended it (if any). */
+async function harvestOutcome(source: SourceCode): Promise<{ error?: string; ids: string[] }> {
+  const ingester = buildSanctionsIngesters().find((i) => i.source === source);
+  const ids: string[] = [];
+  try {
+    for await (const d of ingester!.harvest(new AbortController().signal)) ids.push(d.id);
+  } catch (err) {
+    return { ids, error: (err as Error).message };
+  }
+  return { ids };
 }
 
 afterEach(() => {
@@ -232,12 +256,9 @@ describe('createSanctionsSync — harvest loop contract', () => {
     );
     stubSourceFetch(bodies);
 
-    const reports: { accepted: number; rejected: object; source: SourceCode }[] = [];
+    const reports: SourceSyncReport[] = [];
     await drainSync(
-      createSanctionsSync({
-        applyDeferredFields: async () => {},
-        onSourceReport: (report) => reports.push(report),
-      }),
+      createSanctionsSync({ ...NO_MIRROR, onSourceReport: (report) => reports.push(report) }),
     );
 
     expect(reports.map((r) => r.source)).toEqual([
@@ -250,13 +271,220 @@ describe('createSanctionsSync — harvest loop contract', () => {
     expect(reports.find((r) => r.source === 'eu')).toEqual({
       source: 'eu',
       accepted: 1,
+      pruned: 0,
+      withheld: 0,
       rejected: { missingIdentifier: 1, unusableName: 1 },
     });
     expect(reports.find((r) => r.source === 'un')).toEqual({
       source: 'un',
       accepted: 1,
+      pruned: 0,
+      withheld: 0,
       rejected: { missingIdentifier: 0, unusableName: 0 },
     });
+  });
+});
+
+// ─── Pruning: stale ids become tombstones (issue #30) ──────────────────────────
+
+describe('createSanctionsSync — pruning', () => {
+  it("yields a source's stale ids as tombstone pages after its records, under the run's stamp", async () => {
+    // EU publishes three records, so removing three stored ids stays within the prune bound.
+    const bodies = new Map(SOURCE_BODIES);
+    bodies.set(
+      DEFAULT_SOURCE_URLS.euFsf,
+      `<export>${['EU-1', 'EU-2', 'EU-3'].map((id) => EU_ENTITY.replace('EU-1', id)).join('')}</export>`,
+    );
+    stubSourceFetch(bodies);
+    const asked: [SourceCode, string[]][] = [];
+    const reports: SourceSyncReport[] = [];
+    const pages = await drainSync(
+      createSanctionsSync({
+        applyDeferredFields: async () => {},
+        staleDesignationIds: async (source, kept) => {
+          asked.push([source, [...kept]]);
+          return source === 'eu' ? ['eu:GONE-1', 'eu:GONE-2', 'eu:GONE-3'] : [];
+        },
+        onSourceReport: (report) => reports.push(report),
+        pageSize: 2,
+      }),
+    );
+
+    // Each source is asked once, with exactly the ids its harvest accepted.
+    expect(asked).toEqual([
+      ['ofac_sdn', ['ofac_sdn:900']],
+      ['ofac_consolidated', ['ofac_consolidated:901']],
+      ['eu', ['eu:EU-1', 'eu:EU-2', 'eu:EU-3']],
+      ['uk', ['uk:UK-1']],
+      ['un', ['un:UN-1']],
+    ]);
+    // EU's tombstones follow its records, in bounded pages, before UK's records.
+    expect(
+      pages.map((p) => ({ records: p.records.map((r) => r.id), tombstones: p.tombstones ?? [] })),
+    ).toEqual([
+      { records: ['ofac_sdn:900'], tombstones: [] },
+      { records: ['ofac_consolidated:901'], tombstones: [] },
+      { records: ['eu:EU-1', 'eu:EU-2'], tombstones: [] },
+      { records: ['eu:EU-3'], tombstones: [] },
+      { records: [], tombstones: ['eu:GONE-1', 'eu:GONE-2'] },
+      { records: [], tombstones: ['eu:GONE-3'] },
+      { records: ['uk:UK-1'], tombstones: [] },
+      { records: ['un:UN-1'], tombstones: [] },
+    ]);
+    expect(new Set(pages.map((p) => p.checkpoint)).size).toBe(1);
+    expect(reports.map((r) => [r.source, r.pruned])).toEqual([
+      ['ofac_sdn', 0],
+      ['ofac_consolidated', 0],
+      ['eu', 3],
+      ['uk', 0],
+      ['un', 0],
+    ]);
+  });
+
+  it('withholds every removal for a source that accepted no record, and asks nothing of one that failed', async () => {
+    const bodies = new Map(SOURCE_BODIES);
+    bodies.set(DEFAULT_SOURCE_URLS.euFsf, '<export></export>');
+    bodies.delete(DEFAULT_SOURCE_URLS.ukSanctions); // served as a 404
+    stubSourceFetch(bodies);
+
+    const asked: SourceCode[] = [];
+    const reports: SourceSyncReport[] = [];
+    const sync = createSanctionsSync({
+      applyDeferredFields: async () => {},
+      staleDesignationIds: async (source) => {
+        asked.push(source);
+        return source === 'eu' ? ['eu:STORED-1'] : [];
+      },
+      onSourceReport: (report) => reports.push(report),
+    });
+    await expect(drainSync(sync)).rejects.toThrow(/404/);
+
+    // EU's empty document would remove all it stores, so the removal is withheld
+    // and reported. UK never arrived, and the failure ends the run before UN.
+    expect(asked).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu']);
+    expect(reports.find((r) => r.source === 'eu')).toMatchObject({
+      accepted: 0,
+      pruned: 0,
+      withheld: 1,
+    });
+    expect(reports.map((r) => r.source)).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu']);
+  });
+
+  it('withholds a prune that would remove more than half of what a source stores', async () => {
+    stubSourceFetch();
+    const reports: SourceSyncReport[] = [];
+    const pages = await drainSync(
+      createSanctionsSync({
+        applyDeferredFields: async () => {},
+        // Every source's document accepted one id. UK's one stale id is exactly half
+        // of what it stores; EU's two stale ids are two thirds.
+        staleDesignationIds: async (source) =>
+          source === 'eu' ? ['eu:GONE-1', 'eu:GONE-2'] : source === 'uk' ? ['uk:GONE-1'] : [],
+        onSourceReport: (report) => reports.push(report),
+      }),
+    );
+
+    expect(pages.flatMap((p) => p.tombstones ?? [])).toEqual(['uk:GONE-1']);
+    expect(reports.find((r) => r.source === 'uk')).toMatchObject({ pruned: 1, withheld: 0 });
+    expect(reports.find((r) => r.source === 'eu')).toMatchObject({ pruned: 0, withheld: 2 });
+    // The withheld source's own records still landed.
+    expect(pages.flatMap((p) => p.records.map((r) => r.id))).toContain('eu:EU-1');
+  });
+});
+
+// ─── Completeness: a document must arrive whole before its source can prune ────
+
+describe('sanctions harvest — document completeness', () => {
+  it.each([
+    ['eu', DEFAULT_SOURCE_URLS.euFsf, `<export>${EU_ENTITY}`, '</export>', 'eu:EU-1'],
+    [
+      'uk',
+      DEFAULT_SOURCE_URLS.ukSanctions,
+      `<Designations>${UK_DESIGNATION}`,
+      '</Designations>',
+      'uk:UK-1',
+    ],
+    [
+      'un',
+      DEFAULT_SOURCE_URLS.unSc,
+      `<CONSOLIDATED_LIST><INDIVIDUALS>${UN_INDIVIDUAL}</INDIVIDUALS>`,
+      '</CONSOLIDATED_LIST>',
+      'un:UN-1',
+    ],
+    [
+      'ofac_sdn',
+      DEFAULT_SOURCE_URLS.ofacSdn,
+      `<Sanctions>${OFAC_REFS}<DistinctParties>${ofacParty('900', 'OFAC SDN Person')}</DistinctParties>`,
+      '</Sanctions>',
+      'ofac_sdn:900',
+    ],
+  ] as const)(
+    'fails a %s harvest whose document ends before its root closes, after its whole records',
+    async (source, url, body, rootClose, expectedId) => {
+      const bodies = new Map(SOURCE_BODIES);
+      bodies.set(url, `<?xml version="1.0"?>\n${body}${rootClose}`);
+      stubSourceFetch(bodies);
+      expect(await harvestOutcome(source)).toEqual({ ids: [expectedId] });
+
+      bodies.set(url, `<?xml version="1.0"?>\n${body}`);
+      const truncated = await harvestOutcome(source);
+      expect(truncated.ids).toEqual([expectedId]);
+      expect(truncated.error).toMatch(/truncated/i);
+    },
+  );
+
+  /** Serve the EU document as the given chunks, in order. */
+  function serveEuChunks(chunks: string[]): void {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        const feed = pushStream();
+        for (const chunk of chunks) feed.push(chunk);
+        feed.close();
+        return new Response(feed.stream, { status: 200 });
+      }),
+    );
+  }
+
+  it('reads the root close across chunk boundaries, past trailing comments and whitespace', async () => {
+    const head = [
+      '<?xml version="1.0"?>\n<!-- generated -->\n<!DOCTYPE export>\n<ex',
+      'port xmlns="http://eu.europa.ec/fpi/fsd/export" generationDate="2026-01-01">',
+      EU_ENTITY,
+      '</exp',
+    ];
+    serveEuChunks([...head, 'ort >', '\n<!-- end -->\n']);
+    expect(await harvestOutcome('eu')).toEqual({ ids: ['eu:EU-1'] });
+
+    serveEuChunks([...head, 'ort']);
+    expect((await harvestOutcome('eu')).error).toMatch(/truncated/i);
+  });
+
+  it('accepts a self-closing root as a complete empty document, and fails an unclosed one', async () => {
+    serveEuChunks(['<?xml version="1.0"?>\n<export generationDate="2026-01-01"/>\n']);
+    expect(await harvestOutcome('eu')).toEqual({ ids: [] });
+
+    serveEuChunks(['<?xml version="1.0"?>\n<export generationDate="2026-01-01">\n']);
+    expect((await harvestOutcome('eu')).error).toMatch(/truncated/i);
+  });
+
+  it('reads a prolog and an epilog of many comments without backtracking on them', async () => {
+    // Each run is judged while it is still incomplete: the prolog before the root
+    // tag has arrived, and an epilog cut inside a comment. A pattern that lets one
+    // comment span several re-tries every split of the run, doubling per comment.
+    const run = '<!-- c --><?pi x?>'.repeat(22);
+    const doc = [`<?xml version="1.0"?>\n${run}`, `\n<export>${EU_ENTITY}</export>${run}`];
+
+    serveEuChunks([...doc, '\n']);
+    expect(await harvestOutcome('eu')).toEqual({ ids: ['eu:EU-1'] });
+
+    serveEuChunks([...doc, '<!-- cut']);
+    expect((await harvestOutcome('eu')).error).toMatch(/truncated/i);
+  });
+
+  it('fails a body that never opens an XML root element', async () => {
+    serveEuChunks(['{"error":"service temporarily unavailable"}']);
+    expect((await harvestOutcome('eu')).error).toMatch(/root element/i);
   });
 });
 

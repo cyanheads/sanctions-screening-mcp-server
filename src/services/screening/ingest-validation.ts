@@ -3,10 +3,10 @@
  * normalizers, plus the per-source drop tally that makes a rejection auditable.
  * A source record that cannot supply its own stable identity or a usable name is
  * dropped rather than repaired: the mirror's primary key is
- * `${source}:${sourceEntryId}` and the sync yields no tombstones, so a minted
- * identifier is never an update — it is one extra row per harvest, forever. A
- * placeholder name is worse still, since a screening hit must never carry a
- * synthesized identity.
+ * `${source}:${sourceEntryId}`, so a minted identifier is never an update — each
+ * harvest would store the entity under a new key and remove the last one, and
+ * no id handed to a caller would survive the next refresh. A placeholder name is
+ * worse still, since a screening hit must never carry a synthesized identity.
  *
  * A silent drop is its own failure mode: a source that started publishing
  * malformed records would be absorbed without a trace. Every normalizer counts
