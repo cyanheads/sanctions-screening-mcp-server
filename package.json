@@ -113,13 +113,13 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
     "@socketsecurity/bun-security-scanner": "^1.1.2",
-    "@types/node": "26.6.1",
-    "@vitest/coverage-istanbul": "4.1.11",
+    "@types/node": "26.6.2",
+    "@vitest/coverage-istanbul": "5.0.1",
     "depcheck": "^1.4.7",
-    "fast-check": "^4.10.1",
+    "fast-check": "^4.10.2",
     "ignore": "^7.0.9",
     "tsc-alias": "^1.9.5",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.1"
   }
 }
