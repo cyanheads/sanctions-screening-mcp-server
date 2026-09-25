@@ -254,7 +254,7 @@ export async function startGleifStandIn(): Promise<GleifStandIn> {
     if (override) {
       if (typeof override === 'string') {
         res.writeHead(200, { 'content-type': 'application/xml' }).end(override);
-      } else {
+      } else if (typeof override === 'function') {
         override(res);
       }
       return;
