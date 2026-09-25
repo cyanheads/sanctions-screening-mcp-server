@@ -11,10 +11,11 @@ import { allResourceDefinitions } from '@/mcp-server/resources/definitions/index
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 
 describe('registered MCP surface', () => {
-  it('exports all six tools exactly once', () => {
+  it('exports all seven tools exactly once', () => {
     const names = allToolDefinitions.map((definition) => definition.name);
     expect(names).toEqual([
       'sanctions_screen_name',
+      'sanctions_screen_identifier',
       'sanctions_get_designation',
       'sanctions_list_sources',
       'sanctions_resolve_entity',
@@ -27,6 +28,7 @@ describe('registered MCP surface', () => {
   it('accepts the minimal documented input for every tool', () => {
     const inputs = new Map<string, Record<string, unknown>>([
       ['sanctions_screen_name', { name: 'Example Name' }],
+      ['sanctions_screen_identifier', { value: 'IMO 7406784' }],
       ['sanctions_get_designation', { source: 'ofac_sdn', entryId: '123' }],
       ['sanctions_list_sources', {}],
       ['sanctions_resolve_entity', { name: 'Example Holdings' }],

@@ -18,6 +18,7 @@ import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designati
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity.tool.js';
+import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 
@@ -169,6 +170,39 @@ describe('sanctions_get_designation format()', () => {
     expect(lines).toContain('- Afghanistan');
     expect(lines).toContain('- Port Moresby, Papua New Guinea — Guinea');
     expect(lines).toContain('- 1 Tverskaya St, Moscow — RU');
+  });
+
+  it('renders an approximate date as circa, and an interval at the precision published', () => {
+    const lines = render(getDesignationTool, {
+      ...base,
+      datesOfBirth: [
+        { date: '1951', circa: true, place: 'Mosul, Iraq' },
+        { date: '1955/1957' },
+        { date: '1946-09-26/1946-12-07' },
+        { date: '../1980', circa: true },
+        { date: '1966-07-07', circa: true },
+      ],
+      identifiers: [
+        { type: 'SWIFT/BIC', value: 'HAVIGB2L' },
+        { type: 'Digital Currency Address - XBT', value: '12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL' },
+      ],
+    }).split('\n');
+
+    expect(lines).toContain('- circa 1951 at Mosul, Iraq');
+    expect(lines).toContain('- 1955/1957');
+    expect(lines).toContain('- 1946-09-26/1946-12-07');
+    expect(lines).toContain('- circa ../1980');
+    expect(lines).toContain('- circa 1966-07-07');
+    expect(lines).toContain('- **SWIFT/BIC:** HAVIGB2L');
+    expect(lines).toContain(
+      '- **Digital Currency Address - XBT:** 12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL',
+    );
+  });
+
+  it('accepts circa only as true', () => {
+    expect(() =>
+      getDesignationTool.output.parse({ ...base, datesOfBirth: [{ date: '1951', circa: false }] }),
+    ).toThrow();
   });
 
   it('drops every optional section when the source published none', () => {
@@ -499,5 +533,106 @@ describe('sanctions_list_sources format()', () => {
     expect(text).toContain('**GLEIF mirror:** NOT ready');
     expect(text).not.toContain('as of');
     expect(text).toContain('**Records:** 0');
+  });
+});
+
+describe('published reference numbers in format() (issue #42)', () => {
+  it('renders a screen_name hit reference beside its entry ID, and nothing when absent', () => {
+    const hit = {
+      source: 'uk',
+      sourceLabel: 'UK Sanctions List (FCDO)',
+      sourceEntryId: 'RUS0251',
+      entityType: 'person',
+      primaryName: 'Vladimir Vladimirovich PUTIN',
+      matchedName: 'Vladimir Vladimirovich PUTIN',
+      matchedNameType: 'primary',
+      matchType: 'exact',
+    };
+    const text = render(screenNameTool, {
+      hits: [{ ...hit, referenceNumber: '14196' }],
+      caveat: SCREENING_CAVEAT,
+    });
+    expect(text).toContain('**Entry ID:** RUS0251 | **Reference:** 14196 | **Type:** person');
+    expect(render(screenNameTool, { hits: [hit], caveat: SCREENING_CAVEAT })).not.toContain(
+      'Reference:',
+    );
+  });
+
+  it('renders a designation reference beside its entry ID, and nothing when absent', () => {
+    const record = {
+      source: 'un',
+      sourceLabel: 'UN Security Council Consolidated List',
+      sourceEntryId: '113458',
+      entityType: 'organization',
+      primaryName: 'AL-QAIDA',
+      aliases: [],
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+      caveat: SCREENING_CAVEAT,
+    };
+    expect(render(getDesignationTool, { ...record, referenceNumber: 'QDe.004' })).toContain(
+      '**Entry ID:** 113458 | **Reference:** QDe.004',
+    );
+    expect(render(getDesignationTool, record)).not.toContain('Reference:');
+  });
+});
+
+describe('sanctions_screen_identifier format()', () => {
+  it('renders every hit field and every matched identifier, country included', () => {
+    const text = render(screenIdentifierTool, {
+      hits: [
+        {
+          source: 'eu',
+          sourceLabel: 'EU Consolidated Financial Sanctions List',
+          sourceEntryId: 'FX-BIC-1',
+          primaryName: 'Fictional Clearing Bank',
+          entityType: 'organization',
+          program: 'EU-TEST-REGIME',
+          matchedIdentifiers: [
+            { type: 'SWIFT BIC', value: 'FCLBTLTTXXX' },
+            { type: 'SWIFT BIC', value: 'FCLBTLTT', country: 'Testland' },
+          ],
+        },
+      ],
+      caveat: SCREENING_CAVEAT,
+    });
+
+    expect(text).toContain('1 designation(s) publish a matching identifier');
+    expect(text).toContain('### Fictional Clearing Bank');
+    expect(text).toContain(
+      '**List:** EU Consolidated Financial Sanctions List (`eu`) | **Entry ID:** FX-BIC-1 | **Type:** organization',
+    );
+    expect(text).toContain('**Program:** EU-TEST-REGIME');
+    expect(text).toContain('- **SWIFT BIC:** FCLBTLTTXXX\n');
+    expect(text).toContain('- **SWIFT BIC:** FCLBTLTT (Testland)');
+    expect(text).toMatch(/not a compliance determination/i);
+  });
+
+  it('omits the program for a hit that carries none', () => {
+    const text = render(screenIdentifierTool, {
+      hits: [
+        {
+          source: 'ofac_sdn',
+          sourceLabel: 'OFAC Specially Designated Nationals (SDN) List',
+          sourceEntryId: '4243',
+          primaryName: 'EBANO',
+          entityType: 'vessel',
+          matchedIdentifiers: [
+            { type: 'Vessel Registration Identification', value: 'IMO 7406784' },
+          ],
+        },
+      ],
+      caveat: SCREENING_CAVEAT,
+    });
+    expect(text).toContain('- **Vessel Registration Identification:** IMO 7406784');
+    expect(text).not.toContain('Program:');
+  });
+
+  it('renders the empty result as an absence of matches, never as a clearance', () => {
+    const text = render(screenIdentifierTool, { hits: [], caveat: SCREENING_CAVEAT });
+    expect(text).toContain('**No designation publishes a matching identifier.**');
+    expect(text).toMatch(/an empty result is not a clearance/i);
   });
 });

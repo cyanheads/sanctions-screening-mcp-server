@@ -18,6 +18,7 @@ import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity.tool.js';
+import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 import { type SeededService, seededGlobalService } from '../services/_helpers.js';
@@ -42,6 +43,7 @@ afterAll(async () => {
 /** Minimal schema-valid input per tool, for the strict-root-input sweep. */
 const MINIMAL_INPUTS: Record<string, Record<string, unknown>> = {
   sanctions_screen_name: { name: 'Ivan Testovich Volkov' },
+  sanctions_screen_identifier: { value: 'X1234567' },
   sanctions_get_designation: { source: 'ofac_sdn', entryId: 'FX-1001' },
   sanctions_list_sources: {},
   sanctions_resolve_entity: { name: 'Fictional Trading Company LLC' },
@@ -97,6 +99,17 @@ toolContractSuite(getDesignationTool, {
       name: 'returns the full designation record for a known source + entry ID',
       input: { source: 'ofac_sdn', entryId: 'FX-1001' },
     },
+    {
+      name: 'resolves the published reference number, any case, and returns it with the entry ID',
+      input: { source: 'eu', entryId: 'eu.3003.30' },
+      assert: (result) => {
+        expect(result.structuredContent).toMatchObject({
+          sourceEntryId: 'FX-3003',
+          referenceNumber: 'EU.3003.30',
+        });
+        expect(renderContent(result.content)).toContain('**Reference:** EU.3003.30');
+      },
+    },
   ],
   errors: [
     {
@@ -104,6 +117,52 @@ toolContractSuite(getDesignationTool, {
       input: { source: 'ofac_sdn', entryId: 'NO-SUCH-ENTRY' },
       code: JsonRpcErrorCode.NotFound,
       reason: 'designation_not_found',
+    },
+  ],
+});
+
+toolContractSuite(screenIdentifierTool, {
+  success: [
+    {
+      name: 'returns the designation publishing a passport number, carrying the caveat on both surfaces',
+      input: { value: 'x 123-4567', type: 'passport' },
+      assert: (result) => {
+        const structured = result.structuredContent as {
+          caveat: string;
+          hits: { matchedIdentifiers: { value: string }[]; sourceEntryId: string }[];
+        };
+        expect(structured.hits).toHaveLength(1);
+        expect(structured.hits[0]).toMatchObject({
+          sourceEntryId: 'FX-1001',
+          matchedIdentifiers: [{ type: 'Passport', value: 'X1234567', country: 'Testland' }],
+        });
+        expect(structured.caveat).toContain('not a compliance determination');
+        expect(renderContent(result.content)).toContain('**Passport:** X1234567 (Testland)');
+      },
+    },
+    {
+      name: 'matches a branch BIC11 to the institution BIC8 it belongs to',
+      input: { value: 'FTCOTL2XXXX', type: 'swift_bic' },
+      assert: (result) => {
+        const structured = result.structuredContent as { hits: { sourceEntryId: string }[] };
+        expect(structured.hits.map((hit) => hit.sourceEntryId)).toEqual(['FX-2002']);
+      },
+    },
+    {
+      name: 'returns no designation for an unpublished identifier and says so is not a clearance',
+      input: { value: 'ZZ-0000000' },
+      assert: (result) => {
+        expect((result.structuredContent as { hits: unknown[] }).hits).toEqual([]);
+        expect(renderContent(result.content)).toContain('NOT a clearance');
+      },
+    },
+  ],
+  errors: [
+    {
+      name: 'rejects a value that is only separators',
+      input: { value: '---' },
+      code: JsonRpcErrorCode.InvalidParams,
+      reason: 'identifier_not_searchable',
     },
   ],
 });

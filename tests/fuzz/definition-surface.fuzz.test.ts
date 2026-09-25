@@ -22,6 +22,7 @@ import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designati
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity.tool.js';
+import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 import { type SeededService, seededGlobalService } from '../services/_helpers.js';
@@ -31,6 +32,7 @@ const FUZZ = { numRuns: 40, numAdversarial: 25, seed: 0x5a17c0de } as const;
 
 const tools = [
   ['sanctions_screen_name', screenNameTool],
+  ['sanctions_screen_identifier', screenIdentifierTool],
   ['sanctions_get_designation', getDesignationTool],
   ['sanctions_resolve_entity', resolveEntityTool],
   ['sanctions_get_entity', getEntityTool],

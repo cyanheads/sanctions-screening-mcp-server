@@ -8,11 +8,13 @@ import { getDesignationTool } from './get-designation.tool.js';
 import { getEntityTool } from './get-entity.tool.js';
 import { listSourcesTool } from './list-sources.tool.js';
 import { resolveEntityTool } from './resolve-entity.tool.js';
+import { screenIdentifierTool } from './screen-identifier.tool.js';
 import { screenNameTool } from './screen-name.tool.js';
 import { traceOwnershipTool } from './trace-ownership.tool.js';
 
 export const allToolDefinitions = [
   screenNameTool,
+  screenIdentifierTool,
   getDesignationTool,
   listSourcesTool,
   resolveEntityTool,
@@ -25,6 +27,7 @@ export {
   getEntityTool,
   listSourcesTool,
   resolveEntityTool,
+  screenIdentifierTool,
   screenNameTool,
   traceOwnershipTool,
 };

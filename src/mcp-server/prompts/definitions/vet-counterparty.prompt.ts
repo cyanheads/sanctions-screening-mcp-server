@@ -32,7 +32,7 @@ export const vetCounterpartyPrompt = prompt('sanctions_vet_counterparty', {
           text:
             `Run a counterparty due-diligence pass on "${args.name}".${jurisdictionClause}\n\n` +
             'Follow this workflow with the sanctions-screening tools, then summarize:\n\n' +
-            `1. Screen the name directly with sanctions_screen_name (matchMode "strict"; if it returns nothing, retry with matchMode "fuzzy").\n` +
+            `1. Screen the name directly with sanctions_screen_name (matchMode "strict"; if it returns nothing, retry with matchMode "fuzzy"). If you also hold an identifier for the counterparty — a vessel IMO number, a SWIFT/BIC code, a wallet address, or a passport or national ID number — look each one up exactly with sanctions_screen_identifier.\n` +
             `2. Resolve "${args.name}" to a GLEIF LEI with sanctions_resolve_entity. If there are multiple candidates, pick the best match and note the alternatives.\n` +
             '3. If an LEI is found, call sanctions_trace_ownership on it with screenNodes set to true and direction "both" — this screens every parent and subsidiary (the beneficial owners) against all watchlists.\n' +
             '4. For any potential match surfaced in steps 1–3, call sanctions_get_designation to pull the full record (aliases, identifiers, program, designation date) so it can be verified.\n\n' +
