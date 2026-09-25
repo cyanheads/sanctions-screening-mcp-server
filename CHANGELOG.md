@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-25 · ⚠️ Breaking
+
+GLEIF refresh applies the delta window its checkpoint calls for, deletions included, and now runs on the HTTP cron; sanctions_resolve_entity searches every name GLEIF publishes; ownership traces report each node's parent status from GLEIF reporting exceptions. Existing mirrors need one mirror:init.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-09-25 · ⚠️ Breaking
 
 New sanctions_screen_identifier looks up an IMO number, SWIFT/BIC, wallet address, or document number exactly; sanctions_get_designation resolves published reference numbers; dates keep the precision their source published; and a failing source no longer stops a sanctions refresh.

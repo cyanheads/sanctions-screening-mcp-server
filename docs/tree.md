@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-09-25 10:47:46
+Generated on: 2026-09-25 16:36:32
 
 ```text
 sanctions-screening-mcp-server/
@@ -27,6 +27,7 @@ sanctions-screening-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -167,6 +168,7 @@ sanctions-screening-mcp-server/
 │   │   └── screening/
 │   │       ├── fixtures.ts
 │   │       ├── gleif-ingest.ts
+│   │       ├── gleif-sync.ts
 │   │       ├── identifier-matching.ts
 │   │       ├── ingest-validation.ts
 │   │       ├── sanctions-ingest.ts
@@ -184,6 +186,7 @@ sanctions-screening-mcp-server/
 │   │   ├── definition-surface.fuzz.test.ts
 │   │   └── ingest-and-matcher.fuzz.test.ts
 │   ├── integration/
+│   │   ├── gleif-refresh-script.test.ts
 │   │   ├── matching-correctness.test.ts
 │   │   ├── mirror-upgrade.test.ts
 │   │   ├── ownership-correctness.test.ts
@@ -197,10 +200,13 @@ sanctions-screening-mcp-server/
 │   ├── resources/
 │   │   └── resource-contracts.test.ts
 │   ├── services/
+│   │   ├── _gleif-publication.ts
 │   │   ├── _helpers.ts
 │   │   ├── _lookup-corpus.ts
+│   │   ├── gleif-sync.test.ts
 │   │   ├── identifier-matching.test.ts
 │   │   ├── ingest-parsers.test.ts
+│   │   ├── lei-resolution.test.ts
 │   │   ├── sanctions-sync.test.ts
 │   │   ├── screening-service.test.ts
 │   │   ├── source-fetch.test.ts
