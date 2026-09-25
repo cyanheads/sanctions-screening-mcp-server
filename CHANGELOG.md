@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-09-25 · ⚠️ Breaking
+
+New sanctions_screen_identifier looks up an IMO number, SWIFT/BIC, wallet address, or document number exactly; sanctions_get_designation resolves published reference numbers; dates keep the precision their source published; and a failing source no longer stops a sanctions refresh.
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-09-24 · ⚠️ Breaking · 🛡️ Security
 
 Native-script names are indexed and screenable, XML entities are decoded at parse time, sanctions_get_designation returns the details each list publishes, and a refresh removes delisted designations. Both name tools now reject unmatchable and oversized names.

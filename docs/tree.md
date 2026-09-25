@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-09-24 18:47:01
+Generated on: 2026-09-25 10:47:46
 
 ```text
 sanctions-screening-mcp-server/
@@ -26,6 +26,7 @@ sanctions-screening-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   └── design.md
@@ -159,16 +160,20 @@ sanctions-screening-mcp-server/
 │   │           ├── index.ts
 │   │           ├── list-sources.tool.ts
 │   │           ├── resolve-entity.tool.ts
+│   │           ├── screen-identifier.tool.ts
 │   │           ├── screen-name.tool.ts
 │   │           └── trace-ownership.tool.ts
 │   ├── services/
 │   │   └── screening/
 │   │       ├── fixtures.ts
 │   │       ├── gleif-ingest.ts
+│   │       ├── identifier-matching.ts
 │   │       ├── ingest-validation.ts
 │   │       ├── sanctions-ingest.ts
+│   │       ├── sanctions-refresh.ts
 │   │       ├── schema.ts
 │   │       ├── screening-service.ts
+│   │       ├── source-fetch.ts
 │   │       ├── text-matching.ts
 │   │       ├── types.ts
 │   │       ├── xml-stream.ts
@@ -180,6 +185,7 @@ sanctions-screening-mcp-server/
 │   │   └── ingest-and-matcher.fuzz.test.ts
 │   ├── integration/
 │   │   ├── matching-correctness.test.ts
+│   │   ├── mirror-upgrade.test.ts
 │   │   ├── ownership-correctness.test.ts
 │   │   ├── refresh-pruning.test.ts
 │   │   ├── scheduled-refresh.test.ts
@@ -192,14 +198,20 @@ sanctions-screening-mcp-server/
 │   │   └── resource-contracts.test.ts
 │   ├── services/
 │   │   ├── _helpers.ts
+│   │   ├── _lookup-corpus.ts
+│   │   ├── identifier-matching.test.ts
 │   │   ├── ingest-parsers.test.ts
 │   │   ├── sanctions-sync.test.ts
 │   │   ├── screening-service.test.ts
-│   │   └── text-matching.test.ts
+│   │   ├── source-fetch.test.ts
+│   │   ├── text-matching.test.ts
+│   │   └── xml-stream.test.ts
 │   ├── smoke/
 │   │   └── surface.smoke.test.ts
 │   └── tools/
 │       ├── format-parity.test.ts
+│       ├── reference-lookup.test.ts
+│       ├── screen-identifier.test.ts
 │       └── screening-tools.test.ts
 ├── .dockerignore
 ├── .env.example
