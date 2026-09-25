@@ -31,7 +31,17 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
         { name: 'I. T. Volkov', nameType: 'aka' },
         { name: 'Vanya Volkov', nameType: 'low-quality-aka' },
       ],
-      identifiers: [{ type: 'Passport', value: 'X1234567', country: 'Testland' }],
+      identifiers: [
+        { type: 'Passport', value: 'X1234567', country: 'Testland' },
+        // Feature-backed identifiers: the currency code rides in the type, and
+        // the address keeps its case — case-significant for this base58 address,
+        // case-insensitive for the mixed-case hex one.
+        { type: 'Digital Currency Address - XBT', value: '1TestFixtureAddrNotReaL9xYz' },
+        {
+          type: 'Digital Currency Address - ETH',
+          value: '0xAbCdEf0123456789aBcDeF0123456789AbCdEf01',
+        },
+      ],
       addresses: [{ full: '1 Test Street, Testograd, Testland', country: 'Testland' }],
       datesOfBirth: [{ date: '1970-01-01', place: 'Testograd' }],
       nationalities: ['Testland'],
@@ -51,7 +61,7 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
         { name: 'Fictional Trading Co', nameType: 'aka' },
         { name: 'FTC LLC', nameType: 'aka' },
       ],
-      identifiers: [],
+      identifiers: [{ type: 'SWIFT/BIC', value: 'FTCOTL2X' }],
       addresses: [{ full: '99 Commerce Way, Testopolis', country: 'Testland' }],
       datesOfBirth: [],
       nationalities: [],
@@ -65,6 +75,7 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
     primaryName: 'Katarina Beispiel',
     program: 'EU-TEST-REGIME',
     designationDate: '2023-02-20',
+    referenceNumber: 'EU.3003.30',
     payload: {
       aliases: [{ name: 'Katarina Example', nameType: 'aka' }],
       identifiers: [],
@@ -83,7 +94,7 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
     designationDate: '2024-09-10',
     payload: {
       aliases: [{ name: 'Phantom Voyager', nameType: 'aka' }],
-      identifiers: [{ type: 'IMO', value: '1234567' }],
+      identifiers: [{ type: 'IMO Number', value: '1234567' }],
       addresses: [],
       datesOfBirth: [],
       nationalities: [],
@@ -100,11 +111,13 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
     primaryName: 'Mohammed Al-Testi',
     program: 'UN-TEST-1267',
     designationDate: '2019-04-12',
+    referenceNumber: 'QDi.606',
     payload: {
       aliases: [{ name: 'Mohammed Testi', nameType: 'aka' }],
       identifiers: [],
       addresses: [],
-      datesOfBirth: [{ date: '1975-07-07' }],
+      // A day, and a year the source flags approximate.
+      datesOfBirth: [{ date: '1975-07-07' }, { date: '1974', circa: true }],
       nationalities: ['Testland'],
     },
   },

@@ -3,8 +3,9 @@
  * `designation` + GLEIF `lei_entity`, both SQLite + FTS5 via the framework
  * MirrorService), the normalized-schema write path that keeps the per-alias
  * `name` index and `lei_relationship` table in lockstep, and the matching
- * engine (exact → strict-token → scored Jaro-Winkler / phonetic fuzzy). All six
- * tools compose against this service; the agent never sees the source boundary.
+ * engine (exact → strict-token → scored Jaro-Winkler / phonetic fuzzy) and the
+ * exact identifier lookup. All seven tools compose against this service; the
+ * agent never sees the source boundary.
  *
  * The matching engine surfaces only real signal: exact/strong hits are
  * deterministic and unscored; approximate hits carry the raw Jaro-Winkler
@@ -14,13 +15,28 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import type { Mirror, SqliteHandle, SyncPage } from '@cyanheads/mcp-ts-core/mirror';
+import type {
+  Mirror,
+  SqliteHandle,
+  SqliteStatement,
+  SyncMode,
+  SyncPage,
+  SyncResult,
+  SyncState,
+} from '@cyanheads/mcp-ts-core/mirror';
 import { defineMirror, sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
 import {
+  type IdentifierType,
+  identifierCategory,
+  identifierKey,
+  identifierProbes,
+} from '@/services/screening/identifier-matching.js';
+import {
   createSanctionsSync,
+  type DeferredColumns,
   type DeferredDesignationFields,
   type SanctionsIngester,
 } from '@/services/screening/sanctions-ingest.js';
@@ -28,6 +44,8 @@ import {
   designationStoreSpec,
   ensureDesignationAuxSchema,
   ensureLeiAuxSchema,
+  IDENTIFIER_STAMP_TABLE,
+  IDENTIFIER_TABLE,
   LEI_RELATIONSHIP_TABLE,
   leiStoreSpec,
   NAME_FTS_TABLE,
@@ -46,6 +64,7 @@ import {
 import type {
   DesignationPayload,
   EntityType,
+  IdentifierRecord,
   LeiMatch,
   MatchMode,
   NameRecord,
@@ -145,6 +164,33 @@ export interface ResolveEntityResult {
   totalAvailableBasis: CountBasis;
 }
 
+/**
+ * Where an entry ID resolved: to one designation, to several (a reference number
+ * more than one designation publishes), or to none.
+ */
+export type DesignationLookup =
+  | { designation: NormalizedDesignation; kind: 'found' }
+  | { kind: 'ambiguous'; sourceEntryIds: string[] }
+  | { kind: 'not_found' };
+
+/** Options for {@link ScreeningService.screenIdentifier}. */
+export interface ScreenIdentifierOptions {
+  sources: SourceCode[];
+  type: IdentifierType | 'any';
+  value: string;
+}
+
+/** One designation that publishes an identifier matching the lookup. */
+export interface IdentifierHit {
+  entityType: EntityType;
+  /** Every stored identifier of this designation that matched, as published. */
+  matchedIdentifiers: IdentifierRecord[];
+  primaryName: string;
+  program?: string;
+  source: SourceCode;
+  sourceEntryId: string;
+}
+
 /** Internal row shape from the `name` join used during matching. */
 interface NameJoinRow {
   designation_date: string | null;
@@ -156,8 +202,22 @@ interface NameJoinRow {
   phonetic: string;
   primary_name: string;
   program: string | null;
+  reference_number: string | null;
   source: string;
   source_entry_id: string;
+}
+
+/** Internal row shape from the `designation_identifier` join used by the identifier lookup. */
+interface IdentifierJoinRow {
+  country: string | null;
+  designation_id: string;
+  entity_type: string;
+  primary_name: string;
+  program: string | null;
+  source: string;
+  source_entry_id: string;
+  type: string;
+  value: string;
 }
 
 /** Raw row from the `lei_relationship` table. */
@@ -206,9 +266,10 @@ const STRICT_RAW_ROW_CAP = 5000;
 const LEI_STRICT_RAW_ROW_CAP = 2000;
 
 /**
- * Designation rows read per keyset slice by {@link ScreeningService.rebuildNameIndex}
- * and {@link ScreeningService.staleDesignationIds}. Bounds the rows (and, for the
- * rebuild, their JSON payloads) resident at once — the whole corpus was
+ * Designation rows read per keyset slice by the index rebuilds
+ * ({@link ScreeningService.rebuildSearchIndexes}, the identifier rebuild on open) and
+ * {@link ScreeningService.staleDesignationIds}. Bounds the rows (and, for the
+ * rebuilds, their JSON payloads) resident at once — the whole corpus was
  * previously materialized.
  */
 const DESIGNATION_READ_SLICE = 2000;
@@ -244,8 +305,19 @@ export class ScreeningService {
       // programme block after every party) arrive after those rows are written —
       // the sync patches them through the service rather than re-stating rows.
       sync: createSanctionsSync({
-        applyDeferredFields: (source, fields) => this.applyDeferredFields(source, fields),
+        applyDeferredFields: (source, fields, kept) =>
+          this.applyDeferredFields(source, fields, kept),
+        storedDeferredFields: (ids) => this.storedDeferredFields(ids),
         staleDesignationIds: (source, kept) => this.staleDesignationIds(source, kept),
+        onSourceFailed: (failure) => {
+          logger.error(
+            'Sanctions harvest — source failed; nothing was removed for it, and the run continues with the next source.',
+            requestContextService.createRequestContext({
+              operation: 'mirror.sync.source',
+              additionalContext: { ...failure },
+            }),
+          );
+        },
         onSourceReport: (report) => {
           const context = requestContextService.createRequestContext({
             operation: 'mirror.sync.source',
@@ -281,15 +353,35 @@ export class ScreeningService {
   }
 
   /**
-   * Open the designation mirror's raw handle, ensuring the auxiliary `name` index
-   * + FTS exist first. This service owns that DDL rather than the store's
-   * `migrations` (see `schema.ts`), so it is applied here — idempotently — on
-   * first use.
+   * Open the designation mirror's raw handle, ensuring the auxiliary `name` and
+   * identifier indexes exist first. This service owns that DDL rather than the
+   * store's `migrations` (see `schema.ts`), so it is applied here — idempotently —
+   * on first use.
+   *
+   * The first open also rebuilds the identifier index from the stored payloads,
+   * which hold every identifier, when the index was not built from the data now
+   * stored: a release before the index existed (0.2.0) writes designations and
+   * the name index but never touches the identifier index, so a mirror it wrote —
+   * or synced after a rollback — would otherwise answer identifier lookups from
+   * missing or stale rows, and for a screening aid an empty answer reads as a
+   * clearance. The index carries the sync-state stamp of the run it followed; a
+   * different stamp means a run it did not follow. While a run is in progress its
+   * own rebuild follows, so only an index holding nothing is rebuilt then.
    */
   private async designationHandle(): Promise<SqliteHandle> {
     const raw = await this.designationMirror.raw();
     if (!this.designationAuxReady) {
       ensureDesignationAuxSchema(raw);
+      const state = await this.designationMirror.store.readState();
+      const stamp = syncStamp(state);
+      const stale = state.status !== 'in_progress' && identifierStamp(raw) !== stamp;
+      if (stale || identifierIndexUnbuilt(raw)) {
+        raw.transaction(() => rebuildIdentifierIndex(raw, stamp));
+        logger.info(
+          'Sanctions mirror — identifier index rebuilt from the stored designations',
+          requestContextService.createRequestContext({ operation: 'mirror.identifierBackfill' }),
+        );
+      }
       this.designationAuxReady = true;
     }
     return raw;
@@ -315,6 +407,26 @@ export class ScreeningService {
     return this.leiMirror;
   }
 
+  /**
+   * Run the sanctions sync, then rebuild the name and identifier indexes from what
+   * the run left in `designation` — whether the sync resolved or rejected. A run
+   * that fails part way (a source that could not be read, a caller abort) has
+   * still committed the pages before the failure and, past a failed source, every
+   * source after it; the indexes must follow those rows, not the ones they
+   * replaced. The one entry point for `mirror:init`, `mirror:refresh`, and the
+   * HTTP refresh cron.
+   *
+   * @throws The sync's failure, after the rebuild: one error naming every source
+   *   that failed, or the caller's abort.
+   */
+  async syncSanctions(mode: SyncMode, signal: AbortSignal): Promise<SyncResult> {
+    try {
+      return await this.designationMirror.runSync({ mode, signal });
+    } finally {
+      await this.rebuildSearchIndexes();
+    }
+  }
+
   /** True once the sanctions mirror has ever completed a full sync. */
   sanctionsReady(): Promise<boolean> {
     return this.designationMirror.ready();
@@ -329,8 +441,9 @@ export class ScreeningService {
 
   /**
    * Apply a batch of normalized designations. Writes the primary `designation`
-   * rows via the mirror store, then refreshes the per-alias `name` index for
-   * exactly those designations — all in one transaction. Idempotent per id.
+   * rows via the mirror store, then refreshes the per-alias `name` index and the
+   * identifier index for exactly those designations — all in one transaction.
+   * Idempotent per id.
    */
   async ingestDesignations(designations: NormalizedDesignation[]): Promise<void> {
     if (designations.length === 0) return;
@@ -340,42 +453,41 @@ export class ScreeningService {
       const upsert = handle.prepare(
         `INSERT INTO designation
            (id, source, source_entry_id, entity_type, primary_name, normalized_name,
-            program, legal_basis, designation_date, payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            program, legal_basis, designation_date, reference_number, payload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            source=excluded.source, source_entry_id=excluded.source_entry_id,
            entity_type=excluded.entity_type, primary_name=excluded.primary_name,
            normalized_name=excluded.normalized_name, program=excluded.program,
            legal_basis=excluded.legal_basis, designation_date=excluded.designation_date,
-           payload=excluded.payload`,
+           reference_number=excluded.reference_number, payload=excluded.payload`,
       );
       const deleteNames = handle.prepare(`DELETE FROM ${NAME_TABLE} WHERE designation_id = ?`);
-      const insertName = handle.prepare(
-        `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type)
-         VALUES (?, ?, ?, ?, ?)`,
+      const insertName = prepareNameInsert(handle);
+      const deleteIdentifiers = handle.prepare(
+        `DELETE FROM ${IDENTIFIER_TABLE} WHERE designation_id = ?`,
       );
+      const insertIdentifier = prepareIdentifierInsert(handle);
 
       for (const d of designations) {
-        const normalizedPrimary = fold(d.primaryName);
         upsert.run(
           d.id,
           d.source,
           d.sourceEntryId,
           d.entityType,
           d.primaryName,
-          normalizedPrimary,
+          fold(d.primaryName),
           d.program ?? null,
           d.legalBasis ?? null,
           d.designationDate ?? null,
+          d.referenceNumber ?? null,
           JSON.stringify(d.payload),
         );
 
         deleteNames.run(d.id);
-        for (const rec of this.allNames(d)) {
-          const normalized = fold(rec.name);
-          if (!normalized) continue;
-          insertName.run(d.id, rec.name, normalized, doubleMetaphone(normalized), rec.nameType);
-        }
+        writeNames(insertName, d.id, d.primaryName, d.payload.aliases);
+        deleteIdentifiers.run(d.id);
+        writeIdentifiers(insertIdentifier, d.id, d.payload.identifiers);
       }
     });
   }
@@ -385,24 +497,58 @@ export class ScreeningService {
    * to — the OFAC programme and designation date, which `SDN_ADVANCED.XML`
    * carries in a `<SanctionsEntries>` block after every `<DistinctParty>`. The
    * streaming harvest writes those parties first and hands the fields here once
-   * the source drains, keyed by `source_entry_id`.
+   * the source drains, keyed by `source_entry_id`, with the designation ids it
+   * kept (`{source}:{source_entry_id}`).
    *
-   * An UPDATE, not an upsert: a key with no row is a programme entry pointing at
-   * a party the document never published, and inventing a row for it would put
-   * an entity with no identity into the searchable corpus.
+   * Every kept party gets its programme entry, or neither column when the
+   * document published none for it — its rows carried the previously stored
+   * values while the harvest ran ({@link storedDeferredFields}). An UPDATE of kept
+   * rows only: an entry with no kept party points at a party the document never
+   * published, and inventing a row for it would put an entity with no identity
+   * into the searchable corpus.
    */
-  async applyDeferredFields(source: SourceCode, fields: DeferredDesignationFields): Promise<void> {
-    if (fields.size === 0) return;
+  async applyDeferredFields(
+    source: SourceCode,
+    fields: DeferredDesignationFields,
+    kept: ReadonlySet<string>,
+  ): Promise<void> {
     const handle = await this.designationHandle();
+    const prefix = `${source}:`;
     handle.transaction(() => {
       const update = handle.prepare(
-        `UPDATE designation SET program = ?, designation_date = ?
-         WHERE source = ? AND source_entry_id = ?`,
+        `UPDATE designation SET program = ?, designation_date = ? WHERE id = ?`,
       );
-      for (const [entryId, value] of fields) {
-        update.run(value.program ?? null, value.designationDate ?? null, source, entryId);
+      for (const id of kept) {
+        const value = fields.get(id.slice(prefix.length));
+        update.run(value?.program ?? null, value?.designationDate ?? null, id);
       }
     });
+  }
+
+  /**
+   * The programme fields stored for the given designation ids, keyed by id — what
+   * a page of a deferring source carries until its own programme block arrives,
+   * so a harvest that fails first leaves them as they were. Bounded by the page.
+   */
+  async storedDeferredFields(
+    ids: readonly string[],
+  ): Promise<ReadonlyMap<string, DeferredColumns>> {
+    const handle = await this.designationHandle();
+    const rows = handle
+      .prepare<{ designation_date: string | null; id: string; program: string | null }>(
+        `SELECT id, program, designation_date FROM designation
+         WHERE id IN (SELECT value FROM json_each(?))`,
+      )
+      .all(JSON.stringify(ids));
+    return new Map(
+      rows.map((row) => [
+        row.id,
+        {
+          ...(row.program ? { program: row.program } : {}),
+          ...(row.designation_date ? { designationDate: row.designation_date } : {}),
+        },
+      ]),
+    );
   }
 
   /**
@@ -427,12 +573,13 @@ export class ScreeningService {
   }
 
   /**
-   * Rebuild the per-alias `name` index from the current `designation` table.
-   * The MirrorService `sync` path only writes the primary `designation` rows, so
-   * after a `runSync` the lifecycle scripts (and the refresh cron) call this to
-   * regenerate the matching index — including the Double-Metaphone phonetic keys
-   * that can't be computed in SQL. Idempotent: clears and repopulates `name`,
-   * which is also what drops the names of a designation the sync removed.
+   * Rebuild the per-alias `name` index and the identifier index from the current
+   * `designation` table. The MirrorService `sync` path only writes the primary
+   * `designation` rows, so {@link syncSanctions} calls this after every run to
+   * regenerate both — including the Double-Metaphone phonetic keys and the
+   * per-category identifier keys that can't be computed in SQL. Idempotent: clears
+   * and repopulates both tables, which is also what drops the names and
+   * identifiers of a designation the sync removed.
    *
    * The designation table is walked in keyset slices ordered by `id` rather than
    * materialized: `SELECT … .all()` over the whole corpus, plus a `JSON.parse`
@@ -441,37 +588,18 @@ export class ScreeningService {
    * half-rebuilt index would silently narrow every screen — and nothing writes
    * `designation` during it, so the keyset cursor sees a stable table.
    */
-  async rebuildNameIndex(): Promise<void> {
+  async rebuildSearchIndexes(): Promise<void> {
     const handle = await this.designationHandle();
-    const slice = handle.prepare<{ id: string; payload: string; primary_name: string }>(
-      `SELECT id, primary_name, payload FROM designation
-       WHERE id > ? ORDER BY id LIMIT ${DESIGNATION_READ_SLICE}`,
-    );
-    const insertName = handle.prepare(
-      `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type)
-       VALUES (?, ?, ?, ?, ?)`,
-    );
-
+    const stamp = syncStamp(await this.designationMirror.store.readState());
     handle.transaction(() => {
-      handle.exec(`DELETE FROM ${NAME_TABLE}`);
-      let cursor = '';
-      for (;;) {
-        const rows = slice.all(cursor);
-        if (rows.length === 0) return;
-        for (const row of rows) {
-          const payload = JSON.parse(row.payload) as DesignationPayload;
-          const names: NameRecord[] = [
-            { name: row.primary_name, nameType: 'primary' },
-            ...payload.aliases,
-          ];
-          for (const rec of names) {
-            const normalized = fold(rec.name);
-            if (!normalized) continue;
-            insertName.run(row.id, rec.name, normalized, doubleMetaphone(normalized), rec.nameType);
-          }
-        }
-        cursor = rows[rows.length - 1]?.id ?? cursor;
-      }
+      handle.exec(`DELETE FROM ${NAME_TABLE}; DELETE FROM ${IDENTIFIER_TABLE};`);
+      const insertName = prepareNameInsert(handle);
+      const insertIdentifier = prepareIdentifierInsert(handle);
+      walkDesignations(handle, (row, payload) => {
+        writeNames(insertName, row.id, row.primary_name, payload.aliases);
+        writeIdentifiers(insertIdentifier, row.id, payload.identifiers);
+      });
+      writeIdentifierStamp(handle, stamp);
     });
   }
 
@@ -549,11 +677,6 @@ export class ScreeningService {
   async clearLeiRelationships(): Promise<void> {
     const handle = await this.leiHandle();
     handle.exec(`DELETE FROM ${LEI_RELATIONSHIP_TABLE}`);
-  }
-
-  /** Primary name + aliases as one list, primary first. */
-  private allNames(d: NormalizedDesignation): NameRecord[] {
-    return [{ name: d.primaryName, nameType: 'primary' as const }, ...d.payload.aliases];
   }
 
   /**
@@ -724,7 +847,7 @@ export class ScreeningService {
       .prepare<NameJoinRow>(
         `SELECT n.designation_id, n.name, n.normalized, n.phonetic, n.name_type,
                 d.source, d.source_entry_id, d.entity_type, d.primary_name,
-                d.program, d.designation_date
+                d.program, d.designation_date, d.reference_number
          FROM ${NAME_FTS_TABLE} f
          JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
          JOIN designation d ON d.id = n.designation_id
@@ -786,7 +909,7 @@ export class ScreeningService {
     // rowid — every query token contributes candidates.
     const select = `SELECT n.rowid AS rowid, n.designation_id, n.name, n.normalized,
                 n.phonetic, n.name_type, d.source, d.source_entry_id, d.entity_type,
-                d.primary_name, d.program, d.designation_date
+                d.primary_name, d.program, d.designation_date, d.reference_number
          FROM ${NAME_TABLE} n
          JOIN designation d ON d.id = n.designation_id`;
     const prefixes = blockingPrefixes(args.queryTokens);
@@ -954,12 +1077,13 @@ export class ScreeningService {
       matchType,
       ...(row.program ? { program: row.program } : {}),
       ...(row.designation_date ? { designationDate: row.designation_date } : {}),
+      ...(row.reference_number ? { referenceNumber: row.reference_number } : {}),
     };
   }
 
   // ─── Designation detail ────────────────────────────────────────────────────
 
-  /** Full normalized designation by source + entry id, or null if absent. */
+  /** Full normalized designation by source + exact entry id, or null if absent. */
   async getDesignation(source: SourceCode, entryId: string): Promise<NormalizedDesignation | null> {
     const rows = await this.designationMirror.getByIds([`${source}:${entryId}`]);
     const row = rows[0];
@@ -973,8 +1097,104 @@ export class ScreeningService {
       ...(row.program ? { program: String(row.program) } : {}),
       ...(row.legal_basis ? { legalBasis: String(row.legal_basis) } : {}),
       ...(row.designation_date ? { designationDate: String(row.designation_date) } : {}),
+      ...(row.reference_number ? { referenceNumber: String(row.reference_number) } : {}),
       payload: JSON.parse(String(row.payload)) as DesignationPayload,
     };
+  }
+
+  /**
+   * Resolve a caller's entry ID within one source: trimmed, and case-insensitive
+   * on both sides, against `sourceEntryId` first and then the published
+   * `referenceNumber`. No reference number equals another designation's entry ID
+   * in its source, so the second pass never redirects an ID the first resolves; a
+   * reference number more than one designation publishes (a UK Group ID covering
+   * two regimes' designations of one person) resolves to all of them, and the
+   * caller picks by entry ID.
+   */
+  async resolveDesignation(source: SourceCode, entryId: string): Promise<DesignationLookup> {
+    const wanted = entryId.trim();
+    if (!wanted) return { kind: 'not_found' };
+    const handle = await this.designationHandle();
+
+    // An exact-case match wins over a case-folded one, so an ID that resolves
+    // today resolves to the same record.
+    const byEntryId = handle
+      .prepare<{ source_entry_id: string }>(
+        `SELECT source_entry_id FROM designation
+         WHERE source = ? AND source_entry_id = ? COLLATE NOCASE
+         ORDER BY source_entry_id = ? DESC LIMIT 1`,
+      )
+      .get(source, wanted, wanted);
+    // Sorted here rather than in SQL: an ORDER BY on the entry ID steers the
+    // planner off the case-insensitive reference index onto a scan of the source.
+    const matched = byEntryId
+      ? [byEntryId.source_entry_id]
+      : handle
+          .prepare<{ source_entry_id: string }>(
+            `SELECT source_entry_id FROM designation
+             WHERE source = ? AND reference_number = ? COLLATE NOCASE`,
+          )
+          .all(source, wanted)
+          .map((row) => row.source_entry_id)
+          .sort();
+
+    const [only, ...others] = matched;
+    if (!only) return { kind: 'not_found' };
+    if (others.length > 0) return { kind: 'ambiguous', sourceEntryIds: matched };
+    const designation = await this.getDesignation(source, only);
+    return designation ? { kind: 'found', designation } : { kind: 'not_found' };
+  }
+
+  // ─── Identifier lookup ─────────────────────────────────────────────────────
+
+  /**
+   * The designations that publish an identifier equal to `value` after
+   * normalization — per category, as {@link identifierProbes} keys it — one hit
+   * per designation carrying every stored identifier that matched, ordered by
+   * source then entry ID. Joined to `designation`, so a designation a sync removed
+   * never surfaces, even before the post-sync rebuild drops its identifier rows.
+   */
+  async screenIdentifier(opts: ScreenIdentifierOptions): Promise<IdentifierHit[]> {
+    const probes = identifierProbes(opts.value, opts.type);
+    if (probes.length === 0) return [];
+    const handle = await this.designationHandle();
+    const rows = handle
+      .prepare<IdentifierJoinRow>(
+        `SELECT i.designation_id, i.type, i.value, i.country,
+                d.source, d.source_entry_id, d.entity_type, d.primary_name, d.program
+         FROM ${IDENTIFIER_TABLE} i
+         JOIN designation d ON d.id = i.designation_id
+         WHERE (${probes.map(() => '(i.key = ? AND i.category = ?)').join(' OR ')})${this.sourceFilterClause(opts.sources)}
+         ORDER BY i.rowid`,
+      )
+      .all(...probes.flatMap((probe) => [probe.key, probe.category]));
+
+    const byDesignation = new Map<string, IdentifierHit>();
+    for (const row of rows) {
+      const matched: IdentifierRecord = {
+        type: row.type,
+        value: row.value,
+        ...(row.country ? { country: row.country } : {}),
+      };
+      const hit = byDesignation.get(row.designation_id);
+      if (hit) {
+        hit.matchedIdentifiers.push(matched);
+        continue;
+      }
+      byDesignation.set(row.designation_id, {
+        source: row.source as SourceCode,
+        sourceEntryId: row.source_entry_id,
+        entityType: row.entity_type as EntityType,
+        primaryName: row.primary_name,
+        ...(row.program ? { program: row.program } : {}),
+        matchedIdentifiers: [matched],
+      });
+    }
+    return [...byDesignation.values()].sort(
+      (a, b) =>
+        SOURCE_CODES.indexOf(a.source) - SOURCE_CODES.indexOf(b.source) ||
+        a.sourceEntryId.localeCompare(b.sourceEntryId, 'en', { numeric: true }),
+    );
   }
 
   // ─── LEI resolution ──────────────────────────────────────────────────────
@@ -1285,6 +1505,130 @@ function blockingPrefixes(tokens: readonly string[]): string[] {
     .filter((codePoints) => codePoints.length >= 2)
     .map((codePoints) => codePoints.join(''));
   return [...new Set(prefixes)];
+}
+
+/** A designation row as the index rebuilds read it. */
+interface DesignationPayloadRow {
+  id: string;
+  payload: string;
+  primary_name: string;
+}
+
+/**
+ * Visit every stored designation with its parsed payload, in keyset slices of
+ * {@link DESIGNATION_READ_SLICE} ordered by id, so only one slice of payloads is
+ * resident at a time. Synchronous; the caller owns the transaction.
+ */
+function walkDesignations(
+  handle: SqliteHandle,
+  visit: (row: DesignationPayloadRow, payload: DesignationPayload) => void,
+): void {
+  const slice = handle.prepare<DesignationPayloadRow>(
+    `SELECT id, primary_name, payload FROM designation
+     WHERE id > ? ORDER BY id LIMIT ${DESIGNATION_READ_SLICE}`,
+  );
+  let cursor = '';
+  for (;;) {
+    const rows = slice.all(cursor);
+    if (rows.length === 0) return;
+    for (const row of rows) visit(row, JSON.parse(row.payload) as DesignationPayload);
+    cursor = rows[rows.length - 1]?.id ?? cursor;
+  }
+}
+
+function prepareNameInsert(handle: SqliteHandle): SqliteStatement {
+  return handle.prepare(
+    `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+}
+
+function prepareIdentifierInsert(handle: SqliteHandle): SqliteStatement {
+  return handle.prepare(
+    `INSERT INTO ${IDENTIFIER_TABLE} (designation_id, category, key, type, value, country)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+}
+
+/** Index a designation's primary name and aliases, primary first; a name that folds to nothing is skipped. */
+function writeNames(
+  insert: SqliteStatement,
+  designationId: string,
+  primaryName: string,
+  aliases: readonly NameRecord[],
+): void {
+  for (const rec of [{ name: primaryName, nameType: 'primary' as const }, ...aliases]) {
+    const normalized = fold(rec.name);
+    if (!normalized) continue;
+    insert.run(designationId, rec.name, normalized, doubleMetaphone(normalized), rec.nameType);
+  }
+}
+
+/** Index a designation's identifiers under their categories' keys; one that normalizes to nothing is skipped. */
+function writeIdentifiers(
+  insert: SqliteStatement,
+  designationId: string,
+  identifiers: readonly IdentifierRecord[],
+): void {
+  for (const identifier of identifiers) {
+    const category = identifierCategory(identifier.type);
+    const key = identifierKey(category, identifier.value);
+    if (!key) continue;
+    insert.run(
+      designationId,
+      category,
+      key,
+      identifier.type,
+      identifier.value,
+      identifier.country ?? null,
+    );
+  }
+}
+
+/**
+ * The stamp of the sync run a mirror's designation data came from: every run
+ * records a fresh `startedAt`, and a seeded or completed one a fresh
+ * `completedAt`, whichever release wrote it.
+ */
+function syncStamp(state: SyncState): string {
+  return `${state.startedAt ?? ''}|${state.completedAt ?? ''}`;
+}
+
+/** The stamp the identifier index was last built under, or undefined when it never was. */
+function identifierStamp(handle: SqliteHandle): string | undefined {
+  return handle
+    .prepare<{ stamp: string }>(`SELECT stamp FROM ${IDENTIFIER_STAMP_TABLE} WHERE id = 1`)
+    .get()?.stamp;
+}
+
+function writeIdentifierStamp(handle: SqliteHandle, stamp: string): void {
+  handle
+    .prepare(`INSERT OR REPLACE INTO ${IDENTIFIER_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
+    .run(stamp);
+}
+
+/** Rebuild the identifier index alone from the stored payloads. The caller owns the transaction. */
+function rebuildIdentifierIndex(handle: SqliteHandle, stamp: string): void {
+  handle.exec(`DELETE FROM ${IDENTIFIER_TABLE}`);
+  const insert = prepareIdentifierInsert(handle);
+  walkDesignations(handle, (row, payload) => writeIdentifiers(insert, row.id, payload.identifiers));
+  writeIdentifierStamp(handle, stamp);
+}
+
+/**
+ * True when the identifier index holds nothing although a stored designation
+ * publishes an identifier — a mirror written before the index existed, or one
+ * whose index was never built.
+ */
+function identifierIndexUnbuilt(handle: SqliteHandle): boolean {
+  if (handle.prepare(`SELECT 1 FROM ${IDENTIFIER_TABLE} LIMIT 1`).get()) return false;
+  return (
+    handle
+      .prepare(
+        `SELECT 1 FROM designation WHERE json_array_length(payload, '$.identifiers') > 0 LIMIT 1`,
+      )
+      .get() !== undefined
+  );
 }
 
 /** Rank for sorting match types (exact > strong > approximate). */

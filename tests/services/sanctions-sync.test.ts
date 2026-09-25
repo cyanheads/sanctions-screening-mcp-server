@@ -19,9 +19,10 @@ import { DEFAULT_SOURCE_URLS, resetServerConfig } from '@/config/server-config.j
 import {
   buildSanctionsIngesters,
   createSanctionsSync,
+  type SourceSyncFailure,
   type SourceSyncReport,
 } from '@/services/screening/sanctions-ingest.js';
-import { NAME_TABLE } from '@/services/screening/schema.js';
+import { IDENTIFIER_TABLE, NAME_TABLE } from '@/services/screening/schema.js';
 import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
 import { freshService, type SeededService } from './_helpers.js';
 
@@ -60,8 +61,8 @@ function ofacDocument(source: 'SDN' | 'CONS'): string {
 </Sanctions>`;
 }
 
-const EU_ENTITY = `<sanctionEntity logicalId="EU-1" euReferenceNumber="EU.1.1">
-  <regulation programme="EUPROG" publicationDate="2020-05-06"/>
+const EU_ENTITY = `<sanctionEntity designationDate="2020-05-06" logicalId="EU-1" euReferenceNumber="EU.1.1">
+  <regulation regulationType="amendment" programme="EUPROG" publicationDate="2023-11-14"/>
   <subjectType code="person"/>
   <nameAlias wholeName="Offline EU Person" strong="true"/>
   <nameAlias wholeName="EU Alias" strong="false"/>
@@ -161,6 +162,7 @@ async function drainSync(
 /** Mirror-side wiring that stores nothing: no deferred columns, no stored rows to prune. */
 const NO_MIRROR = {
   applyDeferredFields: async () => {},
+  storedDeferredFields: async () => new Map(),
   staleDesignationIds: async () => [],
 };
 
@@ -229,6 +231,7 @@ describe('createSanctionsSync — harvest loop contract', () => {
       program: 'EUPROG',
       legal_basis: null,
       designation_date: '2020-05-06',
+      reference_number: 'EU.1.1',
       payload: expect.any(String),
     });
     expect(JSON.parse(String(eu?.payload)).aliases).toEqual([
@@ -300,7 +303,7 @@ describe('createSanctionsSync — pruning', () => {
     const reports: SourceSyncReport[] = [];
     const pages = await drainSync(
       createSanctionsSync({
-        applyDeferredFields: async () => {},
+        ...NO_MIRROR,
         staleDesignationIds: async (source, kept) => {
           asked.push([source, [...kept]]);
           return source === 'eu' ? ['eu:GONE-1', 'eu:GONE-2', 'eu:GONE-3'] : [];
@@ -349,25 +352,29 @@ describe('createSanctionsSync — pruning', () => {
 
     const asked: SourceCode[] = [];
     const reports: SourceSyncReport[] = [];
+    const failures: SourceSyncFailure[] = [];
     const sync = createSanctionsSync({
-      applyDeferredFields: async () => {},
+      ...NO_MIRROR,
       staleDesignationIds: async (source) => {
         asked.push(source);
         return source === 'eu' ? ['eu:STORED-1'] : [];
       },
       onSourceReport: (report) => reports.push(report),
+      onSourceFailed: (failure) => failures.push(failure),
     });
-    await expect(drainSync(sync)).rejects.toThrow(/404/);
+    await expect(drainSync(sync)).rejects.toThrow(/\buk: .*404/);
 
     // EU's empty document would remove all it stores, so the removal is withheld
-    // and reported. UK never arrived, and the failure ends the run before UN.
-    expect(asked).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu']);
+    // and reported. UK never arrived, so it is asked nothing and reported as a
+    // failure; the run moves on to UN.
+    expect(asked).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu', 'un']);
     expect(reports.find((r) => r.source === 'eu')).toMatchObject({
       accepted: 0,
       pruned: 0,
       withheld: 1,
     });
-    expect(reports.map((r) => r.source)).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu']);
+    expect(reports.map((r) => r.source)).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu', 'un']);
+    expect(failures).toEqual([{ source: 'uk', accepted: 0, error: expect.stringMatching(/404/) }]);
   });
 
   it('withholds a prune that would remove more than half of what a source stores', async () => {
@@ -375,7 +382,7 @@ describe('createSanctionsSync — pruning', () => {
     const reports: SourceSyncReport[] = [];
     const pages = await drainSync(
       createSanctionsSync({
-        applyDeferredFields: async () => {},
+        ...NO_MIRROR,
         // Every source's document accepted one id. UK's one stale id is exactly half
         // of what it stores; EU's two stale ids are two thirds.
         staleDesignationIds: async (source) =>
@@ -389,6 +396,173 @@ describe('createSanctionsSync — pruning', () => {
     expect(reports.find((r) => r.source === 'eu')).toMatchObject({ pruned: 0, withheld: 2 });
     // The withheld source's own records still landed.
     expect(pages.flatMap((p) => p.records.map((r) => r.id))).toContain('eu:EU-1');
+  });
+});
+
+// ─── A failing source: every other source still refreshes (issue #32) ─────────
+
+describe('createSanctionsSync — a failing source does not stop the others', () => {
+  /** Every source's baseline body, minus the listed ones (served as 404s). */
+  function bodiesWithout(...urls: string[]): Map<string, string> {
+    const bodies = new Map(SOURCE_BODIES);
+    for (const url of urls) bodies.delete(url);
+    return bodies;
+  }
+
+  it('harvests, prunes, and reports every source between a failing first and last', async () => {
+    stubSourceFetch(bodiesWithout(DEFAULT_SOURCE_URLS.ofacSdn, DEFAULT_SOURCE_URLS.unSc));
+    const asked: SourceCode[] = [];
+    const reports: SourceSyncReport[] = [];
+    const failures: SourceSyncFailure[] = [];
+    const pages: DrainedPage[] = [];
+    const sync = createSanctionsSync({
+      ...NO_MIRROR,
+      staleDesignationIds: async (source) => {
+        asked.push(source);
+        return source === 'eu' ? ['eu:GONE-1'] : [];
+      },
+      onSourceReport: (report) => reports.push(report),
+      onSourceFailed: (failure) => failures.push(failure),
+    });
+
+    let error: Error | undefined;
+    try {
+      for await (const page of sync({ signal: new AbortController().signal })) {
+        pages.push({ records: page.records, tombstones: page.tombstones });
+      }
+    } catch (err) {
+      error = err as Error;
+    }
+
+    // One error after the last source, naming each failed source by its code.
+    expect(error?.message).toMatch(/ofac_sdn: .*404[\s\S]*; un: .*404/);
+    expect(failures.map((f) => f.source)).toEqual(['ofac_sdn', 'un']);
+    // The failed sources are asked nothing, so they prune nothing.
+    expect(asked).toEqual(['ofac_consolidated', 'eu', 'uk']);
+    expect(reports.map((r) => r.source)).toEqual(['ofac_consolidated', 'eu', 'uk']);
+    expect(pages.flatMap((p) => p.records.map((r) => r.id))).toEqual([
+      'ofac_consolidated:901',
+      'eu:EU-1',
+      'uk:UK-1',
+    ]);
+    expect(pages.flatMap((p) => p.tombstones ?? [])).toEqual(['eu:GONE-1']);
+  });
+
+  it('names all five sources when every one fails', async () => {
+    stubSourceFetch(new Map());
+    const failures: SourceSyncFailure[] = [];
+    const sync = createSanctionsSync({
+      ...NO_MIRROR,
+      onSourceFailed: (failure) => failures.push(failure),
+    });
+    const error = await drainSync(sync).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(failures.map((f) => f.source)).toEqual([
+      'ofac_sdn',
+      'ofac_consolidated',
+      'eu',
+      'uk',
+      'un',
+    ]);
+    for (const source of failures.map((f) => f.source)) {
+      expect(error?.message).toContain(`${source}: `);
+    }
+  });
+
+  it('ends the whole run at once on a caller abort, reporting no source as failed', async () => {
+    const controller = new AbortController();
+    const requested: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        requested.push(url);
+        if (url === DEFAULT_SOURCE_URLS.euFsf) {
+          // The caller gives up while EU is being requested, as a real fetch sees it.
+          controller.abort();
+          init?.signal?.throwIfAborted();
+        }
+        const body = SOURCE_BODIES.get(url) as string;
+        return new Response(body, { status: 200 });
+      }),
+    );
+    const reports: SourceSyncReport[] = [];
+    const failures: SourceSyncFailure[] = [];
+    const sync = createSanctionsSync({
+      ...NO_MIRROR,
+      onSourceReport: (report) => reports.push(report),
+      onSourceFailed: (failure) => failures.push(failure),
+    });
+
+    const error = await drainSync(sync, controller.signal).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).not.toMatch(/Sanctions harvest failed/);
+    expect(failures).toEqual([]);
+    expect(reports.map((r) => r.source)).toEqual(['ofac_sdn', 'ofac_consolidated']);
+    expect(requested).not.toContain(DEFAULT_SOURCE_URLS.ukSanctions);
+    expect(requested).not.toContain(DEFAULT_SOURCE_URLS.unSc);
+  });
+
+  it("carries an OFAC party's stored programme fields on its pages, and applies the deferred block only on success", async () => {
+    // SDN is cut before its programme block; Consolidated arrives whole.
+    const bodies = new Map(SOURCE_BODIES);
+    bodies.set(
+      DEFAULT_SOURCE_URLS.ofacSdn,
+      `<Sanctions>${OFAC_REFS}<DistinctParties>${ofacParty('900', 'Stored Party')}${ofacParty('902', 'New Party')}</DistinctParties>`,
+    );
+    stubSourceFetch(bodies);
+    const storedAsked: string[][] = [];
+    const applied: [SourceCode, Record<string, unknown>, string[]][] = [];
+    const pages: DrainedPage[] = [];
+    const sync = createSanctionsSync({
+      ...NO_MIRROR,
+      pageSize: 1,
+      // The mirror stores programme fields for 900 and nothing for the new 902.
+      storedDeferredFields: async (ids) => {
+        storedAsked.push([...ids]);
+        return new Map(
+          ids
+            .filter((id) => id !== 'ofac_sdn:902')
+            .map((id) => [id, { program: `STORED-${id}`, designationDate: '1990-01-02' }]),
+        );
+      },
+      applyDeferredFields: async (source, fields, kept) => {
+        applied.push([source, Object.fromEntries(fields), [...kept]]);
+      },
+    });
+    try {
+      for await (const page of sync({ signal: new AbortController().signal })) {
+        pages.push({ records: page.records });
+      }
+    } catch {
+      // SDN's truncation is the expected failure.
+    }
+
+    const rows = pages.flatMap((p) => p.records);
+    expect(rows.filter((r) => r.source === 'ofac_sdn')).toMatchObject([
+      { id: 'ofac_sdn:900', program: 'STORED-ofac_sdn:900', designation_date: '1990-01-02' },
+      { id: 'ofac_sdn:902', program: null, designation_date: null },
+    ]);
+    // Only the deferring sources are asked for their stored fields, a page at a time.
+    expect(storedAsked).toEqual([['ofac_sdn:900'], ['ofac_sdn:902'], ['ofac_consolidated:901']]);
+    // The failed source applies no deferred block; the one that finished does,
+    // over every party it kept.
+    expect(applied).toEqual([
+      [
+        'ofac_consolidated',
+        { '901': { program: 'PROG-CONS', designationDate: '1999-03-04' } },
+        ['ofac_consolidated:901'],
+      ],
+    ]);
+    // A source with no deferred block writes its own programme, untouched.
+    expect(rows.find((r) => r.id === 'eu:EU-1')).toMatchObject({ program: 'EUPROG' });
   });
 });
 
@@ -494,6 +668,15 @@ describe('sanctions harvest — document completeness', () => {
     expect(await harvestOutcome('eu')).toEqual({ ids: ['eu:EU-1'] });
 
     serveEuChunks([...doc, '<!-- cut']);
+    expect((await harvestOutcome('eu')).error).toMatch(/truncated/i);
+  });
+
+  it('accepts any length of trailing misc, and fails a cut inside a content section after a literal root close (#34)', async () => {
+    const whole = `<?xml version="1.0"?>\n<export>${EU_ENTITY}</export>`;
+    serveEuChunks([whole, '<!-- c --><?pi x?>'.repeat(1000), '\n']);
+    expect(await harvestOutcome('eu')).toEqual({ ids: ['eu:EU-1'] });
+
+    serveEuChunks([`<?xml version="1.0"?>\n<export>${EU_ENTITY}<!-- </export>`]);
     expect((await harvestOutcome('eu')).error).toMatch(/truncated/i);
   });
 
@@ -636,9 +819,80 @@ describe('OFAC deferred programme join', () => {
     // patches nothing; an UPDATE cannot mint an entity with no identity.
     expect(row('ofac_sdn:999')).toBeUndefined();
   });
+
+  /** An SDN document of `count` parties from ref 1000 up, each with its programme entry. */
+  function manyPartyDocument(count: number, programmes = true): string {
+    const refs = Array.from({ length: count }, (_, i) => String(1000 + i));
+    const parties = refs.map((ref) => ofacParty(ref, `Party ${ref}`)).join('');
+    const entries = programmes
+      ? refs.map((ref) => ofacEntry(ref, 'PROG-SDN', '1999')).join('')
+      : '';
+    return `<Sanctions>${OFAC_REFS}<DistinctParties>${parties}</DistinctParties><SanctionsEntries>${entries}</SanctionsEntries></Sanctions>`;
+  }
+
+  /** Every `ofac_sdn` row's programme fields. */
+  async function sdnProgrammes(): Promise<{ designation_date: unknown; program: unknown }[]> {
+    const handle = await harness!.service.designations.raw();
+    return handle
+      .prepare<{ designation_date: unknown; program: unknown }>(
+        `SELECT program, designation_date FROM designation WHERE source = 'ofac_sdn'`,
+      )
+      .all();
+  }
+
+  it('keeps the stored programme fields of an OFAC source whose harvest fails after committing pages', async () => {
+    // More parties than one sync page, so whole pages land before the cut.
+    const bodies = new Map(SOURCE_BODIES);
+    const complete = manyPartyDocument(2_600);
+    bodies.set(DEFAULT_SOURCE_URLS.ofacSdn, complete);
+    await syncAndRead(bodies);
+    expect(new Set((await sdnProgrammes()).map((r) => r.program))).toEqual(new Set(['PROG-SDN']));
+
+    // The same document, cut before its programme block.
+    bodies.set(
+      DEFAULT_SOURCE_URLS.ofacSdn,
+      complete.slice(0, complete.indexOf('<SanctionsEntries>')),
+    );
+    stubSourceFetch(bodies);
+    await expect(
+      harness!.service.designations.runSync({
+        mode: 'refresh',
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(/ofac_sdn/);
+
+    const rows = await sdnProgrammes();
+    expect(rows).toHaveLength(2_600);
+    expect(
+      rows.filter((r) => r.program !== 'PROG-SDN' || r.designation_date !== '1999-03-04'),
+    ).toEqual([]);
+  });
+
+  it('clears the programme fields of a party whose programme entry is gone, once the harvest succeeds', async () => {
+    const bodies = new Map(SOURCE_BODIES);
+    bodies.set(DEFAULT_SOURCE_URLS.ofacSdn, manyPartyDocument(3));
+    await syncAndRead(bodies);
+    expect((await sdnProgrammes()).map((r) => r.program)).toEqual([
+      'PROG-SDN',
+      'PROG-SDN',
+      'PROG-SDN',
+    ]);
+
+    bodies.set(DEFAULT_SOURCE_URLS.ofacSdn, manyPartyDocument(3, false));
+    stubSourceFetch(bodies);
+    await harness!.service.designations.runSync({
+      mode: 'refresh',
+      signal: new AbortController().signal,
+    });
+    expect(await sdnProgrammes()).toEqual([
+      { program: null, designation_date: null },
+      { program: null, designation_date: null },
+      { program: null, designation_date: null },
+    ]);
+  });
 });
 
-// ─── rebuildNameIndex: bounded read of the designation table ───────────────────
+// ─── rebuildSearchIndexes: bounded read of the designation table ───────────────────
 
 function designation(
   source: SourceCode,
@@ -662,7 +916,7 @@ function designation(
   };
 }
 
-describe('rebuildNameIndex', () => {
+describe('rebuildSearchIndexes', () => {
   let harness: SeededService | undefined;
 
   afterEach(async () => {
@@ -693,9 +947,9 @@ describe('rebuildNameIndex', () => {
     const count = (): number =>
       handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${NAME_TABLE}`).get()?.n ?? 0;
 
-    await service.rebuildNameIndex();
+    await service.rebuildSearchIndexes();
     expect(count()).toBe(ACROSS_SLICES * 2); // one primary + one alias per designation
-    await service.rebuildNameIndex();
+    await service.rebuildSearchIndexes();
     expect(count()).toBe(ACROSS_SLICES * 2);
 
     // Every designation is indexed exactly twice — no slice skipped, none repeated.
@@ -725,6 +979,45 @@ describe('rebuildNameIndex', () => {
     ).toBe(2);
   });
 
+  it('rebuilds the identifier index across slice boundaries, and is idempotent', async () => {
+    harness = await freshService();
+    await harness.service.ingestDesignations(
+      Array.from({ length: ACROSS_SLICES }, (_, i) => {
+        const d = designation('un', `R${String(i).padStart(4, '0')}`, `Person Number ${i}`);
+        return {
+          ...d,
+          payload: { ...d.payload, identifiers: [{ type: 'Passport', value: `P-${i}` }] },
+        };
+      }),
+    );
+    const handle = await harness.service.designations.raw();
+    const rows = (): { keys: number; n: number } | undefined =>
+      handle
+        .prepare<{ keys: number; n: number }>(
+          `SELECT COUNT(*) AS n, COUNT(DISTINCT key) AS keys FROM ${IDENTIFIER_TABLE}`,
+        )
+        .get();
+    handle.exec(`DELETE FROM ${IDENTIFIER_TABLE}`);
+
+    await harness.service.rebuildSearchIndexes();
+    expect(rows()).toEqual({ n: ACROSS_SLICES, keys: ACROSS_SLICES });
+    await harness.service.rebuildSearchIndexes();
+    expect(rows()).toEqual({ n: ACROSS_SLICES, keys: ACROSS_SLICES });
+    expect(
+      handle
+        .prepare(
+          `SELECT designation_id, category, key, type, value FROM ${IDENTIFIER_TABLE} WHERE key = 'P4499'`,
+        )
+        .get(),
+    ).toEqual({
+      designation_id: 'un:R4499',
+      category: 'passport',
+      key: 'P4499',
+      type: 'Passport',
+      value: 'P-4499',
+    });
+  });
+
   it('reads the designation table in bounded slices', async () => {
     const { service } = await seed(ACROSS_SLICES);
     const handle = (await service.designations.raw()) as SqliteHandle;
@@ -736,7 +1029,7 @@ describe('rebuildNameIndex', () => {
     }) as typeof handle.prepare;
 
     try {
-      await service.rebuildNameIndex();
+      await service.rebuildSearchIndexes();
     } finally {
       handle.prepare = original;
     }

@@ -41,13 +41,18 @@ export interface NameRecord {
   nameType: NameType;
 }
 
-/** A structured identifier (passport, national ID, tax ID, registration number, …). */
+/**
+ * A structured identifier: an identity document (passport, national ID, tax ID,
+ * registration number, …), or a value a source publishes alongside them (SWIFT/BIC,
+ * digital-currency address, vessel call sign, aircraft tail number, phone number,
+ * email address, website).
+ */
 export interface IdentifierRecord {
   /** Issuing country/authority, when published. */
   country?: string;
-  /** Identifier category as published (e.g. "Passport", "National ID"). */
+  /** Identifier category as the source labels it (e.g. "Passport", "SWIFT/BIC", "Website"). */
   type: string;
-  /** The identifier value. */
+  /** The identifier value, verbatim. */
   value: string;
 }
 
@@ -61,7 +66,13 @@ export interface AddressRecord {
 
 /** Date + place of birth (persons only). */
 export interface DobRecord {
-  /** Date string as published (ISO 8601 where the source provides a clean date). */
+  /** Set when the source flags the date approximate; never without {@link DobRecord.date}. */
+  circa?: true;
+  /**
+   * ISO 8601 at the precision the source published — `YYYY-MM-DD`, `YYYY-MM`, or
+   * `YYYY`, or an interval whose ends keep their own precision (`1955/1957`,
+   * `../1980` when one end is open). A value with no ISO form stays as published.
+   */
   date?: string;
   /** Place of birth, when published. */
   place?: string;
@@ -86,7 +97,7 @@ export interface DesignationPayload {
  * in the primary `designation` table (with `payload` JSON-stringified).
  */
 export interface NormalizedDesignation {
-  /** Designation date, ISO 8601 where available. */
+  /** The source's own designation date, `YYYY-MM-DD`, when published. */
   designationDate?: string;
   entityType: EntityType;
   /** `{source}:{sourceEntryId}` composite primary key. */
@@ -99,6 +110,13 @@ export interface NormalizedDesignation {
   primaryName: string;
   /** Sanctioning program / regime, when published. */
   program?: string;
+  /**
+   * The list's published reference number, when it publishes one distinct from
+   * {@link NormalizedDesignation.sourceEntryId}: UN `REFERENCE_NUMBER`, EU
+   * `euReferenceNumber`, UK OFSI Group ID. Trimmed. Not unique within a source —
+   * a UK Group ID can cover two designations.
+   */
+  referenceNumber?: string;
   source: SourceCode;
   /** The list's own entry ID (for `get_designation`). */
   sourceEntryId: string;
@@ -165,6 +183,7 @@ export type MatchMode = 'strict' | 'fuzzy';
 
 /** A scored screening hit returned by the matching engine. */
 export interface ScreeningHit {
+  /** The source's own designation date, `YYYY-MM-DD`, when published. */
   designationDate?: string;
   /** `{source}:{sourceEntryId}` of the matched designation. */
   designationId: string;
@@ -183,6 +202,8 @@ export interface ScreeningHit {
    * by match type.
    */
   queryTokenCoverage?: QueryTokenCoverage;
+  /** The list's published reference number, when it publishes one. */
+  referenceNumber?: string;
   /**
    * Raw Jaro-Winkler similarity (0–1) for `approximate` hits — a real
    * measurement, never a fabricated composite. Omitted for exact/strong hits,

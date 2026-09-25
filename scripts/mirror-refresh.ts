@@ -2,10 +2,10 @@
  * @fileoverview `mirror:refresh` — incremental out-of-band refresh. Re-harvests
  * the sanctions lists in full — streamed, so the ~120 MB OFAC SDN document is
  * never held whole — removing each list's designations its complete document no
- * longer publishes, and rebuilds the name index, then applies the last day of
- * GLEIF deltas, which are small enough for the buffered parse. The HTTP server runs
- * the sanctions half of this on a cron automatically; stdio operators run this
- * manually. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to refresh only the sanctions
+ * longer publishes, and rebuilds the name and identifier indexes, then applies
+ * the last day of GLEIF deltas, which are small enough for the buffered parse.
+ * The HTTP server runs the sanctions half of this on a cron automatically; stdio
+ * operators run this manually. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to refresh only the sanctions
  * lists.
  *
  * Usage: `bun run mirror:refresh`
@@ -19,17 +19,17 @@ import {
   resolveGleifFileUrl,
 } from '@/services/screening/gleif-ingest.js';
 import { createRejections } from '@/services/screening/ingest-validation.js';
-import { bootstrap, longRunSignal } from './_mirror-context.js';
+import { longRunSignal, REFRESH_HOURS } from '@/services/screening/sanctions-refresh.js';
+import { bootstrap } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const { service, log, ctx } = await bootstrap('mirror:refresh');
-  const signal = longRunSignal(4);
+  const signal = longRunSignal(REFRESH_HOURS);
 
   log.info('mirror:refresh — re-harvesting sanctions lists', ctx);
-  const sanctions = await service.designations.runSync({ mode: 'refresh', signal });
-  await service.rebuildNameIndex();
+  const sanctions = await service.syncSanctions('refresh', signal);
   log.info(
-    'mirror:refresh — sanctions refreshed',
+    'mirror:refresh — sanctions refreshed, name and identifier indexes rebuilt',
     withExtra(ctx, {
       records: sanctions.recordsApplied,
       removed: sanctions.tombstonesApplied,

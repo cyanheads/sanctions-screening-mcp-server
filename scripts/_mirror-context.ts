@@ -32,11 +32,6 @@ export async function bootstrap(operation: string) {
   };
 }
 
-/** A long, abortable signal for hours-long init runs (caps a runaway harvest). */
-export function longRunSignal(hours = 6): AbortSignal {
-  return AbortSignal.timeout(hours * 60 * 60 * 1000);
-}
-
 /**
  * Drain an async source into a sink in fixed-size batches, returning the total
  * count. Keeps peak memory bounded during a streaming golden-copy ingest — only

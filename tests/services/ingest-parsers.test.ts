@@ -39,6 +39,34 @@ import { parseXml } from '@/services/screening/xml.js';
 
 // ─── OFAC advanced schema (attribute-driven) ────────────────────────────────────
 
+/** One OFAC `<From>`/`<To>` point. */
+const ofacPoint = (tag: 'From' | 'To', ymd: string) => {
+  const [year, month, day] = ymd.split('-');
+  return `<${tag}><Year>${year}</Year><Month>${Number(month)}</Month><Day>${Number(day)}</Day></${tag}>`;
+};
+
+/**
+ * One OFAC Birthdate `<Feature>` in the published shape: `Start` and `End`, each
+ * a `From`…`To` window of full Year/Month/Day points, and `Approximate` on both.
+ */
+const ofacBirthdate = (
+  start: [from: string, to: string],
+  end: [from: string, to: string],
+  approximate = false,
+) => `<Feature FeatureTypeID="8"><FeatureVersion><Comment /><DatePeriod CalendarTypeID="1" YearFixed="false" MonthFixed="false" DayFixed="false">
+  <Start Approximate="${approximate}" YearFixed="false" MonthFixed="false" DayFixed="false">${ofacPoint('From', start[0])}${ofacPoint('To', start[1])}</Start>
+  <End Approximate="${approximate}" YearFixed="false" MonthFixed="false" DayFixed="false">${ofacPoint('From', end[0])}${ofacPoint('To', end[1])}</End>
+</DatePeriod><VersionDetail DetailTypeID="1430" /></FeatureVersion></Feature>`;
+
+/** An OFAC text `<Feature>` — the shape every identifier-class feature publishes. */
+const ofacText = (typeId: string, value: string) =>
+  `<Feature FeatureTypeID="${typeId}"><FeatureVersion ReliabilityID="1"><Comment /><VersionDetail DetailTypeID="1432">${value}</VersionDetail></FeatureVersion></Feature>`;
+
+const ofacParty = (ref: string, identityId: string, name: string, features: string[]) =>
+  `<DistinctParty FixedRef="${ref}"><Profile ID="${ref}" PartySubTypeID="4"><Identity ID="${identityId}" Primary="true">
+    <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>${name}</NamePartValue></DocumentedNamePart></DocumentedName></Alias>
+  </Identity>${features.join('\n')}</Profile></DistinctParty>`;
+
 /**
  * A trimmed but real-shaped OFAC advanced document: reference value sets +
  * one Individual DistinctParty (with a primary "Name" alias and an A.K.A.,
@@ -82,10 +110,15 @@ const OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
         </Identity>
         <Feature FeatureTypeID="8">
           <FeatureVersion ID="1">
-            <DatePeriod>
-              <Start>
+            <DatePeriod CalendarTypeID="1">
+              <Start Approximate="false">
                 <From><Year>1948</Year><Month>12</Month><Day>10</Day></From>
+                <To><Year>1948</Year><Month>12</Month><Day>10</Day></To>
               </Start>
+              <End Approximate="false">
+                <From><Year>1948</Year><Month>12</Month><Day>10</Day></From>
+                <To><Year>1948</Year><Month>12</Month><Day>10</Day></To>
+              </End>
             </DatePeriod>
           </FeatureVersion>
         </Feature>
@@ -166,7 +199,7 @@ describe('OFAC advanced parser', () => {
 
 const EU_XML = `<?xml version="1.0" encoding="UTF-8"?>
 <export xmlns="http://eu.europa.ec/fpi/fsd/export">
-  <sanctionEntity logicalId="13" euReferenceNumber="EU.27.28">
+  <sanctionEntity designationDate="2003-05-23" logicalId="13" euReferenceNumber="EU.27.28">
     <regulation regulationType="regulation" programme="IRQ" publicationDate="2003-07-08"/>
     <subjectType code="person" classificationCode="P"/>
     <nameAlias firstName="Saddam" lastName="Hussein Al-Tikriti" wholeName="Saddam Hussein Al-Tikriti" strong="true"/>
@@ -191,7 +224,8 @@ describe('EU parser', () => {
     expect(person?.primaryName).toBe('Saddam Hussein Al-Tikriti');
     expect(person?.entityType).toBe('person');
     expect(person?.program).toBe('IRQ');
-    expect(person?.designationDate).toBe('2003-07-08');
+    // The entity's own designation date, not the regulation's publication date.
+    expect(person?.designationDate).toBe('2003-05-23');
     expect(person?.payload.aliases.some((a) => a.name === 'Abu Ali')).toBe(true);
     expect(person?.payload.nationalities).toContain('Iraq');
 
@@ -453,7 +487,8 @@ describe('sanctions parser sparsity and alias quality', () => {
 // ─── Detail groups already populated (pinned before issue #22) ─────────────────
 //
 // The groups each normalizer read before the detail-group fix, in the shape it
-// read them. The fix widens what each group reads; none of these must change.
+// read them — dates in their ISO 8601 form (issue #39). The fix widens what each
+// group reads; none of these must change.
 
 describe('sanctions detail groups — shapes that were already read', () => {
   it('OFAC advanced: one Birthdate and one Place of Birth stay one paired entry', () => {
@@ -466,7 +501,7 @@ describe('sanctions detail groups — shapes that were already read', () => {
         <DistinctParties><DistinctParty FixedRef="1"><Profile ID="1"><Identity ID="1">
           <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>One Person</NamePartValue></DocumentedNamePart></DocumentedName></Alias>
           </Identity>
-          <Feature ID="1" FeatureTypeID="8"><FeatureVersion ID="1"><DatePeriod><Start><From><Year>1962</Year><Month>11</Month><Day>23</Day></From></Start></DatePeriod></FeatureVersion></Feature>
+          ${ofacBirthdate(['1962-11-23', '1962-11-23'], ['1962-11-23', '1962-11-23'])}
           <Feature ID="2" FeatureTypeID="9"><FeatureVersion ID="2"><VersionDetail DetailTypeID="1432">Caracas, Venezuela</VersionDetail></FeatureVersion></Feature>
         </Profile></DistinctParty></DistinctParties>
       </Sanctions>`),
@@ -493,7 +528,7 @@ describe('sanctions detail groups — shapes that were already read', () => {
           country: 'Venezuela',
         },
       ],
-      datesOfBirth: [{ date: '23 Nov 1962' }],
+      datesOfBirth: [{ date: '1962-11-23' }],
       nationalities: ['Venezuela'],
     });
   });
@@ -522,9 +557,107 @@ describe('sanctions detail groups — shapes that were already read', () => {
     );
     expect(d?.payload).toMatchObject({
       identifiers: [{ type: 'Passport', value: '03824970', country: 'Oman' }],
-      datesOfBirth: [{ date: '1965-12-28' }, { date: '1966' }],
+      datesOfBirth: [{ date: '1965-12-28' }, { date: '1966', circa: true }],
       nationalities: ['Oman', 'Yemen'],
     });
+  });
+});
+
+// ─── Shapes pinned before the date and identifier reads widened ─────────────────
+//
+// What each normalizer already produced for a day-precision date, an exact flag,
+// and a descriptive feature. Widening the date and identifier reads (issues #39,
+// #40, #45) must leave every one of these unchanged.
+
+describe('sanctions detail groups — exact dates and descriptive features stay as read', () => {
+  it('OFAC advanced: a day DatePeriod with Approximate="false" is a day, with no circa flag', () => {
+    const [d] = parseOfac(
+      parseXml(`<Sanctions>
+        <ReferenceValueSets>
+          <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+          <FeatureTypeValues><FeatureType ID="8">Birthdate</FeatureType></FeatureTypeValues>
+        </ReferenceValueSets>
+        <DistinctParties><DistinctParty FixedRef="2674"><Profile ID="2674"><Identity ID="1">
+          <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>Day Person</NamePartValue></DocumentedNamePart></DocumentedName></Alias>
+          </Identity>
+          <Feature ID="1" FeatureTypeID="8"><FeatureVersion ID="1"><DatePeriod CalendarTypeID="1">
+            <Start Approximate="false"><From><Year>1948</Year><Month>12</Month><Day>10</Day></From><To><Year>1948</Year><Month>12</Month><Day>10</Day></To></Start>
+            <End Approximate="false"><From><Year>1948</Year><Month>12</Month><Day>10</Day></From><To><Year>1948</Year><Month>12</Month><Day>10</Day></To></End>
+          </DatePeriod></FeatureVersion></Feature>
+        </Profile></DistinctParty></DistinctParties>
+      </Sanctions>`),
+      'ofac_sdn',
+    );
+    expect(d?.payload.datesOfBirth).toEqual([{ date: '1948-12-10' }]);
+  });
+
+  it('OFAC advanced: descriptive text, lookup, and country features never reach identifiers', () => {
+    const [d] = parseOfac(
+      parseXml(`<Sanctions>
+        <ReferenceValueSets>
+          <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+          <FeatureTypeValues>
+            <FeatureType ID="3">Vessel Flag</FeatureType>
+            <FeatureType ID="4">Vessel Owner</FeatureType>
+            <FeatureType ID="26">Title</FeatureType>
+            <FeatureType ID="47">Aircraft Model</FeatureType>
+            <FeatureType ID="224">Gender</FeatureType>
+            <FeatureType ID="365">Nationality of Registration</FeatureType>
+          </FeatureTypeValues>
+          <IDRegDocTypeValues><IDRegDocType ID="1626">Vessel Registration Identification</IDRegDocType></IDRegDocTypeValues>
+        </ReferenceValueSets>
+        <IDRegDocuments><IDRegDocument IDRegDocTypeID="1626" IdentityID="9001"><IDRegistrationNo>IMO 7303803</IDRegistrationNo></IDRegDocument></IDRegDocuments>
+        <DistinctParties><DistinctParty FixedRef="4238"><Profile ID="4238"><Identity ID="9001">
+          <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>MAR AZUL</NamePartValue></DocumentedNamePart></DocumentedName></Alias>
+          </Identity>
+          <Feature FeatureTypeID="3"><FeatureVersion><VersionDetail DetailTypeID="1432">Cuba</VersionDetail></FeatureVersion></Feature>
+          <Feature FeatureTypeID="4"><FeatureVersion><VersionDetail DetailTypeID="1432">Samir de Navegacion S.A.</VersionDetail></FeatureVersion></Feature>
+          <Feature FeatureTypeID="26"><FeatureVersion><VersionDetail DetailTypeID="1432">Director</VersionDetail></FeatureVersion></Feature>
+          <Feature FeatureTypeID="47"><FeatureVersion><VersionDetail DetailTypeID="1432">IL-76TD</VersionDetail></FeatureVersion></Feature>
+          <Feature FeatureTypeID="224"><FeatureVersion><VersionDetail DetailTypeID="1431" DetailReferenceID="91526" /></FeatureVersion></Feature>
+          <Feature FeatureTypeID="365"><FeatureVersion><VersionLocation LocationID="1" /></FeatureVersion></Feature>
+        </Profile></DistinctParty></DistinctParties>
+      </Sanctions>`),
+      'ofac_sdn',
+    );
+    expect(d?.payload.identifiers).toEqual([
+      { type: 'Vessel Registration Identification', value: 'IMO 7303803' },
+    ]);
+  });
+
+  it('EU: a full birthdate published with circa="false" carries no circa flag', () => {
+    const [d] = parseEu(
+      parseXml(`<export><sanctionEntity logicalId="1"><subjectType code="person"/>
+        <nameAlias wholeName="Exact Date Person" strong="true"/>
+        <birthdate circa="false" birthdate="1960-04-10" dayOfMonth="10" monthOfYear="4" year="1960" city="" countryIso2Code="00" countryDescription="UNKNOWN"/>
+      </sanctionEntity></export>`),
+    );
+    expect(d?.payload.datesOfBirth).toEqual([{ date: '1960-04-10' }]);
+  });
+
+  it('UN: an EXACT date and an offset-free LISTED_ON pass through unchanged', () => {
+    const [d] = parseUn(
+      parseXml(`<CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL>
+        <DATAID>6907993</DATAID><FIRST_NAME>ERIC</FIRST_NAME><SECOND_NAME>BADEGE</SECOND_NAME>
+        <LISTED_ON>2012-12-31</LISTED_ON>
+        <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>EXACT</TYPE_OF_DATE><DATE>1971-01-01</DATE></INDIVIDUAL_DATE_OF_BIRTH>
+      </INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>`),
+    );
+    expect(d?.designationDate).toBe('2012-12-31');
+    expect(d?.payload.datesOfBirth).toEqual([{ date: '1971-01-01' }]);
+  });
+
+  it('UK: a designation that publishes no contact details keeps its document identifiers', () => {
+    const [d] = parseUk(
+      parseXml(`<Designations><Designation><UniqueID>RUS1000</UniqueID>
+        <Names><Name><Name6>EXAMPLE TRADING LLC</Name6><NameType>Primary Name</NameType></Name></Names>
+        <IndividualEntityShip>Entity</IndividualEntityShip>
+        <EntityDetails><Entity><BusinessRegistrationNumbers><BusinessRegistrationNumber>1027700132195</BusinessRegistrationNumber></BusinessRegistrationNumbers></Entity></EntityDetails>
+      </Designation></Designations>`),
+    );
+    expect(d?.payload.identifiers).toEqual([
+      { type: 'Business Registration Number', value: '1027700132195' },
+    ]);
   });
 });
 
@@ -705,12 +838,8 @@ const DETAIL_OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
             <DocumentedName ID="1"><DocumentedNamePart><NamePartValue>TANAKA Hiro</NamePartValue></DocumentedNamePart></DocumentedName>
           </Alias>
         </Identity>
-        <Feature ID="30" FeatureTypeID="8">
-          <FeatureVersion ID="30"><DatePeriod><Start><From><Year>1970</Year><Month>1</Month><Day>2</Day></From></Start></DatePeriod></FeatureVersion>
-        </Feature>
-        <Feature ID="31" FeatureTypeID="8">
-          <FeatureVersion ID="31"><DatePeriod><Start><From><Year>1971</Year></From></Start></DatePeriod></FeatureVersion>
-        </Feature>
+        ${ofacBirthdate(['1970-01-02', '1970-01-02'], ['1970-01-02', '1970-01-02'])}
+        ${ofacBirthdate(['1971-01-01', '1971-01-01'], ['1971-12-31', '1971-12-31'])}
         <Feature ID="32" FeatureTypeID="9">
           <FeatureVersion ID="32"><VersionDetail DetailTypeID="1432">Nagoya, Japan</VersionDetail></FeatureVersion>
         </Feature>
@@ -1026,7 +1155,7 @@ describe('published designation details (issue #22)', () => {
             country: 'Venezuela',
           },
         ],
-        datesOfBirth: [{ date: '23 Nov 1962', place: 'Caracas, Venezuela' }],
+        datesOfBirth: [{ date: '1962-11-23', place: 'Caracas, Venezuela' }],
         nationalities: ['Venezuela', 'Colombia'],
       });
     });
@@ -1102,8 +1231,8 @@ describe('published designation details (issue #22)', () => {
         ],
         addresses: [{ full: 'Kabul, Afghanistan', country: 'Afghanistan' }],
         datesOfBirth: [
-          { date: 'dd/mm/1971' },
-          { date: '24/10/1972' },
+          { date: '1971' },
+          { date: '1972-10-24' },
           { place: 'Moni village, Shigal District, Kunar Province, Afghanistan' },
         ],
         nationalities: ['Afghanistan'],
@@ -1320,6 +1449,591 @@ describe('published designation details (issue #22)', () => {
   });
 });
 
+// ─── Published precision, designation dates, and feature identifiers ────────────
+// (issues #39, #40, #45)
+//
+// A date of birth is ISO 8601 at the precision the source published — a day, a
+// month, a year, or an interval whose ends keep their own precision — with
+// `circa: true` where the source flags it approximate. A designation date is the
+// source's own, as YYYY-MM-DD. OFAC's identifier-class features and the UK's
+// contact details are identifiers, stored verbatim.
+
+/**
+ * OFAC advanced parties reproducing the published Birthdate shapes of SDN 2679
+ * (two years), 8868 (a range of year windows), 7782 (an approximate year), 8594
+ * (a month), 16605 and 15962 (ranges of day points), 23470 (a range of month
+ * windows), and 7929 (an approximate day); party 40001 carries all of them at
+ * once. Parties 906, 24003, and 18150 reproduce the identifier-class features of
+ * the same SDN entries; 50001 publishes only features that identify nothing.
+ */
+const PRECISION_OFAC_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Sanctions xmlns="https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/ADVANCED_XML">
+  <ReferenceValueSets>
+    <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+    <CountryValues><Country ID="11247">United Kingdom</Country></CountryValues>
+    <FeatureTypeValues>
+      <FeatureType ID="1" FeatureTypeGroupID="1">Vessel Call Sign</FeatureType>
+      <FeatureType ID="3" FeatureTypeGroupID="1">Vessel Flag</FeatureType>
+      <FeatureType ID="8" FeatureTypeGroupID="1">Birthdate</FeatureType>
+      <FeatureType ID="9" FeatureTypeGroupID="1">Place of Birth</FeatureType>
+      <FeatureType ID="13" FeatureTypeGroupID="1">SWIFT/BIC</FeatureType>
+      <FeatureType ID="14" FeatureTypeGroupID="1">Website</FeatureType>
+      <FeatureType ID="21" FeatureTypeGroupID="1">Email Address</FeatureType>
+      <FeatureType ID="26" FeatureTypeGroupID="1">Title</FeatureType>
+      <FeatureType ID="47" FeatureTypeGroupID="1">Aircraft Model</FeatureType>
+      <FeatureType ID="50" FeatureTypeGroupID="1">Aircraft Manufacturer's Serial Number (MSN)</FeatureType>
+      <FeatureType ID="64" FeatureTypeGroupID="1">Aircraft Tail Number</FeatureType>
+      <FeatureType ID="344" FeatureTypeGroupID="1">Digital Currency Address - XBT</FeatureType>
+      <FeatureType ID="345" FeatureTypeGroupID="1">Digital Currency Address - ETH</FeatureType>
+      <FeatureType ID="992" FeatureTypeGroupID="1">Digital Currency Address - TRX</FeatureType>
+      <FeatureType ID="4000" FeatureTypeGroupID="1">Digital Currency Address - NEWC</FeatureType>
+      <FeatureType ID="4001" FeatureTypeGroupID="1">Digital Currency Address</FeatureType>
+    </FeatureTypeValues>
+    <IDRegDocTypeValues><IDRegDocType ID="1583">Company Number</IDRegDocType></IDRegDocTypeValues>
+    <PartySubTypeValues><PartySubType ID="4" PartyTypeID="1">Unknown</PartySubType></PartySubTypeValues>
+  </ReferenceValueSets>
+  <IDRegDocuments>
+    <IDRegDocument ID="1" IDRegDocTypeID="1583" IdentityID="4267" IssuedBy-CountryID="11247"><Comment /><IDRegistrationNo>01074897</IDRegistrationNo></IDRegDocument>
+  </IDRegDocuments>
+  <DistinctParties>
+    ${ofacParty('2679', '2679', 'TWO YEARS', [
+      ofacBirthdate(['1938-01-01', '1938-01-01'], ['1938-12-31', '1938-12-31']),
+      ofacBirthdate(['1936-01-01', '1936-01-01'], ['1936-12-31', '1936-12-31']),
+      ofacText('9', 'Cairo, Egypt'),
+    ])}
+    ${ofacParty('8868', '8868', 'YEAR RANGE', [
+      ofacBirthdate(['1955-01-01', '1955-12-31'], ['1957-01-01', '1957-12-31']),
+      ofacText('9', 'Baghdad, Iraq'),
+    ])}
+    ${ofacParty('7782', '7782', 'CIRCA YEAR', [
+      ofacBirthdate(['1951-01-01', '1951-01-01'], ['1951-12-31', '1951-12-31'], true),
+      ofacText('9', 'Mosul, Iraq'),
+    ])}
+    ${ofacParty('8594', '8594', 'ONE MONTH', [
+      ofacBirthdate(['1946-08-01', '1946-08-01'], ['1946-08-31', '1946-08-31']),
+    ])}
+    ${ofacParty('16605', '16605', 'DAY RANGE', [
+      ofacBirthdate(['1946-09-26', '1946-09-26'], ['1946-12-07', '1946-12-07']),
+    ])}
+    ${ofacParty('15962', '15962', 'TWO YEAR DAY RANGE', [
+      ofacBirthdate(['1961-01-01', '1961-01-01'], ['1962-12-31', '1962-12-31']),
+    ])}
+    ${ofacParty('23470', '23470', 'MONTH RANGE', [
+      ofacBirthdate(['1962-03-01', '1962-03-31'], ['1963-02-01', '1963-02-28']),
+    ])}
+    ${ofacParty('7929', '7929', 'CIRCA DAY', [
+      ofacBirthdate(['1966-07-07', '1966-07-07'], ['1966-07-07', '1966-07-07'], true),
+    ])}
+    ${ofacParty('40001', '40001', 'EVERY SHAPE', [
+      ofacBirthdate(['1970-02-03', '1970-02-03'], ['1970-02-03', '1970-02-03']),
+      ofacBirthdate(['1971-02-01', '1971-02-01'], ['1971-02-28', '1971-02-28']),
+      ofacBirthdate(['1972-01-01', '1972-01-01'], ['1972-12-31', '1972-12-31'], true),
+      ofacBirthdate(['1973-01-01', '1973-12-31'], ['1975-01-01', '1975-12-31']),
+      ofacBirthdate(['1972-01-01', '1972-01-01'], ['1972-12-31', '1972-12-31']),
+      ofacText('9', 'Tehran, Iran'),
+    ])}
+    ${ofacParty('906', '4267', 'HAVANA INTERNATIONAL BANK', [
+      ofacText('13', 'HAVIGB2L'),
+      ofacText('14', 'www.havanaintbank.co.uk'),
+      ofacText('14', 'www.hib.uk.com'),
+    ])}
+    ${ofacParty('24003', '24003', 'WALLET PERSON', [
+      ofacText('21', 'info@example.test'),
+      ofacText('344', '12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL'),
+      ofacText('345', '0x1CAb8177E2A6e6f6b7A2aC4E7C8e1b37B7aB2F0D'),
+      ofacText('992', 'TNiq9AXBp9EjUqhDhrwrfvAA8U3GUQZH81'),
+      ofacText('344', '12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL'),
+      ofacText('9', 'Moscow, Russia'),
+    ])}
+    ${ofacParty('18150', '18150', 'EP-MMH', [
+      ofacText('50', '391'),
+      ofacText('64', 'EP-MMH'),
+      ofacText('47', 'A300B4-605R'),
+    ])}
+    ${ofacParty('50001', '50001', 'NOTHING IDENTIFYING', [
+      ofacText('26', 'Director'),
+      ofacText('3', 'Iran'),
+      ofacText('7777', 'UNRESOLVED-FEATURE'),
+      '<Feature FeatureTypeID="14"><FeatureVersion><VersionDetail DetailTypeID="1432" /></FeatureVersion></Feature>',
+      ofacText('4001', 'NO-CURRENCY-CODE'),
+      ofacText('4000', 'NewChainAddr9'),
+      ofacText('1', 'CL2192'),
+    ])}
+  </DistinctParties>
+</Sanctions>`;
+
+describe('OFAC advanced — birthdates at published precision (issue #39)', () => {
+  const records = () => parseOfac(parseXml(PRECISION_OFAC_XML), 'ofac_sdn');
+
+  it.each([
+    ['2679', [{ date: '1938' }, { date: '1936' }, { place: 'Cairo, Egypt' }]],
+    ['8868', [{ date: '1955/1957', place: 'Baghdad, Iraq' }]],
+    ['7782', [{ date: '1951', circa: true, place: 'Mosul, Iraq' }]],
+    ['8594', [{ date: '1946-08' }]],
+    ['16605', [{ date: '1946-09-26/1946-12-07' }]],
+    ['15962', [{ date: '1961-01-01/1962-12-31' }]],
+    ['23470', [{ date: '1962-03/1963-02' }]],
+    ['7929', [{ date: '1966-07-07', circa: true }]],
+  ] as const)('%s → %j', (entryId, datesOfBirth) => {
+    expect(byEntryId(records(), entryId).payload.datesOfBirth).toEqual(datesOfBirth);
+  });
+
+  it('keeps every shape a party publishes, and keeps a circa year distinct from the same exact year', () => {
+    expect(byEntryId(records(), '40001').payload.datesOfBirth).toEqual([
+      { date: '1970-02-03' },
+      { date: '1971-02' },
+      { date: '1972', circa: true },
+      { date: '1973/1975' },
+      { date: '1972' },
+      { place: 'Tehran, Iran' },
+    ]);
+  });
+
+  it('streams the same birthdates at every chunk size', async () => {
+    const oracle = records();
+    for (const size of CHUNK_SIZES) {
+      const { records: streamed, state } = await streamAll(
+        (chunks, s) => streamOfacFromText(chunks, 'ofac_sdn', s),
+        PRECISION_OFAC_XML,
+        size,
+      );
+      expect(withDeferred(streamed, state), `chunk size ${size}`).toEqual(oracle);
+    }
+  });
+});
+
+describe('OFAC advanced — identifier-class features (issue #40)', () => {
+  const records = () => parseOfac(parseXml(PRECISION_OFAC_XML), 'ofac_sdn');
+
+  it('appends SWIFT/BIC and websites after the identity documents, labels verbatim, no country', () => {
+    expect(byEntryId(records(), '906').payload.identifiers).toEqual([
+      { type: 'Company Number', value: '01074897', country: 'United Kingdom' },
+      { type: 'SWIFT/BIC', value: 'HAVIGB2L' },
+      { type: 'Website', value: 'www.havanaintbank.co.uk' },
+      { type: 'Website', value: 'www.hib.uk.com' },
+    ]);
+  });
+
+  it('keeps each digital-currency code in the type, the address case-exact, and collapses a duplicate', () => {
+    expect(byEntryId(records(), '24003').payload.identifiers).toEqual([
+      { type: 'Email Address', value: 'info@example.test' },
+      { type: 'Digital Currency Address - XBT', value: '12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL' },
+      {
+        type: 'Digital Currency Address - ETH',
+        value: '0x1CAb8177E2A6e6f6b7A2aC4E7C8e1b37B7aB2F0D',
+      },
+      { type: 'Digital Currency Address - TRX', value: 'TNiq9AXBp9EjUqhDhrwrfvAA8U3GUQZH81' },
+    ]);
+  });
+
+  it('reads the aircraft serial and tail numbers, but not the model', () => {
+    expect(byEntryId(records(), '18150').payload.identifiers).toEqual([
+      { type: "Aircraft Manufacturer's Serial Number (MSN)", value: '391' },
+      { type: 'Aircraft Tail Number', value: 'EP-MMH' },
+    ]);
+  });
+
+  it('adds nothing for a label outside the allow-list, an unresolved type, or an empty value', () => {
+    // A currency OFAC adds later still lands, by its label prefix.
+    expect(byEntryId(records(), '50001').payload.identifiers).toEqual([
+      { type: 'Digital Currency Address - NEWC', value: 'NewChainAddr9' },
+      { type: 'Vessel Call Sign', value: 'CL2192' },
+    ]);
+  });
+
+  it('reads the same features on the Consolidated list', () => {
+    const [d] = parseOfac(
+      parseXml(`<Sanctions>
+        <ReferenceValueSets>
+          <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+          <FeatureTypeValues><FeatureType ID="13">SWIFT/BIC</FeatureType></FeatureTypeValues>
+        </ReferenceValueSets>
+        <DistinctParties>${ofacParty('15268', '15268', 'CHINA CONSTRUCTION BANK EXAMPLE', [ofacText('13', 'CKLBCNBJ')])}</DistinctParties>
+      </Sanctions>`),
+      'ofac_consolidated',
+    );
+    expect(d).toMatchObject({
+      id: 'ofac_consolidated:15268',
+      payload: { identifiers: [{ type: 'SWIFT/BIC', value: 'CKLBCNBJ' }] },
+    });
+  });
+
+  it('streams the same identifiers at every chunk size', async () => {
+    const oracle = records();
+    expect(byEntryId(oracle, '24003').payload.identifiers).toHaveLength(4);
+    for (const size of CHUNK_SIZES) {
+      const { records: streamed, state } = await streamAll(
+        (chunks, s) => streamOfacFromText(chunks, 'ofac_consolidated', s),
+        PRECISION_OFAC_XML,
+        size,
+      );
+      expect(withDeferred(streamed, state), `chunk size ${size}`).toEqual(
+        parseOfac(parseXml(PRECISION_OFAC_XML), 'ofac_consolidated'),
+      );
+    }
+  });
+});
+
+describe('OFAC standard — display dates as ISO 8601 (issue #39)', () => {
+  it.each([
+    ['26 Aug 1988', { date: '1988-08-26' }],
+    ['07 Jul 1966', { date: '1966-07-07' }],
+    ['Aug 1946', { date: '1946-08' }],
+    ['1938', { date: '1938' }],
+    ['circa 1951', { date: '1951', circa: true }],
+    ['circa 07 Jul 1966', { date: '1966-07-07', circa: true }],
+    ['1955 to 1957', { date: '1955/1957' }],
+    ['26 Sep 1946 to 07 Dec 1946', { date: '1946-09-26/1946-12-07' }],
+    ['Mar 1962 to Feb 1963', { date: '1962-03/1963-02' }],
+    // No ISO form: kept whole, as published.
+    ['circa 1979-1982', { date: 'circa 1979-1982' }],
+    ['31 Foo 1970', { date: '31 Foo 1970' }],
+  ] as const)('%j → %j', (published, dob) => {
+    const [d] = parseOfac(
+      parseXml(
+        `<sdnList><sdnEntry><uid>1</uid><lastName>DATED</lastName><dateOfBirthList><dateOfBirthItem><dateOfBirth>${published}</dateOfBirth></dateOfBirthItem></dateOfBirthList></sdnEntry></sdnList>`,
+      ),
+      'ofac_sdn',
+    );
+    expect(d?.payload.datesOfBirth).toEqual([dob]);
+  });
+});
+
+/**
+ * Two parties as one OFAC publication writes them in both schemas: the vessel
+ * 15036 as published on 2026-09-23 (trimmed), and a person whose `idList` mixes
+ * identity documents, identifier-class entries, and descriptive notes, with a
+ * date in its remarks.
+ */
+const PAIR_OFAC_STANDARD_XML = `<?xml version="1.0" standalone="yes"?>
+<sdnList>
+  <sdnEntry>
+    <uid>15036</uid><lastName>ARTAVIL</lastName><sdnType>Vessel</sdnType>
+    <remarks>(Linked To: NATIONAL IRANIAN TANKER COMPANY)</remarks>
+    <programList><program>IRAN</program></programList>
+    <idList>
+      <id><uid>8045</uid><idType>Vessel Registration Identification</idType><idNumber>IMO 9187629</idNumber></id>
+      <id><uid>8114</uid><idType>MMSI</idType><idNumber>572469210</idNumber></id>
+      <id><uid>111445</uid><idType>Former Vessel Flag</idType><idNumber>Malta</idNumber></id>
+      <id><uid>112992</uid><idType>Former Vessel Flag</idType><idNumber>Tuvalu</idNumber></id>
+      <id><uid>119227</uid><idType>Additional Sanctions Information -</idType><idNumber>Subject to Secondary Sanctions</idNumber></id>
+    </idList>
+    <vesselInfo>
+      <callSign>T2EU4</callSign><vesselType>Crude/Oil Products Tanker</vesselType><vesselFlag>Iran</vesselFlag>
+      <tonnage>99144</tonnage><grossRegisteredTonnage>56068</grossRegisteredTonnage>
+    </vesselInfo>
+  </sdnEntry>
+  <sdnEntry>
+    <uid>90001</uid><firstName>Remark</firstName><lastName>DATED</lastName><sdnType>Individual</sdnType>
+    <remarks>alt. Registration Number 12 Mar 2014; listed 2015-06-07.</remarks>
+    <idList>
+      <id><uid>1</uid><idType>Passport</idType><idNumber>P7654321</idNumber><idCountry>Testland</idCountry></id>
+      <id><uid>2</uid><idType>Gender</idType><idNumber>Male</idNumber></id>
+      <id><uid>3</uid><idType>Secondary sanctions risk:</idType><idNumber>section 1(b) of Executive Order 13224, as amended by Executive Order 13886</idNumber></id>
+      <id><uid>4</uid><idType>Website</idType><idNumber>www.example.test</idNumber></id>
+      <id><uid>5</uid><idType>Organization Established Date</idType><idNumber>01 Jan 2001</idNumber></id>
+      <id><uid>6</uid><idType>Digital Currency Address - XBT</idType><idNumber>12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL</idNumber></id>
+      <id><uid>7</uid><idType>Listing Date (EO 14024 Directive 2):</idType><idNumber>24 Feb 2022</idNumber></id>
+    </idList>
+  </sdnEntry>
+</sdnList>`;
+
+const PAIR_OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Sanctions>
+  <ReferenceValueSets>
+    <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+    <CountryValues><Country ID="1">Testland</Country></CountryValues>
+    <FeatureTypeValues>
+      <FeatureType ID="1">Vessel Call Sign</FeatureType>
+      <FeatureType ID="3">Vessel Flag</FeatureType>
+      <FeatureType ID="5">Vessel Tonnage</FeatureType>
+      <FeatureType ID="14">Website</FeatureType>
+      <FeatureType ID="24">Former Vessel Flag</FeatureType>
+      <FeatureType ID="125">Additional Sanctions Information -</FeatureType>
+      <FeatureType ID="224">Gender</FeatureType>
+      <FeatureType ID="345">Digital Currency Address - XBT</FeatureType>
+      <FeatureType ID="504">Secondary sanctions risk:</FeatureType>
+      <FeatureType ID="646">Organization Established Date</FeatureType>
+      <FeatureType ID="700">Listing Date (EO 14024 Directive 2):</FeatureType>
+    </FeatureTypeValues>
+    <IDRegDocTypeValues>
+      <IDRegDocType ID="1571">Passport</IDRegDocType>
+      <IDRegDocType ID="1626">Vessel Registration Identification</IDRegDocType>
+      <IDRegDocType ID="91264">MMSI</IDRegDocType>
+    </IDRegDocTypeValues>
+  </ReferenceValueSets>
+  <IDRegDocuments>
+    <IDRegDocument ID="8045" IDRegDocTypeID="1626" IdentityID="6780"><IDRegistrationNo>IMO 9187629</IDRegistrationNo></IDRegDocument>
+    <IDRegDocument ID="8114" IDRegDocTypeID="91264" IdentityID="6780"><IDRegistrationNo>572469210</IDRegistrationNo></IDRegDocument>
+    <IDRegDocument ID="1" IDRegDocTypeID="1571" IdentityID="9001" IssuedBy-CountryID="1"><IDRegistrationNo>P7654321</IDRegistrationNo></IDRegDocument>
+  </IDRegDocuments>
+  <DistinctParties>
+    ${ofacParty('15036', '6780', 'ARTAVIL', [
+      ofacText('1', 'T2EU4'),
+      ofacText('24', 'Malta'),
+      ofacText('5', '99,144'),
+      ofacText('24', 'Tuvalu'),
+      ofacText('3', 'Iran'),
+      ofacText('125', 'Subject to Secondary Sanctions'),
+    ])}
+    ${ofacParty('90001', '9001', 'Remark DATED', [
+      ofacText('224', 'Male'),
+      ofacText('504', 'section 1(b) of Executive Order 13224, as amended by Executive Order 13886'),
+      ofacText('14', 'www.example.test'),
+      ofacText('646', '01 Jan 2001'),
+      ofacText('345', '12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL'),
+      ofacText('700', '24 Feb 2022'),
+    ])}
+  </DistinctParties>
+</Sanctions>`;
+
+describe('OFAC standard — the identifier classes the advanced schema reads (issue #46)', () => {
+  const standard = () => parseOfac(parseXml(PAIR_OFAC_STANDARD_XML), 'ofac_sdn');
+  const advanced = () => parseOfac(parseXml(PAIR_OFAC_ADVANCED_XML), 'ofac_sdn');
+
+  /** Identifiers as `type = value`, country aside, sorted — the parity the two schemas share. */
+  const typedValues = (d: NormalizedDesignation) =>
+    d.payload.identifiers.map((i) => `${i.type} = ${i.value}`).sort();
+
+  it('keeps identity documents and the vessel call sign, and drops vessel descriptors', () => {
+    expect(byEntryId(standard(), '15036').payload.identifiers).toEqual([
+      { type: 'Vessel Registration Identification', value: 'IMO 9187629' },
+      { type: 'MMSI', value: '572469210' },
+      { type: 'Vessel Call Sign', value: 'T2EU4' },
+    ]);
+  });
+
+  it('drops gender, sanctions notes, and organization and listing dates from idList', () => {
+    expect(byEntryId(standard(), '90001').payload.identifiers).toEqual([
+      { type: 'Passport', value: 'P7654321', country: 'Testland' },
+      { type: 'Website', value: 'www.example.test' },
+      { type: 'Digital Currency Address - XBT', value: '12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL' },
+    ]);
+  });
+
+  it('carries the same identifiers, by type and value, as the advanced projection of each party', () => {
+    for (const entryId of ['15036', '90001']) {
+      expect(typedValues(byEntryId(standard(), entryId)), entryId).toEqual(
+        typedValues(byEntryId(advanced(), entryId)),
+      );
+    }
+  });
+
+  it('reads no designation date out of free-text remarks', () => {
+    const party = byEntryId(standard(), '90001');
+    expect(party.designationDate).toBeUndefined();
+    expect(party.payload.remarks).toBe('alt. Registration Number 12 Mar 2014; listed 2015-06-07.');
+    expect(byEntryId(standard(), '15036').designationDate).toBeUndefined();
+  });
+
+  it('streams the same records at every chunk size', async () => {
+    const oracle = standard();
+    for (const size of CHUNK_SIZES) {
+      const { records } = await streamAll(
+        (chunks, s) => streamOfacFromText(chunks, 'ofac_sdn', s),
+        PAIR_OFAC_STANDARD_XML,
+        size,
+      );
+      expect(records, `chunk size ${size}`).toEqual(oracle);
+    }
+  });
+});
+
+/** UK designations: RUS0251's dates, placeholder DOBs, an undated record, and contact details. */
+const PRECISION_UK_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Designations>
+  <Designation>
+    <LastUpdated>09/04/2025</LastUpdated>
+    <DateDesignated>25/02/2022</DateDesignated>
+    <UniqueID>RUS0251</UniqueID>
+    <Names><Name><Name1>Vladimir</Name1><Name6>PUTIN</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+    <IndividualDetails><Individual>
+      <DOBs><DOB>07/10/1952</DOB></DOBs>
+      <BirthDetails><Location><TownOfBirth>Leningrad</TownOfBirth><CountryOfBirth>Russia</CountryOfBirth></Location></BirthDetails>
+    </Individual></IndividualDetails>
+  </Designation>
+  <Designation>
+    <DateDesignated>20/05/2025</DateDesignated>
+    <UniqueID>PLACEHOLDERS</UniqueID>
+    <Names><Name><Name6>PLACEHOLDER PERSON</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+    <IndividualDetails><Individual>
+      <DOBs><DOB>dd/mm/1952</DOB><DOB>dd/08/1961</DOB><DOB>1968</DOB><DOB>15/08/19yy</DOB><DOB>31/13/1970</DOB><DOB>00/00/1975</DOB><DOB>00/06/1980</DOB></DOBs>
+    </Individual></IndividualDetails>
+  </Designation>
+  <Designation>
+    <LastUpdated>16/04/2026</LastUpdated>
+    <UniqueID>UNDATED</UniqueID>
+    <Names><Name><Name6>UNDATED ENTITY</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+  </Designation>
+  <Designation>
+    <DateDesignated>29/06/2012</DateDesignated>
+    <UniqueID>AFG0001</UniqueID>
+    <Names><Name><Name6>HAJI KHAIRULLAH MONEY EXCHANGE</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+    <EntityDetails><Entity><BusinessRegistrationNumbers><BusinessRegistrationNumber>1027700132195</BusinessRegistrationNumber></BusinessRegistrationNumbers></Entity></EntityDetails>
+    <PhoneNumbers>
+      <PhoneNumber>-103495</PhoneNumber>
+      <PhoneNumber>0202-104748</PhoneNumber>
+      <PhoneNumber>0202-104748</PhoneNumber>
+    </PhoneNumbers>
+    <EmailAddresses><EmailAddress>Helmand_Exchange_MSP@yahoo.com</EmailAddress><EmailAddress>Unknown</EmailAddress></EmailAddresses>
+    <Websites><Website>http://ghu.by</Website><Website>  </Website></Websites>
+  </Designation>
+</Designations>`;
+
+describe('UK — dates as ISO 8601 and contact details as identifiers (issues #39, #45)', () => {
+  const records = () => parseUk(parseXml(PRECISION_UK_XML));
+
+  it('RUS0251: designated 2022-02-25, born 1952-10-07', () => {
+    expect(byEntryId(records(), 'RUS0251')).toMatchObject({
+      designationDate: '2022-02-25',
+      payload: { datesOfBirth: [{ date: '1952-10-07', place: 'Leningrad, Russia' }] },
+    });
+  });
+
+  it('reads a placeholder component as absent, and keeps a value with no ISO form as published', () => {
+    expect(byEntryId(records(), 'PLACEHOLDERS').payload.datesOfBirth).toEqual([
+      { date: '1952' },
+      { date: '1961-08' },
+      { date: '1968' },
+      { date: '15/08/19yy' },
+      { date: '31/13/1970' },
+      // `00` is the list's other placeholder for an unknown day or month (RUS1683).
+      { date: '1975' },
+      { date: '1980-06' },
+    ]);
+  });
+
+  it('publishes no designation date where DateDesignated is absent, never the last-update date', () => {
+    expect(byEntryId(records(), 'UNDATED').designationDate).toBeUndefined();
+  });
+
+  it('adds phone numbers, emails, and websites verbatim after the document identifiers', () => {
+    expect(byEntryId(records(), 'AFG0001').payload.identifiers).toEqual([
+      { type: 'Business Registration Number', value: '1027700132195' },
+      { type: 'Phone Number', value: '-103495' },
+      { type: 'Phone Number', value: '0202-104748' },
+      { type: 'Email Address', value: 'Helmand_Exchange_MSP@yahoo.com' },
+      { type: 'Website', value: 'http://ghu.by' },
+    ]);
+  });
+
+  it('streams the same records at every chunk size', async () => {
+    for (const size of CHUNK_SIZES) {
+      const { records: streamed } = await streamAll(streamUkFromText, PRECISION_UK_XML, size);
+      expect(streamed, `chunk size ${size}`).toEqual(records());
+    }
+  });
+});
+
+/** UN records: 6908457's offset LISTED_ON and 6908006's approximate year. */
+const PRECISION_UN_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<CONSOLIDATED_LIST><INDIVIDUALS>
+  <INDIVIDUAL>
+    <DATAID>6908457</DATAID><FIRST_NAME>OFFSET</FIRST_NAME><SECOND_NAME>LISTING</SECOND_NAME>
+    <LISTED_ON>2015-07-01-04:00</LISTED_ON>
+    <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>EXACT</TYPE_OF_DATE><DATE>1966-01-01</DATE></INDIVIDUAL_DATE_OF_BIRTH>
+  </INDIVIDUAL>
+  <INDIVIDUAL>
+    <DATAID>6908006</DATAID><FIRST_NAME>APPROXIMATE</FIRST_NAME><SECOND_NAME>YEAR</SECOND_NAME>
+    <LISTED_ON>2009-03-03</LISTED_ON>
+    <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>EXACT</TYPE_OF_DATE><DATE>1962-03-17</DATE></INDIVIDUAL_DATE_OF_BIRTH>
+    <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>APPROXIMATELY</TYPE_OF_DATE><YEAR>1966</YEAR></INDIVIDUAL_DATE_OF_BIRTH>
+    <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>EXACT</TYPE_OF_DATE><YEAR>1966</YEAR></INDIVIDUAL_DATE_OF_BIRTH>
+    <INDIVIDUAL_DATE_OF_BIRTH><TYPE_OF_DATE>APPROXIMATELY</TYPE_OF_DATE></INDIVIDUAL_DATE_OF_BIRTH>
+    <INDIVIDUAL_PLACE_OF_BIRTH><CITY>Kabul</CITY><COUNTRY>Afghanistan</COUNTRY></INDIVIDUAL_PLACE_OF_BIRTH>
+  </INDIVIDUAL>
+</INDIVIDUALS></CONSOLIDATED_LIST>`;
+
+describe('UN — listing date without its offset, approximate years flagged (issue #39)', () => {
+  const records = () => parseUn(parseXml(PRECISION_UN_XML));
+
+  it('6908457: LISTED_ON 2015-07-01-04:00 → 2015-07-01', () => {
+    expect(byEntryId(records(), '6908457').designationDate).toBe('2015-07-01');
+  });
+
+  it('6908006: an APPROXIMATELY year is circa, an EXACT year of the same value is not', () => {
+    expect(byEntryId(records(), '6908006').payload.datesOfBirth).toEqual([
+      { date: '1962-03-17' },
+      { date: '1966', circa: true },
+      { date: '1966' },
+      { place: 'Kabul, Afghanistan' },
+    ]);
+  });
+
+  it('streams the same records at every chunk size', async () => {
+    for (const size of CHUNK_SIZES) {
+      const { records: streamed } = await streamAll(streamUnFromText, PRECISION_UN_XML, size);
+      expect(streamed, `chunk size ${size}`).toEqual(records());
+    }
+  });
+});
+
+/** EU entities: 521's circa year ranges, 201's own designation date, 117053's open range. */
+const PRECISION_EU_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<export xmlns="http://eu.europa.ec/fpi/fsd/export">
+  <sanctionEntity designationDate="2001-01-25" designationDetails="" unitedNationId="" euReferenceNumber="EU.502.12" logicalId="521">
+    <regulation regulationType="amendment" publicationDate="2017-03-09" programme="AFG"/>
+    <subjectType code="person" classificationCode="P"/>
+    <nameAlias wholeName="Haji Ahmad Jan" strong="true"/>
+    <birthdate circa="true" calendarType="GREGORIAN" city="Kandahar province" zipCode="" yearRangeFrom="1953" yearRangeTo="1958" region="" place="" countryIso2Code="AF" countryDescription="AFGHANISTAN"/>
+    <birthdate circa="true" calendarType="GREGORIAN" city="Tirin Kot District, Uruzgan Province" zipCode="" yearRangeFrom="1953" yearRangeTo="1958" region="" place="" countryIso2Code="AF" countryDescription="AFGHANISTAN"/>
+  </sanctionEntity>
+  <sanctionEntity designationDate="2002-06-18" euReferenceNumber="EU.3502.46" logicalId="201">
+    <regulation regulationType="amendment" publicationDate="2025-01-31" programme="TERR"/>
+    <subjectType code="enterprise" classificationCode="E"/>
+    <nameAlias wholeName="Example Organisation 201" strong="true"/>
+  </sanctionEntity>
+  <sanctionEntity euReferenceNumber="EU.9.9" logicalId="117053">
+    <regulation regulationType="regulation" publicationDate="2024-01-01" programme="ERI"/>
+    <subjectType code="person" classificationCode="P"/>
+    <nameAlias wholeName="Open Range Person" strong="true"/>
+    <birthdate circa="false" calendarType="GREGORIAN" city="" zipCode="" yearRangeTo="1980" region="" place="" countryIso2Code="ER" countryDescription="ERITREA"/>
+    <birthdate circa="true" year="1957" city="" countryIso2Code="00" countryDescription="UNKNOWN"/>
+    <birthdate circa="true" city="Tadamon" region="Rif Dimashq" place="" countryIso2Code="SY" countryDescription="SYRIAN ARAB REPUBLIC"/>
+  </sanctionEntity>
+</export>`;
+
+describe('EU — ranges, circa, and the entity designation date (issue #39)', () => {
+  const records = () => parseEu(parseXml(PRECISION_EU_XML));
+
+  it('521: two circa year ranges, each with its own birthplace', () => {
+    expect(byEntryId(records(), '521').payload.datesOfBirth).toEqual([
+      { date: '1953/1958', circa: true, place: 'Kandahar province, AFGHANISTAN' },
+      {
+        date: '1953/1958',
+        circa: true,
+        place: 'Tirin Kot District, Uruzgan Province, AFGHANISTAN',
+      },
+    ]);
+  });
+
+  it("reads the entity's own designationDate, never the latest regulation's publication date", () => {
+    const all = records();
+    expect(byEntryId(all, '521').designationDate).toBe('2001-01-25');
+    expect(byEntryId(all, '201').designationDate).toBe('2002-06-18');
+    expect(byEntryId(all, '117053').designationDate).toBeUndefined();
+  });
+
+  it('keeps a one-sided range open, a circa year flagged, and a place-only circa entry unflagged', () => {
+    expect(byEntryId(records(), '117053').payload.datesOfBirth).toEqual([
+      { date: '../1980', place: 'ERITREA' },
+      { date: '1957', circa: true },
+      { place: 'Tadamon, Rif Dimashq, SYRIAN ARAB REPUBLIC' },
+    ]);
+  });
+
+  it('streams the same records at every chunk size', async () => {
+    for (const size of CHUNK_SIZES) {
+      const { records: streamed } = await streamAll(streamEuFromText, PRECISION_EU_XML, size);
+      expect(streamed, `chunk size ${size}`).toEqual(records());
+    }
+  });
+});
+
 // ─── Sanctions streaming ingest (issue #13) ─────────────────────────────────────
 //
 // Each sanctions source now streams: the document is scanned for complete record
@@ -1422,11 +2136,7 @@ const MULTI_OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
             </DocumentedName>
           </Alias>
         </Identity>
-        <Feature FeatureTypeID="8">
-          <FeatureVersion ID="1"><DatePeriod><Start><From>
-            <Year>1948</Year><Month>12</Month><Day>10</Day>
-          </From></Start></DatePeriod></FeatureVersion>
-        </Feature>
+        ${ofacBirthdate(['1948-12-10', '1948-12-10'], ['1948-12-10', '1948-12-10'])}
         <Feature FeatureTypeID="9">
           <FeatureVersion ID="2"><VersionDetail DetailTypeID="1432">Safed, Israel</VersionDetail></FeatureVersion>
         </Feature>
@@ -2463,5 +3173,62 @@ describe('entity decoding cost on caller-sized text', () => {
     const t80k = time(80_000);
     expect(t80k / t5k).toBeLessThan(64);
     expect(t80k).toBeLessThan(250);
+  });
+});
+
+// ─── Published list reference numbers (issue #42) ───────────────────────────────
+
+describe('published list reference numbers', () => {
+  it('reads the UN REFERENCE_NUMBER, trimmed, beside the DATAID entry ID', () => {
+    const [entity] = parseUn(
+      parseXml(
+        '<CONSOLIDATED_LIST><ENTITIES><ENTITY><DATAID>6908499</DATAID><REFERENCE_NUMBER>KPe.023 </REFERENCE_NUMBER><FIRST_NAME>DAEDONG CREDIT BANK (DCB)</FIRST_NAME></ENTITY></ENTITIES></CONSOLIDATED_LIST>',
+      ),
+    );
+    expect(entity).toMatchObject({ sourceEntryId: '6908499', referenceNumber: 'KPe.023' });
+  });
+
+  it('reads the EU euReferenceNumber beside the logicalId entry ID', () => {
+    const [entity] = parseEu(
+      parseXml(
+        '<export><sanctionEntity logicalId="13" euReferenceNumber="EU.27.28"><subjectType code="person"/><nameAlias wholeName="Saddam Hussein Al-Tikriti" strong="true"/></sanctionEntity></export>',
+      ),
+    );
+    expect(entity).toMatchObject({ sourceEntryId: '13', referenceNumber: 'EU.27.28' });
+  });
+
+  it('reads the UK OFSI Group ID beside the UniqueID, and none where the list issued none', () => {
+    const [grouped, ungrouped] = parseUk(
+      parseXml(
+        '<Designations><Designation><UniqueID>RUS0251</UniqueID><OFSIGroupID>14196</OFSIGroupID><Names><Name><Name6>PUTIN</Name6><NameType>Primary Name</NameType></Name></Names></Designation><Designation><UniqueID>RUS3686</UniqueID><Names><Name><Name6>TM HAI HA 568</Name6><NameType>Primary Name</NameType></Name></Names></Designation></Designations>',
+      ),
+    );
+    expect(grouped).toMatchObject({ sourceEntryId: 'RUS0251', referenceNumber: '14196' });
+    expect(ungrouped).toMatchObject({ sourceEntryId: 'RUS3686' });
+    expect(ungrouped).not.toHaveProperty('referenceNumber');
+  });
+
+  it('publishes no reference number for OFAC, whose entry ID is its published number', () => {
+    const [entry] = parseOfac(
+      parseXml(
+        '<sdnList><sdnEntry><uid>4243</uid><lastName>EBANO</lastName><sdnType>Vessel</sdnType></sdnEntry></sdnList>',
+      ),
+      'ofac_sdn',
+    );
+    expect(entry).toMatchObject({ sourceEntryId: '4243' });
+    expect(entry).not.toHaveProperty('referenceNumber');
+  });
+});
+
+describe('the synthetic fixture uses the identifier labels the parsers emit', () => {
+  it('labels the UK vessel IMO number as the UK parser does', async () => {
+    const { FIXTURE_DESIGNATIONS } = await import('@/services/screening/fixtures.js');
+    const [ship] = parseUk(
+      parseXml(
+        '<Designations><Designation><UniqueID>FX-4004</UniqueID><IndividualEntityShip>Ship</IndividualEntityShip><Names><Name><Name6>MV Phantom Voyager</Name6><NameType>Primary Name</NameType></Name></Names><ShipDetails><Ship><IMONumbers><IMONumber>1234567</IMONumber></IMONumbers></Ship></ShipDetails></Designation></Designations>',
+      ),
+    );
+    const fixture = FIXTURE_DESIGNATIONS.find((d) => d.id === 'uk:FX-4004');
+    expect(fixture?.payload.identifiers).toEqual(ship?.payload.identifiers);
   });
 });

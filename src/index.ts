@@ -2,7 +2,7 @@
 /**
  * @fileoverview sanctions-screening-mcp-server MCP server entry point. Wires the
  * screening service (which owns the local SQLite + FTS5 mirrors), registers the
- * six screening/resolution tools, three URI resources, and the counterparty
+ * seven screening/resolution tools, three URI resources, and the counterparty
  * vetting prompt, and schedules the mirror refresh on HTTP deployments. The
  * full-corpus mirror init runs out-of-band via `bun run mirror:init`.
  * @module index
@@ -10,11 +10,10 @@
 
 import { createApp } from '@cyanheads/mcp-ts-core';
 import { config } from '@cyanheads/mcp-ts-core/config';
-import { logger, requestContextService, schedulerService } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig } from './config/server-config.js';
 import { allPromptDefinitions } from './mcp-server/prompts/definitions/index.js';
 import { allResourceDefinitions } from './mcp-server/resources/definitions/index.js';
 import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
+import { scheduleSanctionsRefresh } from './services/screening/sanctions-refresh.js';
 import {
   getScreeningService,
   initScreeningService,
@@ -31,7 +30,7 @@ await createApp({
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
   instructions:
-    'Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, all fuzzy-matched offline over a local mirror. Start with sanctions_screen_name for "is this entity on a watchlist"; sanctions_resolve_entity → sanctions_get_entity → sanctions_trace_ownership for "who is this legal entity and who owns it." Every result is a screening AID, not a compliance determination — a hit is a candidate to verify against the official source, and an empty result is never a clearance. Check sanctions_list_sources for which lists are loaded and how fresh the mirror is.',
+    'Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, all fuzzy-matched offline over a local mirror. Start with sanctions_screen_name for "is this entity on a watchlist"; holding a vessel IMO number, a SWIFT/BIC code, a wallet address, or a passport or national ID number instead of a name, look it up exactly with sanctions_screen_identifier; sanctions_resolve_entity → sanctions_get_entity → sanctions_trace_ownership for "who is this legal entity and who owns it." Every result is a screening AID, not a compliance determination — a hit is a candidate to verify against the official source, and an empty result is never a clearance. Check sanctions_list_sources for which lists are loaded and how fresh the mirror is.',
   // The tool, resource, and prompt surface is fixed at startup — nothing
   // registers or retires a definition at runtime — so a 2026-07-28 client may
   // hold the listings for an hour. Shared caches may too: the same listings are
@@ -65,7 +64,10 @@ await createApp({
   },
   setup() {
     initScreeningService();
-    scheduleRefresh();
+    // HTTP deployments refresh on a cron. stdio operators run `bun run
+    // mirror:refresh` out-of-band, where a cron would be redundant and could
+    // collide with a manual run.
+    if (config.mcpTransportType === 'http') void scheduleSanctionsRefresh();
   },
   // The service holds open SQLite handles for both mirrors. Releasing them here
   // closes prepared statements with the file rather than leaving it pinned
@@ -74,34 +76,3 @@ await createApp({
     await getScreeningService().close();
   },
 });
-
-/**
- * Schedule the daily mirror refresh on HTTP deployments only. stdio operators
- * run refresh out-of-band via `bun run mirror:refresh`, so a cron there would be
- * redundant and could collide with a manual run.
- */
-function scheduleRefresh(): void {
-  if (config.mcpTransportType !== 'http') return;
-  const { refreshCron } = getServerConfig();
-  void schedulerService
-    .schedule(
-      'sanctions-mirror-refresh',
-      refreshCron,
-      async (ctx) => {
-        const svc = getScreeningService();
-        logger.info('Starting scheduled sanctions mirror refresh', ctx);
-        await svc.designations.runSync({ mode: 'refresh' });
-        await svc.rebuildNameIndex();
-        logger.info('Scheduled sanctions mirror refresh complete', ctx);
-      },
-      'Refreshes the sanctions watchlists from their upstream sources.',
-    )
-    .then(() => schedulerService.start('sanctions-mirror-refresh'))
-    .catch((err) => {
-      logger.error(
-        'Failed to schedule sanctions mirror refresh',
-        err as Error,
-        requestContextService.createRequestContext({ operation: 'scheduleRefresh' }),
-      );
-    });
-}

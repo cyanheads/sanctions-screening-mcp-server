@@ -1,10 +1,12 @@
 /**
  * @fileoverview A sanctions refresh removes designations its source stopped
  * publishing (issue #30), and only when that source's document arrived and
- * parsed to completion. Drives the real harvest → `runSync` → name-index path
- * with every source served by fake responses at the fetch boundary, then reads
- * the result back through the mirror and through the `sanctions_get_designation`
- * and `sanctions_screen_name` tools — `structuredContent` and `content[]` both.
+ * parsed to completion; and a source that fails no longer stops the sources
+ * after it (issue #32). Drives the real harvest → `runSync` → name-index path
+ * (`syncSanctions`, the one every caller runs) with every source served by fake
+ * responses at the fetch boundary, then reads the result back through the mirror
+ * and through the `sanctions_get_designation`, `sanctions_screen_name`, and
+ * `sanctions_list_sources` tools — `structuredContent` and `content[]` both.
  *
  * Each boundary case (a failing, truncated, or zero-record source) runs in the
  * same cycle as a source that does prune, so its "nothing removed" assertion is
@@ -12,11 +14,12 @@
  * @module tests/integration/refresh-pruning.test
  */
 
-import type { ErrorContract } from '@cyanheads/mcp-ts-core/errors';
+import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SOURCE_URLS } from '@/config/server-config.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
+import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { NAME_TABLE } from '@/services/screening/schema.js';
 import type { SourceCode } from '@/services/screening/types.js';
@@ -116,16 +119,20 @@ function without(source: SourceCode, ...ids: string[]): string {
   );
 }
 
-function serve(bodies: Map<string, Feed>): void {
+/** Serve `bodies` at the fetch boundary; returns the URLs requested, in order. */
+function serve(bodies: Map<string, Feed>): string[] {
+  const requested: string[] = [];
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      requested.push(url);
       const body = bodies.get(url);
       if (body === undefined || body === 404) return new Response('not found', { status: 404 });
       return new Response(body, { status: 200, headers: { 'content-type': 'application/xml' } });
     }),
   );
+  return requested;
 }
 
 // ─── Harness ───────────────────────────────────────────────────────────────────
@@ -141,21 +148,17 @@ afterEach(async () => {
   await harness.cleanup();
 });
 
-/** One sync cycle over `bodies`, then the name-index rebuild every caller runs. */
+/** One sync cycle over `bodies`, through the sync-then-rebuild path every caller runs. */
 async function cycle(mode: 'init' | 'refresh', bodies: Map<string, Feed>): Promise<void> {
   serve(bodies);
-  await harness.service.designations.runSync({ mode, signal: new AbortController().signal });
-  await harness.service.rebuildNameIndex();
+  await harness.service.syncSanctions(mode, new AbortController().signal);
 }
 
-/** A cycle whose sync is expected to fail: the name index is left as the failure left it. */
+/** A cycle whose sync is expected to fail; the name index is rebuilt all the same. */
 async function failingCycle(bodies: Map<string, Feed>): Promise<void> {
   serve(bodies);
   await expect(
-    harness.service.designations.runSync({
-      mode: 'refresh',
-      signal: new AbortController().signal,
-    }),
+    harness.service.syncSanctions('refresh', new AbortController().signal),
   ).rejects.toThrow();
 }
 
@@ -187,7 +190,11 @@ const ctxFor = <const E extends readonly ErrorContract[] | undefined>(errors: E)
   createMockContext({ errors });
 
 /** Screen a name through the tool: its structured hits and its rendered text. */
-async function screen(name: string): Promise<{ ids: string[]; text: string }> {
+async function screen(name: string): Promise<{
+  hits: { id: string; matchedName: string; matchType: string }[];
+  ids: string[];
+  text: string;
+}> {
   const result = await screenNameTool.handler(
     screenNameTool.input.parse({ name }),
     ctxFor(screenNameTool.errors),
@@ -195,7 +202,12 @@ async function screen(name: string): Promise<{ ids: string[]; text: string }> {
   const text = (screenNameTool.format?.(result) ?? [])
     .map((block) => ('text' in block ? block.text : ''))
     .join('\n');
-  return { ids: result.hits.map((h) => `${h.source}:${h.sourceEntryId}`), text };
+  const hits = result.hits.map((h) => ({
+    id: `${h.source}:${h.sourceEntryId}`,
+    matchedName: h.matchedName,
+    matchType: h.matchType,
+  }));
+  return { hits, ids: hits.map((h) => h.id), text };
 }
 
 function getDesignation(source: SourceCode, entryId: string) {
@@ -361,5 +373,152 @@ describe('a source whose document did not fully arrive prunes nothing', () => {
     expect(ids).toEqual(expect.arrayContaining(['eu:EU-1', 'eu:EU-2', 'eu:EU-3']));
     expect(await counts()).toEqual({ ...BASELINE_COUNTS, ofac_sdn: 1, eu: 3 });
     expect((await screen('Elm Heron')).ids).toContain('eu:EU-2');
+  });
+});
+
+// ─── A failing source does not stall the others (issue #32) ────────────────────
+
+/** The Consolidated feed with CONS-1 published under one alias. */
+function consolidatedWithAlias(alias: string): string {
+  const [first, last] = split(alias);
+  return `<?xml version="1.0" encoding="utf-8"?>\n<sdnList><sdnEntry><uid>CONS-1</uid><firstName>Cedar</firstName><lastName>Wren</lastName><sdnType>Individual</sdnType><akaList><aka><category>strong</category><firstName>${first}</firstName><lastName>${last}</lastName></aka></akaList></sdnEntry></sdnList>`;
+}
+
+describe('a failing source does not stop the sources after it', () => {
+  it('refreshes every other source, rebuilds the name index, and names the failed source', async () => {
+    await cycle('init', feeds({ ofac_consolidated: consolidatedWithAlias('Tayr Quillon') }));
+    expect((await screen('Tayr Quillon')).hits).toContainEqual({
+      id: 'ofac_consolidated:CONS-1',
+      matchedName: 'Tayr Quillon',
+      matchType: 'exact',
+    });
+    const initAsOf = (await harness.service.sanctionsReadiness()).completedAt;
+
+    // Issue #32's repro: Consolidated renames an alias, EU's request fails, and UN
+    // (harvested after EU) delists UN-2.
+    const requested = serve(
+      feeds({
+        ofac_consolidated: consolidatedWithAlias('Zorvexkal Quillon'),
+        eu: 404,
+        un: without('un', 'UN-2'),
+      }),
+    );
+    await expect(
+      harness.service.syncSanctions('refresh', new AbortController().signal),
+    ).rejects.toThrow(/Sanctions harvest failed for eu \(1 of 5 sources\)[\s\S]*eu: .*404/);
+
+    // The sources after the failure were requested and refreshed.
+    expect(requested).toEqual([URLS.ofac_sdn, URLS.ofac_consolidated, URLS.eu, URLS.uk, URLS.un]);
+    expect(await storedIds()).not.toContain('un:UN-2');
+    // The failed source kept every row and pruned nothing.
+    expect(await counts()).toEqual({ ...BASELINE_COUNTS, un: 1 });
+
+    // The name index follows the committed rows: the added alias is an exact hit
+    // and the removed one no longer matches anything.
+    const added = await screen('Zorvexkal Quillon');
+    expect(added.hits[0]).toEqual({
+      id: 'ofac_consolidated:CONS-1',
+      matchedName: 'Zorvexkal Quillon',
+      matchType: 'exact',
+    });
+    expect(added.text).toContain('**Matched on:** "Zorvexkal Quillon"');
+    const removed = await screen('Tayr Quillon');
+    expect(removed.hits.map((h) => h.matchedName)).not.toContain('Tayr Quillon');
+    expect(removed.text).not.toContain('**Matched on:** "Tayr Quillon"');
+    expect(await indexedNames('ofac_consolidated:CONS-1')).toEqual([
+      'Cedar Wren',
+      'Zorvexkal Quillon',
+    ]);
+
+    // The run is recorded as failed, naming the source; the mirror's as-of stays
+    // at the last run in which every source refreshed.
+    const readiness = await harness.service.sanctionsReadiness();
+    expect(readiness).toMatchObject({ ready: true, status: 'error', completedAt: initAsOf });
+    expect(readiness.error).toMatch(/\beu: /);
+    const sources = await listSourcesTool.handler(
+      listSourcesTool.input.parse({}),
+      ctxFor(listSourcesTool.errors),
+    );
+    expect(sources.sanctionsAsOf).toBe(initAsOf);
+    const sourcesText = (listSourcesTool.format?.(sources) ?? [])
+      .map((block) => ('text' in block ? block.text : ''))
+      .join('\n');
+    expect(sourcesText).toContain(`(as of ${initAsOf})`);
+
+    // The next run in which every source refreshes advances it.
+    await cycle(
+      'refresh',
+      feeds({ ofac_consolidated: consolidatedWithAlias('Zorvexkal Quillon') }),
+    );
+    const next = await harness.service.sanctionsReadiness();
+    expect(next.status).toBe('complete');
+    expect(next.completedAt).not.toBe(initAsOf);
+  });
+
+  it('names every failed source when the first and the last both fail', async () => {
+    await cycle('init', feeds());
+
+    await expect(
+      (async () => {
+        serve(feeds({ ofac_sdn: 404, uk: without('uk', 'UK-2'), un: 404 }));
+        await harness.service.syncSanctions('refresh', new AbortController().signal);
+      })(),
+    ).rejects.toThrow(
+      /failed for ofac_sdn, un \(2 of 5 sources\)[\s\S]*ofac_sdn: .*404[\s\S]*; un: .*404/,
+    );
+
+    // UK, between the two failures, refreshed and pruned; the failed sources kept everything.
+    expect(await counts()).toEqual({ ...BASELINE_COUNTS, uk: 1 });
+  });
+
+  it('leaves a first init with a failed source not ready, with every other source loaded and indexed', async () => {
+    serve(feeds({ uk: 404 }));
+    await expect(
+      harness.service.syncSanctions('init', new AbortController().signal),
+    ).rejects.toThrow(/\buk: /);
+
+    expect(await harness.service.sanctionsReady()).toBe(false);
+    expect(await counts()).toEqual({ ...BASELINE_COUNTS, uk: 0 });
+    expect(await indexedNames('un:UN-1')).toEqual(['Hazel Crane']);
+    await expect(
+      screenNameTool.handler(
+        screenNameTool.input.parse({ name: 'Hazel Crane' }),
+        ctxFor(screenNameTool.errors),
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'mirror_not_ready' } });
+  });
+
+  it('ends the run at once on a caller abort, as a cancellation that names no source', async () => {
+    await cycle('init', feeds());
+    const initAsOf = (await harness.service.sanctionsReadiness()).completedAt;
+
+    const controller = new AbortController();
+    const requested: string[] = [];
+    const bodies = feeds({ ofac_sdn: without('ofac_sdn', 'SDN-2') });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        requested.push(url);
+        if (url === URLS.eu) {
+          controller.abort();
+          init?.signal?.throwIfAborted();
+        }
+        return new Response(bodies.get(url) as string, { status: 200 });
+      }),
+    );
+
+    const error = await harness.service.syncSanctions('refresh', controller.signal).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(error?.message).not.toMatch(/Sanctions harvest failed/);
+    expect(requested).toEqual([URLS.ofac_sdn, URLS.ofac_consolidated, URLS.eu]);
+    // What landed before the abort stands, and the index was rebuilt from it.
+    expect(await counts()).toEqual({ ...BASELINE_COUNTS, ofac_sdn: 1 });
+    expect(await indexedNames('ofac_sdn:SDN-2')).toEqual([]);
+    expect((await harness.service.sanctionsReadiness()).completedAt).toBe(initAsOf);
   });
 });

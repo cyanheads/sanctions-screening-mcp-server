@@ -37,14 +37,15 @@
  * @module services/screening/sanctions-ingest
  */
 
-import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { serviceUnavailable, timeout } from '@cyanheads/mcp-ts-core/errors';
+import { requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import {
   createRejections,
   type IngestRejections,
   isUsableName,
 } from '@/services/screening/ingest-validation.js';
+import { fetchSourceDownload } from '@/services/screening/source-fetch.js';
 import { fold } from '@/services/screening/text-matching.js';
 import type {
   AddressRecord,
@@ -68,10 +69,13 @@ import {
  * mirror; see the OFAC deferred join in this module's overview. Empty for every
  * source whose document is a flat repeating sequence.
  */
-export type DeferredDesignationFields = ReadonlyMap<
-  string,
-  { designationDate?: string; program?: string }
->;
+export type DeferredDesignationFields = ReadonlyMap<string, DeferredColumns>;
+
+/** The two columns OFAC publishes after the parties they belong to. */
+export interface DeferredColumns {
+  designationDate?: string;
+  program?: string;
+}
 
 /** What one source's harvest accepted and dropped. */
 export interface SourceHarvestReport {
@@ -89,6 +93,12 @@ export interface SanctionsIngester {
    * advanced, and only meaningful once {@link harvest} has completed.
    */
   deferredFields(): DeferredDesignationFields;
+  /**
+   * True once the harvest has yielded a record whose {@link deferredFields} arrive
+   * after it — an OFAC advanced party. Its streamed record carries no programme
+   * fields, so they are not what the source published.
+   */
+  defersFields(): boolean;
   /** Stream the full list, one normalized designation at a time. */
   harvest(signal: AbortSignal): AsyncGenerator<NormalizedDesignation>;
   /** What the last {@link harvest} accepted and dropped. */
@@ -101,15 +111,6 @@ export interface SanctionsIngester {
 /** Browser-style UA — the UN SC domain returns 404 to bare requests. */
 const BROWSER_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-
-/**
- * Bounds only time-to-response-headers. `fetchWithTimeout` clears its own timer
- * once the `Response` is returned; the body is then drained lazily by the record
- * scanner, bounded by the caller's `signal` (the lifecycle script's long-run
- * signal). A 120 MiB document legitimately takes longer to transfer than any
- * fixed fetch timeout, so this guards a stalled connection, not the transfer.
- */
-const HEADERS_TIMEOUT_MS = 120_000;
 
 /** Designations accumulated per yielded sync page — bounds one page's memory. */
 const SYNC_PAGE_SIZE = 2500;
@@ -159,7 +160,9 @@ function opt<K extends string>(key: K, value: string | undefined): Record<K, str
 // Shared by every normalizer's identifiers, addresses, dates and places of birth,
 // and nationalities. Absence stays absence: a component that carries no letter or
 // digit, or that is a placeholder, is not published; an entry with no published
-// component is skipped; and nothing is inferred from another group.
+// component is skipped; and nothing is inferred from another group. A date is ISO
+// 8601 at the precision its source published, never widened to a day it did not
+// name; a value with no ISO form stays as published.
 
 /**
  * Whole values the sources write where they have nothing to publish: the EU's
@@ -232,20 +235,53 @@ function toAddress(
 }
 
 /**
+ * One published date of birth: ISO 8601 at the precision the source published,
+ * and `circa` when the source flags it approximate. A circa year and the same
+ * exact year are two published facts.
+ */
+interface BirthDate {
+  circa?: true;
+  date: string;
+}
+
+/** A {@link BirthDate}, flagged `circa` only when the source said so. */
+function birthDate(date: string, circa: boolean): BirthDate {
+  return circa ? { date, circa: true } : { date };
+}
+
+/**
+ * A published year range as an ISO 8601 interval, open (`..`) at an end the
+ * source left blank (`../1980`); undefined when neither end is published.
+ */
+function yearRange(from: string | undefined, to: string | undefined): string | undefined {
+  return from || to ? `${from ?? '..'}/${to ?? '..'}` : undefined;
+}
+
+/** Zero-pad a month or day to two digits. */
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/** The number of days in a month (`month` is 1-based). */
+function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/**
  * Dates and places of birth a source publishes as two separate lists. The source
  * links a date to a place only when it publishes exactly one of each; any other
  * shape emits every date and every place as its own entry, since pairing them by
  * position would assert a link the source never made.
  */
-function birthRecords(dates: readonly string[], places: readonly string[]): DobRecord[] {
+function birthRecords(dates: readonly BirthDate[], places: readonly string[]): DobRecord[] {
   const uniqueDates = dedupe(dates);
   const uniquePlaces = dedupe(places);
   const [date] = uniqueDates;
   const [place] = uniquePlaces;
   if (date && place && uniqueDates.length === 1 && uniquePlaces.length === 1) {
-    return [{ date, place }];
+    return [{ ...date, place }];
   }
-  return [...uniqueDates.map((d) => ({ date: d })), ...uniquePlaces.map((p) => ({ place: p }))];
+  return [...uniqueDates, ...uniquePlaces.map((p) => ({ place: p }))];
 }
 
 /**
@@ -265,10 +301,14 @@ function openSourceTextStream(
   const reqCtx = requestContextService.createRequestContext({ operation: `harvest:${source}` });
   return withRetry(
     async () => {
-      const response = await fetchWithTimeout(url, HEADERS_TIMEOUT_MS, reqCtx, {
+      const response = await fetchSourceDownload(url, {
+        source,
         signal,
-        headers: { 'User-Agent': BROWSER_UA, Accept: 'application/xml, text/xml, */*' },
-        redirect: 'follow',
+        context: reqCtx,
+        init: {
+          headers: { 'User-Agent': BROWSER_UA, Accept: 'application/xml, text/xml, */*' },
+          redirect: 'follow',
+        },
       });
       if (!response.body) {
         throw serviceUnavailable(`${source} returned an empty body.`);
@@ -318,13 +358,15 @@ async function* replayTextStream(
  */
 export interface HarvestState {
   /** Columns to apply once the source's rows have landed. Only OFAC fills this. */
-  deferredFields: Map<string, { designationDate?: string; program?: string }>;
+  deferredFields: Map<string, DeferredColumns>;
+  /** A record has been yielded whose {@link deferredFields} arrive after it. */
+  defersFields: boolean;
   rejections: IngestRejections;
 }
 
 /** Fresh, zeroed harvest accounting. */
 export function createHarvestState(): HarvestState {
-  return { deferredFields: new Map(), rejections: createRejections() };
+  return { deferredFields: new Map(), defersFields: false, rejections: createRejections() };
 }
 
 /**
@@ -370,6 +412,7 @@ function buildStreamingIngester(spec: StreamingSourceSpec): SanctionsIngester {
     source: spec.source,
     url: spec.url,
     deferredFields: () => state.deferredFields,
+    defersFields: () => state.defersFields,
     report: () => ({ source: spec.source, accepted, rejected: state.rejections }),
     async *harvest(signal) {
       state = createHarvestState();
@@ -445,11 +488,22 @@ export async function* streamOfacFromText(
         foldOfacSanctionsEntry(body, state.deferredFields);
         continue;
     }
-    const record =
-      fragment.name === 'sdnEntry'
-        ? parseOfacStandard(body, source, state.rejections)
-        : parseOfacAdvanced(body, source, refs, xrefs, EMPTY_PROGRAM_INDEX, state.rejections);
-    if (record) yield record;
+    if (fragment.name === 'sdnEntry') {
+      const record = parseOfacStandard(body, source, state.rejections);
+      if (record) yield record;
+      continue;
+    }
+    const record = parseOfacAdvanced(
+      body,
+      source,
+      refs,
+      xrefs,
+      EMPTY_PROGRAM_INDEX,
+      state.rejections,
+    );
+    if (!record) continue;
+    state.defersFields = true;
+    yield record;
   }
 }
 
@@ -699,10 +753,8 @@ function ofacLabels(
  * `<Date>` (Year/Month/Day elements). Keyed by `ProfileID` (== the DistinctParty
  * `FixedRef`).
  */
-function buildOfacProgramIndex(
-  sanctions: Record<string, unknown>,
-): Map<string, { designationDate?: string; program?: string }> {
-  const out = new Map<string, { designationDate?: string; program?: string }>();
+function buildOfacProgramIndex(sanctions: Record<string, unknown>): Map<string, DeferredColumns> {
+  const out = new Map<string, DeferredColumns>();
   const entries = (sanctions.SanctionsEntries ?? {}) as Record<string, unknown>;
   for (const raw of asArray(entries.SanctionsEntry as unknown)) {
     foldOfacSanctionsEntry(raw as Record<string, unknown>, out);
@@ -719,7 +771,7 @@ function buildOfacProgramIndex(
  */
 function foldOfacSanctionsEntry(
   entry: Record<string, unknown>,
-  index: Map<string, { designationDate?: string; program?: string }>,
+  index: Map<string, DeferredColumns>,
 ): void {
   const profileId = asText(entry['@_ProfileID']);
   if (!profileId) return;
@@ -734,6 +786,112 @@ function foldOfacSanctionsEntry(
     ...(programs.length ? { program: programs.join(', ') } : {}),
     ...(designationDate ? { designationDate } : {}),
   });
+}
+
+/** A calendar day as `[year, month, day]`, month and day 1-based. */
+type CalendarDay = readonly [number, number, number];
+
+/** `day` as `YYYY-MM-DD`. */
+function isoDay([year, month, day]: CalendarDay): string {
+  return `${year}-${pad2(month)}-${pad2(day)}`;
+}
+
+/**
+ * `first`…`last` as the one ISO 8601 unit it spans exactly — a day, a whole
+ * month, or a whole year — or undefined when it spans none of them.
+ */
+function isoUnit(first: CalendarDay, last: CalendarDay): string | undefined {
+  const [y1, m1, d1] = first;
+  const [y2, m2, d2] = last;
+  if (y1 !== y2) return;
+  if (m1 === m2 && d1 === d2) return isoDay(first);
+  if (m1 === m2 && d1 === 1 && d2 === daysInMonth(y2, m2)) return `${y1}-${pad2(m1)}`;
+  if (m1 === 1 && d1 === 1 && m2 === 12 && d2 === 31) return String(y1);
+  return;
+}
+
+/**
+ * The first and last day one OFAC `<From>` / `<To>` point covers. OFAC publishes
+ * every point with a Year, Month, and Day; a point that omits the finer parts
+ * covers its whole month or year rather than its first day.
+ */
+function ofacPointDays(point: unknown): [CalendarDay, CalendarDay] | undefined {
+  const node = point as Record<string, unknown> | undefined;
+  const year = Number(asText(node?.Year));
+  if (!Number.isInteger(year)) return;
+  const month = Number(asText(node?.Month));
+  const day = Number(asText(node?.Day));
+  const lastMonth = month || 12;
+  return [
+    [year, month || 1, day || 1],
+    [year, lastMonth, day || daysInMonth(year, lastMonth)],
+  ];
+}
+
+/** One `DatePeriod` bound (`Start` or `End`) as the days from its `From` to its `To`. */
+function ofacWindow(bound: unknown): [CalendarDay, CalendarDay] | undefined {
+  const from = ofacPointDays(elementsAt(bound, 'From')[0]);
+  if (!from) return;
+  const to = ofacPointDays(elementsAt(bound, 'To')[0]) ?? from;
+  return [from[0], to[1]];
+}
+
+/**
+ * An OFAC advanced `<DatePeriod>` as ISO 8601 at the precision it publishes. The
+ * period is a `Start` and an `End` bound, each a `From`…`To` window. When the
+ * whole period — `Start/From` through `End/To` — is exactly one day, month, or
+ * year, it is that unit (`1946-08`, `1938`). Otherwise it is an interval whose
+ * ends take the precision of their own windows (`1955/1957`,
+ * `1946-09-26/1946-12-07`); a window that is no single unit contributes its outer
+ * day. `Approximate="true"` on either bound flags the date circa.
+ */
+function ofacPeriodDate(period: unknown): BirthDate | undefined {
+  const [start] = elementsAt(period, 'Start');
+  const [end] = elementsAt(period, 'End');
+  const first = ofacWindow(start);
+  if (!first) return;
+  const last = ofacWindow(end) ?? first;
+  const date =
+    isoUnit(first[0], last[1]) ??
+    `${isoUnit(...first) ?? isoDay(first[0])}/${isoUnit(...last) ?? isoDay(last[1])}`;
+  const circa = [start, end].some(
+    (bound) => asText((bound as Record<string, unknown> | undefined)?.['@_Approximate']) === 'true',
+  );
+  return birthDate(date, circa);
+}
+
+/** Month abbreviations as OFAC's display text writes them, in calendar order. */
+const OFAC_DISPLAY_MONTHS = 'jan feb mar apr may jun jul aug sep oct nov dec'.split(' ');
+
+/** One OFAC display point — `26 Aug 1988`, `Aug 1946`, or `1938` — as ISO 8601. */
+function ofacDisplayPoint(text: string): string | undefined {
+  const match = /^(?:(\d{1,2})\s+)?(?:([A-Za-z]{3})\s+)?(\d{4})$/.exec(text);
+  if (!match) return;
+  const [, day, monthName, year = ''] = match;
+  if (!monthName) return day ? undefined : year;
+  const month = OFAC_DISPLAY_MONTHS.indexOf(monthName.toLowerCase()) + 1;
+  if (!month) return;
+  if (!day) return `${year}-${pad2(month)}`;
+  const d = Number(day);
+  return d >= 1 && d <= daysInMonth(Number(year), month)
+    ? isoDay([Number(year), month, d])
+    : undefined;
+}
+
+/**
+ * An OFAC standard-schema date of birth — the list's display text: `26 Aug 1988`,
+ * `Aug 1946`, `1938`, a `circa` prefix, or two of them joined by `to` — as ISO
+ * 8601 at the same precision (`1988-08-26`, `1955/1957`, circa `1951`). Text in
+ * any other form stays whole, as published.
+ */
+function ofacDisplayDate(text: string): BirthDate {
+  const circa = /^circa\s+/i.test(text);
+  const ends = text
+    .replace(/^circa\s+/i, '')
+    .split(/\s+to\s+/i)
+    .map(ofacDisplayPoint);
+  if (ends.length > 2 || ends.some((end) => !end)) return { date: text };
+  return birthDate(ends.join('/'), circa);
 }
 
 /** Compose an OFAC `<Date><Year>/<Month>/<Day></Date>` node into an ISO-ish string. */
@@ -752,6 +910,13 @@ function composeOfacDate(date: Record<string, unknown> | undefined): string | un
  * Parse one standard-schema `<sdnEntry>`. Null when the entry publishes no `uid`
  * or no usable name — the two fields the mirror key and the name index are built
  * from.
+ *
+ * The standard schema folds identity documents and every text feature into one
+ * `idList`, typed by label. Only the entries the advanced schema reads as
+ * identifiers are kept — an identity-document type or an identifier-class
+ * feature — plus the vessel call sign, which this schema publishes under
+ * `vesselInfo`; gender, sanctions notes, and vessel or aircraft descriptors stay
+ * out. The schema has no designation-date field, so none is set.
  */
 function parseOfacStandard(
   e: Record<string, unknown>,
@@ -786,15 +951,17 @@ function parseOfacStandard(
     })
     .filter((a) => isUsableName(a.name));
 
-  const identifiers = dedupe(
-    elementsAt(e, 'idList', 'id').flatMap((id): IdentifierRecord[] => {
+  const identifiers = dedupe([
+    ...elementsAt(e, 'idList', 'id').flatMap((id): IdentifierRecord[] => {
       const i = id as Record<string, unknown>;
+      const type = asText(i.idType);
       const value = componentText(i.idNumber);
-      return value
-        ? [{ type: asText(i.idType) ?? 'ID', value, ...opt('country', componentText(i.idCountry)) }]
+      return type && value && isOfacStandardIdentifier(type)
+        ? [{ type, value, ...opt('country', componentText(i.idCountry)) }]
         : [];
     }),
-  );
+    ...textsAt(e, 'vesselInfo', 'callSign').map((value) => ({ type: 'Vessel Call Sign', value })),
+  ]);
 
   const addresses = dedupe(
     elementsAt(e, 'addressList', 'address').flatMap((addr) => {
@@ -810,7 +977,7 @@ function parseOfacStandard(
   );
 
   const datesOfBirth = birthRecords(
-    textsAt(e, 'dateOfBirthList', 'dateOfBirthItem', 'dateOfBirth'),
+    textsAt(e, 'dateOfBirthList', 'dateOfBirthItem', 'dateOfBirth').map(ofacDisplayDate),
     textsAt(e, 'placeOfBirthList', 'placeOfBirthItem', 'placeOfBirth'),
   );
 
@@ -820,7 +987,6 @@ function parseOfacStandard(
   ]);
 
   const remarks = asText(e.remarks);
-  const designationDate = remarks ? extractDateFromRemarks(remarks) : undefined;
   return {
     id: `${source}:${uid}`,
     source,
@@ -830,7 +996,6 @@ function parseOfacStandard(
     // Every `programList/program`, joined as the advanced schema joins a
     // SanctionsEntry's measures.
     ...opt('program', joinParts(elementsAt(e, 'programList', 'program').map(asText))),
-    ...(designationDate ? { designationDate } : {}),
     payload: {
       aliases,
       identifiers,
@@ -917,12 +1082,14 @@ function parseOfacAdvanced(
     .map((n) => ({ name: n.name, nameType: n.nameType }));
 
   const features = extractOfacFeatures(profile, refs, xrefs);
-  const identifiers = dedupe(
-    identities.flatMap(
+  // Identity documents first, then the identifier-class features, each in document order.
+  const identifiers = dedupe([
+    ...identities.flatMap(
       (ident) =>
         xrefs.documents.get(asText((ident as Record<string, unknown>)['@_ID']) ?? '') ?? [],
     ),
-  );
+    ...features.identifiers,
+  ]);
   const program = programsByProfile.get(id);
 
   return {
@@ -976,9 +1143,177 @@ function mapOfacPartySubType(subTypeId: string | undefined, refs: OfacReferenceS
 /** The detail-group values a profile's `<Feature>`s publish, before dedupe and birth pairing. */
 interface OfacFeatureValues {
   addresses: AddressRecord[];
-  datesOfBirth: string[];
+  datesOfBirth: BirthDate[];
+  identifiers: IdentifierRecord[];
   nationalities: string[];
   placesOfBirth: string[];
+}
+
+/**
+ * Feature labels whose text value identifies the party, as a document number
+ * does, rather than describing it (a title, a vessel flag, an aircraft model).
+ * Matched on the label OFAC publishes, never on its numeric type id.
+ */
+const OFAC_IDENTIFIER_FEATURES: ReadonlySet<string> = new Set([
+  'SWIFT/BIC',
+  'Website',
+  'Email Address',
+  'Phone Number',
+  'Vessel Call Sign',
+  'Other Vessel Call Sign',
+  'Aircraft Tail Number',
+  'Previous Aircraft Tail Number',
+  "Aircraft Manufacturer's Serial Number (MSN)",
+  'Aircraft Construction Number (also called L/N or S/N or F/N)',
+  'Aircraft Mode S Transponder Code',
+  'D-U-N-S Number',
+  'BIK (RU)',
+  'ISIN',
+  'Equity Ticker',
+  'MICEX Code',
+  'UN/LOCODE',
+]);
+
+/**
+ * OFAC gives each digital currency its own feature label, the currency code
+ * after this prefix (`Digital Currency Address - XBT`). Matching the prefix lets a
+ * currency OFAC adds later land without a code change, its code kept in the type.
+ */
+const OFAC_DIGITAL_CURRENCY_PREFIX = 'Digital Currency Address - ';
+
+function isOfacIdentifierFeature(label: string): boolean {
+  return (
+    OFAC_IDENTIFIER_FEATURES.has(label) ||
+    (label.startsWith(OFAC_DIGITAL_CURRENCY_PREFIX) &&
+      label.length > OFAC_DIGITAL_CURRENCY_PREFIX.length)
+  );
+}
+
+/**
+ * The identity-document types OFAC publishes — every `IDRegDocType` label in the
+ * `<ReferenceValueSets>` of `SDN_ADVANCED.XML` and `CONS_ADVANCED.XML` as of the
+ * 2026-09-23 publication. The advanced schema resolves these from the document
+ * itself; the standard schema carries no reference sets, so its `idList` is
+ * classified against this list instead. A type OFAC adds later is dropped from
+ * a standard-schema harvest until it is listed here — a missing identifier rather
+ * than a descriptive note presented as one.
+ */
+const OFAC_IDENTITY_DOCUMENT_TYPES: ReadonlySet<string> = new Set([
+  'Afghan Money Service Provider License Number',
+  'Aircraft Serial Identification',
+  'Birth Certificate Number',
+  'Bosnian Personal ID No.',
+  'Branch Unit Number',
+  'British National Overseas Passport',
+  'Business Number',
+  'Business Registration Document #',
+  'Business Registration Number',
+  'C.I.F.',
+  'C.I.N.',
+  'C.R. No.',
+  'C.U.I.',
+  'C.U.I.P.',
+  'C.U.I.T.',
+  'C.U.R.P.',
+  'CNP (Personal Numerical Code)',
+  'Cartilla de Servicio Militar Nacional',
+  'Cedula No.',
+  'Central Registration System Number',
+  'Certificate of Incorporation Number',
+  'Chamber of Commerce Number',
+  'Chinese Commercial Code',
+  "Citizen's Card Number",
+  'Commercial Registry Number',
+  'Company Number',
+  'Credencial electoral',
+  'D.N.I.',
+  'Diplomatic Passport',
+  "Driver's License No.",
+  'Dubai Chamber of Commerce Membership No.',
+  'Economic Register Number (CBLS)',
+  'Electoral Registry No.',
+  'Enterprise Number',
+  'Entity Code',
+  'Federal ID Card',
+  'File Number',
+  'Fiscal Code',
+  'Folio Mercantil No.',
+  'Global Intermediary Identification Number',
+  'Government Gazette Number',
+  'I.F.E.',
+  'Identification Number',
+  'Immigration No.',
+  'Istanbul Chamber of Comm. No.',
+  'Italian Fiscal Code',
+  'Kenyan ID No.',
+  'LE Number',
+  'Legal Entity Number',
+  'License',
+  'MMSI',
+  'MSB Registration Number',
+  'Matricula Mercantil No',
+  'Military Registration Number',
+  'Moroccan Personal ID No.',
+  'N.I.E.',
+  'N.I.F.',
+  'NIT #',
+  'National Foreign ID Number',
+  'National ID No.',
+  'Numero Unico de Identificacao Tributaria (NUIT)',
+  'Numero de Identidad',
+  'Organization Code',
+  'Paraguayan tax identification number',
+  'Passport',
+  'Permit Number',
+  'Personal ID Card',
+  'Pilot License Number',
+  'Public Registration Number',
+  'Public Security and Immigration No.',
+  'R.F.C.',
+  'RFC',
+  'RIF #',
+  'RTN',
+  'RUC #',
+  'Refugee ID Card',
+  'Registered Charity No.',
+  'Registration Certificate Number (Dubai)',
+  'Registration ID',
+  'Registration Number',
+  'Residency Number',
+  'Romanian C.R.',
+  'Romanian Permanent Resident',
+  'Romanian Tax Registration',
+  'Russian State Individual Business Registration Number Pattern (OGRNIP)',
+  'SRE Permit No.',
+  'SSN',
+  "Seafarer's Identification Document",
+  'Serial No.',
+  'Stateless Person ID Card',
+  'Stateless Person Passport',
+  'Tarjeta de Identidad',
+  'Tax ID No.',
+  'Tazkira National ID Card',
+  'Tourism License No.',
+  'Trade License No.',
+  'Trademark number',
+  'Travel Document Number',
+  'Turkish Identification Number',
+  'UAE Identification',
+  'UK Company Number',
+  'US FEIN',
+  'Unified Social Credit Code (USCC)',
+  'United Social Credit Code Certificate (USCCC)',
+  'V.A.T. Number',
+  'Vessel Registration Identification',
+  'VisaNumberID',
+]);
+
+/**
+ * Whether a standard-schema `idList` entry is an identifier the advanced schema
+ * would also read: an identity document or an identifier-class feature.
+ */
+function isOfacStandardIdentifier(idType: string): boolean {
+  return OFAC_IDENTITY_DOCUMENT_TYPES.has(idType) || isOfacIdentifierFeature(idType);
 }
 
 /**
@@ -986,9 +1321,11 @@ interface OfacFeatureValues {
  * feature-type label. A birthdate is a `DatePeriod`; a place of birth is free
  * text in the `VersionDetail`; an address, nationality, or citizenship is a
  * `VersionLocation` resolved through the cross-reference index — a nationality
- * or citizenship target renders to its one country-name part. Every other
- * feature (gender, title, vessel flag, registration country, …) has no
- * normalized field.
+ * or citizenship target renders to its one country-name part. An
+ * identifier-class feature ({@link isOfacIdentifierFeature}) is an identifier
+ * typed by its label verbatim, its `VersionDetail` text the value, with no
+ * country. Every other feature (gender, title, vessel flag, registration
+ * country, …) has no normalized field.
  */
 function extractOfacFeatures(
   profile: Record<string, unknown> | undefined,
@@ -998,12 +1335,13 @@ function extractOfacFeatures(
   const values: OfacFeatureValues = {
     addresses: [],
     datesOfBirth: [],
+    identifiers: [],
     nationalities: [],
     placesOfBirth: [],
   };
   for (const featRaw of asArray(profile?.Feature as unknown)) {
     const feat = featRaw as Record<string, unknown>;
-    const label = refs.featureType.get(asText(feat['@_FeatureTypeID']) ?? '')?.toLowerCase();
+    const label = refs.featureType.get(asText(feat['@_FeatureTypeID']) ?? '');
     for (const versionRaw of asArray(feat.FeatureVersion as unknown)) {
       const version = versionRaw as Record<string, unknown>;
       const locations = elementsAt(version, 'VersionLocation').flatMap((vl) => {
@@ -1012,13 +1350,9 @@ function extractOfacFeatures(
         );
         return location ? [location] : [];
       });
-      switch (label) {
+      switch (label?.toLowerCase()) {
         case 'birthdate': {
-          const date = composeOfacDate(
-            elementsAt(version, 'DatePeriod', 'Start', 'From')[0] as
-              | Record<string, unknown>
-              | undefined,
-          );
+          const date = ofacPeriodDate(elementsAt(version, 'DatePeriod')[0]);
           if (date) values.datesOfBirth.push(date);
           break;
         }
@@ -1034,6 +1368,11 @@ function extractOfacFeatures(
         case 'citizenship country':
           values.nationalities.push(...locations.map((l) => l.full));
           break;
+        default:
+          if (label && isOfacIdentifierFeature(label)) {
+            const value = componentText(version.VersionDetail);
+            if (value) values.identifiers.push({ type: label, value });
+          }
       }
     }
   }
@@ -1053,12 +1392,6 @@ function mapOfacType(t: string | undefined): EntityType {
     default:
       return 'unknown';
   }
-}
-
-/** OFAC remarks embed the designation date; pull an ISO-ish date if present. */
-function extractDateFromRemarks(remarks: string): string | undefined {
-  const m = remarks.match(/(\d{1,2}\s+\w+\s+\d{4})|(\d{4}-\d{2}-\d{2})/);
-  return m ? m[0] : undefined;
 }
 
 // ─── EU (xmlFullSanctionsList_1_1) ──────────────────────────────────────────────
@@ -1137,10 +1470,11 @@ function parseEuEntity(
       'program',
       asText((e.regulation as Record<string, unknown> | undefined)?.['@_programme']),
     ),
-    ...opt(
-      'designationDate',
-      asText((e.regulation as Record<string, unknown> | undefined)?.['@_publicationDate']),
-    ),
+    // The entity's own designation date. The entity-level <regulation> is the
+    // latest act touching the entry (usually an amendment), so its publication
+    // date is not when the entry was designated.
+    ...opt('designationDate', asText(e['@_designationDate'])),
+    ...opt('referenceNumber', asText(e['@_euReferenceNumber'])),
     payload: {
       aliases: nameAliases.slice(1).map((n) => ({
         name: n.name,
@@ -1182,18 +1516,23 @@ function euAddress(element: unknown): AddressRecord[] {
 
 /**
  * An EU `<birthdate>`: the full date, else the year (with the month when the
- * list publishes one), and the birthplace published on the same element. The
- * date and place are one published fact, so they stay one entry.
+ * list publishes one), else the `yearRangeFrom`/`yearRangeTo` range; `circa`
+ * when the element flags the date approximate; and the birthplace published on
+ * the same element. The date and place are one published fact, so they stay one
+ * entry.
  */
 function euBirth(element: unknown): DobRecord[] {
   const year = euText(element, 'year');
   const month = euText(element, 'monthOfYear');
   const date =
-    euText(element, 'birthdate') ?? (year && month ? `${year}-${month.padStart(2, '0')}` : year);
+    euText(element, 'birthdate') ??
+    (year && month ? `${year}-${month.padStart(2, '0')}` : year) ??
+    yearRange(euText(element, 'yearRangeFrom'), euText(element, 'yearRangeTo'));
+  const birth = date ? birthDate(date, euText(element, 'circa') === 'true') : undefined;
   const place = joinParts(
     ['place', 'city', 'region', 'countryDescription'].map((a) => euText(element, a)),
   );
-  return date || place ? [{ ...opt('date', date), ...opt('place', place) } as DobRecord] : [];
+  return birth || place ? [{ ...birth, ...opt('place', place) }] : [];
 }
 
 function mapEuType(code: string | undefined): EntityType {
@@ -1287,6 +1626,8 @@ function parseUkDesignation(
   // Person-only details (dates, birthplaces, nationalities, passports, national
   // IDs) are published under IndividualDetails, never directly on Designation.
   const individuals = elementsAt(d, 'IndividualDetails', 'Individual');
+  // `LastUpdated` is when the record last changed, not when it was designated.
+  const designated = asText(d.DateDesignated);
 
   return {
     id: `uk:${id}`,
@@ -1295,7 +1636,10 @@ function parseUkDesignation(
     entityType: mapUkType(asText(d.IndividualEntityShip ?? d.GroupType)),
     primaryName: primary,
     ...opt('program', asText(d.RegimeName)),
-    ...opt('designationDate', asText(d.DateDesignated ?? d.LastUpdated)),
+    ...opt('designationDate', designated && ukDate(designated)),
+    // The legacy OFSI Group ID. The UK list issues none for a designation made
+    // after 28 Jan 2026, and one Group ID can cover two designations.
+    ...opt('referenceNumber', asText(d.OFSIGroupID)),
     payload: {
       aliases: allNames.slice(1).map((n) => ({
         name: n.name,
@@ -1319,6 +1663,10 @@ function parseUkDesignation(
           'BusinessRegistrationNumber',
         ),
         ...ukIdentifiers('IMO Number', d, 'ShipDetails', 'Ship', 'IMONumbers', 'IMONumber'),
+        // Contact details, labelled as OFAC labels the same values.
+        ...ukIdentifiers('Phone Number', d, 'PhoneNumbers', 'PhoneNumber'),
+        ...ukIdentifiers('Email Address', d, 'EmailAddresses', 'EmailAddress'),
+        ...ukIdentifiers('Website', d, 'Websites', 'Website'),
       ]),
       addresses: dedupe(
         elementsAt(d, 'Addresses', 'Address').flatMap((raw) => {
@@ -1339,7 +1687,7 @@ function parseUkDesignation(
         }),
       ),
       datesOfBirth: birthRecords(
-        textsAt(individuals, 'DOBs', 'DOB'),
+        textsAt(individuals, 'DOBs', 'DOB').map((dob) => ({ date: ukDate(dob) })),
         elementsAt(individuals, 'BirthDetails', 'Location').flatMap((raw) => {
           const l = raw as Record<string, unknown>;
           const place = joinParts([componentText(l.TownOfBirth), componentText(l.CountryOfBirth)]);
@@ -1350,6 +1698,26 @@ function parseUkDesignation(
       ...opt('remarks', asText(d.OtherInformation)),
     },
   };
+}
+
+/**
+ * A UKSL date, published `DD/MM/YYYY`, as ISO 8601. The list writes `dd`, `mm`,
+ * or `00` for a component it does not know; that component is absent, so
+ * `dd/mm/1952` is `1952` and `dd/08/1961` is `1961-08`. A bare year is already
+ * ISO. Any other text — a masked year (`15/08/19yy`), a day with no month, a date
+ * that does not exist — has no ISO form and stays as published.
+ */
+function ukDate(text: string): string {
+  const match = /^(\d{2}|dd)\/(\d{2}|mm)\/(\d{4})$/i.exec(text);
+  if (!match) return text;
+  const [, dd = '', mm = '', year = ''] = match;
+  // `Number` reads a placeholder (`dd`, `mm`, `00`) as NaN or 0 — absent.
+  const day = Number(dd) || undefined;
+  const month = Number(mm) || undefined;
+  if (month === undefined) return day === undefined ? year : text;
+  if (month > 12) return text;
+  if (day === undefined) return `${year}-${mm}`;
+  return day <= daysInMonth(Number(year), month) ? `${year}-${mm}-${dd}` : text;
 }
 
 /**
@@ -1448,14 +1816,14 @@ function parseUnEntry(
     .filter((a) => isUsableName(a.name));
 
   // A BETWEEN date publishes only its year range; it renders as an ISO 8601
-  // interval (`1973/1974`).
+  // interval (`1973/1974`). TYPE_OF_DATE APPROXIMATELY flags the date circa.
   const dates = asArray(e.INDIVIDUAL_DATE_OF_BIRTH).flatMap((d) => {
     const dd = d as Record<string, unknown>;
     const date =
       componentText(dd.DATE) ??
       componentText(dd.YEAR) ??
-      [componentText(dd.FROM_YEAR), componentText(dd.TO_YEAR)].filter(Boolean).join('/');
-    return date ? [date] : [];
+      yearRange(componentText(dd.FROM_YEAR), componentText(dd.TO_YEAR));
+    return date ? [birthDate(date, asText(dd.TYPE_OF_DATE) === 'APPROXIMATELY')] : [];
   });
   const places = asArray(e.INDIVIDUAL_PLACE_OF_BIRTH).flatMap((p) => {
     const pp = p as Record<string, unknown>;
@@ -1472,7 +1840,8 @@ function parseUnEntry(
     entityType,
     primaryName: primary,
     ...opt('program', asText(e.UN_LIST_TYPE)),
-    ...opt('designationDate', asText(e.LISTED_ON)),
+    ...opt('designationDate', unListedOn(asText(e.LISTED_ON))),
+    ...opt('referenceNumber', asText(e.REFERENCE_NUMBER)),
     payload: {
       aliases,
       identifiers: dedupe(
@@ -1503,6 +1872,15 @@ function parseUnEntry(
   };
 }
 
+/**
+ * A UN `LISTED_ON` date without the UTC offset some values carry
+ * (`2015-07-01-04:00` → `2015-07-01`): a calendar date's offset says nothing
+ * about the day. Any other text stays as published.
+ */
+function unListedOn(text: string | undefined): string | undefined {
+  return text?.match(/^(\d{4}-\d{2}-\d{2})(?:Z|[+-]\d{2}:\d{2})$/)?.[1] ?? text;
+}
+
 // ─── Registry + sync factory ─────────────────────────────────────────────────
 
 /** All five sanctions ingesters, configured from the current server config. */
@@ -1528,6 +1906,15 @@ export interface SourceSyncReport extends SourceHarvestReport {
   withheld: number;
 }
 
+/** A source whose harvest failed — reported, then passed over for the rest of the run. */
+export interface SourceSyncFailure {
+  /** Records its harvest accepted before the failure; each full page of them was committed. */
+  accepted: number;
+  /** What ended its harvest. */
+  error: string;
+  source: SourceCode;
+}
+
 /**
  * The largest share of a source's stored designations one run may remove. The
  * completeness check proves a document arrived whole, not that it is the whole
@@ -1544,13 +1931,21 @@ export const MAX_PRUNE_SHARE = 0.5;
 /** Wiring {@link createSanctionsSync} needs from the service that owns the mirror. */
 export interface SanctionsSyncOptions {
   /**
-   * Apply a source's deferred columns once its rows have landed. The runner
-   * persists each yielded page before resuming the generator, so by the time
-   * this is called every row it patches is in the mirror.
+   * Apply a deferring source's columns once its harvest completed: each kept
+   * designation gets its entry in `fields` (keyed by source entry id), or neither
+   * column when the source published none for it. The runner persists each
+   * yielded page before resuming the generator, so every kept row is in the
+   * mirror by the time this is called.
    */
-  applyDeferredFields(source: SourceCode, fields: DeferredDesignationFields): Promise<void>;
+  applyDeferredFields(
+    source: SourceCode,
+    fields: DeferredDesignationFields,
+    kept: ReadonlySet<string>,
+  ): Promise<void>;
   /** Ingesters to harvest. Defaults to {@link buildSanctionsIngesters}. */
   ingesters?: SanctionsIngester[];
+  /** Called once per failed source, after the failure and before the next source starts. */
+  onSourceFailed?(failure: SourceSyncFailure): void;
   /** Called once per source, after its records, deferred columns, and removals are applied. */
   onSourceReport?(report: SourceSyncReport): void;
   /** Designations (or removed ids) per yielded page. Defaults to {@link SYNC_PAGE_SIZE}. */
@@ -1560,6 +1955,11 @@ export interface SanctionsSyncOptions {
    * its current document no longer publishes.
    */
   staleDesignationIds(source: SourceCode, kept: ReadonlySet<string>): Promise<string[]>;
+  /**
+   * The deferred columns the mirror stores for the given designation ids, keyed
+   * by id; an id with no stored row, or none stored, is absent.
+   */
+  storedDeferredFields(ids: readonly string[]): Promise<ReadonlyMap<string, DeferredColumns>>;
 }
 
 /**
@@ -1571,8 +1971,11 @@ export interface SanctionsSyncOptions {
  *
  * After a source drains, its deferred columns (the OFAC programme fields, which
  * the source publishes after every party) are applied to the rows just written.
- * Then the source's stored designations its document no longer published are
- * yielded as tombstones, so a delisting leaves the mirror on the next run.
+ * Until then each page of such a source carries the programme fields the mirror
+ * already stores for its parties, so a harvest that fails after committing pages
+ * leaves them as they were rather than blank. Then the source's stored
+ * designations its document no longer published are yielded as tombstones, so a
+ * delisting leaves the mirror on the next run.
  *
  * Pruning is per source and guarded, because a wrongly-emptied list is the worst
  * failure a screening aid can have. It runs only once the source's harvest has
@@ -1580,20 +1983,46 @@ export interface SanctionsSyncOptions {
  * transfer cut short fails on its missing root close), and was parsed to its end
  * — and only when the removal stays within {@link MAX_PRUNE_SHARE} of the
  * source's stored rows, which also holds back a document that yielded no
- * accepted record. A harvest that throws ends the run before its source prunes.
- * The kept set is the ids the harvest accepted, so a designation the source now
- * publishes only in a form the ingest rejects is removed like a delisted one.
- * That set is the only state the loop keeps per source: one id per published
- * designation.
+ * accepted record. The kept set is the ids the harvest accepted, so a
+ * designation the source now publishes only in a form the ingest rejects is
+ * removed like a delisted one. That set is the only state the loop keeps per
+ * source: one id per published designation.
+ *
+ * A source whose harvest fails keeps the pages it committed, prunes nothing, and
+ * is reported; the run moves on to the next source. After the last one, a run
+ * with any failed source throws one error naming each by its source code, so the
+ * runner records the run as failed and the mirror's completion time — its
+ * as-of — stays at the last run in which every source refreshed. A caller abort
+ * is not a source failure: it ends the whole run at once. It can reach the
+ * harvest as any error (the fetch wraps it), so the signal is what decides.
  *
  * The mirror upserts the `designation` rows and deletes the tombstoned ones; the
  * per-alias `name` index is rebuilt from `designation` afterwards by the
- * service's `rebuildNameIndex()`, which the lifecycle scripts and the refresh
- * cron call. Until then a removed designation's `name` rows join to no
- * `designation` row, so no screen can surface it.
+ * service's `syncSanctions()`, whether the run completed or not. Until then a
+ * removed designation's `name` rows join to no `designation` row, so no screen
+ * can surface it.
  */
 export function createSanctionsSync(options: SanctionsSyncOptions) {
   const pageSize = options.pageSize ?? SYNC_PAGE_SIZE;
+
+  /**
+   * A page as the mirror should hold it until its source completes: a deferring
+   * source's rows carry the programme fields already stored for them.
+   */
+  async function settled(
+    ingester: SanctionsIngester,
+    rows: Record<string, string | number | null>[],
+  ): Promise<Record<string, string | number | null>[]> {
+    if (!ingester.defersFields()) return rows;
+    const stored = await options.storedDeferredFields(rows.map((row) => String(row.id)));
+    for (const row of rows) {
+      const fields = stored.get(String(row.id));
+      row.program = fields?.program ?? null;
+      row.designation_date = fields?.designationDate ?? null;
+    }
+    return rows;
+  }
+
   return async function* sync(ctx: { signal: AbortSignal }): AsyncGenerator<{
     checkpoint?: string;
     records: Record<string, string | number | null>[];
@@ -1601,41 +2030,81 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
   }> {
     const ingesters = options.ingesters ?? buildSanctionsIngesters();
     const stamp = new Date().toISOString();
+    const failures: SourceSyncFailure[] = [];
+
     for (const ingester of ingesters) {
       if (ctx.signal.aborted) return;
-      const kept = new Set<string>();
-      let page: Record<string, string | number | null>[] = [];
-      for await (const designation of ingester.harvest(ctx.signal)) {
-        kept.add(designation.id);
-        page.push(toDesignationRow(designation));
-        if (page.length >= pageSize) {
-          yield { records: page, checkpoint: stamp };
-          page = [];
+      try {
+        const kept = new Set<string>();
+        let page: Record<string, string | number | null>[] = [];
+        for await (const designation of ingester.harvest(ctx.signal)) {
+          kept.add(designation.id);
+          page.push(toDesignationRow(designation));
+          if (page.length >= pageSize) {
+            yield { records: await settled(ingester, page), checkpoint: stamp };
+            page = [];
+          }
         }
-      }
-      // The trailing partial page must be yielded before the deferred columns
-      // are applied — the runner persists a page before resuming this generator,
-      // so this is what puts the source's last rows in reach of the UPDATE.
-      if (page.length > 0) yield { records: page, checkpoint: stamp };
+        // The trailing partial page must be yielded before the deferred columns
+        // are applied — the runner persists a page before resuming this generator,
+        // so this is what puts the source's last rows in reach of the UPDATE.
+        if (page.length > 0) yield { records: await settled(ingester, page), checkpoint: stamp };
 
-      const deferred = ingester.deferredFields();
-      if (deferred.size > 0) await options.applyDeferredFields(ingester.source, deferred);
+        if (ingester.defersFields()) {
+          await options.applyDeferredFields(ingester.source, ingester.deferredFields(), kept);
+        }
 
-      const stale = await options.staleDesignationIds(ingester.source, kept);
-      // Every kept id was just upserted, so the source now stores kept + stale rows.
-      // A document that yielded no record would remove all of them, so it never passes.
-      const withinBound = stale.length <= MAX_PRUNE_SHARE * (kept.size + stale.length);
-      const pruned = withinBound ? stale : [];
-      for (let at = 0; at < pruned.length; at += pageSize) {
-        yield { records: [], tombstones: pruned.slice(at, at + pageSize), checkpoint: stamp };
+        const stale = await options.staleDesignationIds(ingester.source, kept);
+        // Every kept id was just upserted, so the source now stores kept + stale rows.
+        // A document that yielded no record would remove all of them, so it never passes.
+        const withinBound = stale.length <= MAX_PRUNE_SHARE * (kept.size + stale.length);
+        const pruned = withinBound ? stale : [];
+        for (let at = 0; at < pruned.length; at += pageSize) {
+          yield { records: [], tombstones: pruned.slice(at, at + pageSize), checkpoint: stamp };
+        }
+        options.onSourceReport?.({
+          ...ingester.report(),
+          pruned: pruned.length,
+          withheld: stale.length - pruned.length,
+        });
+      } catch (err) {
+        if (ctx.signal.aborted) throw abortedHarvest(ctx.signal, ingester.source, err);
+        const failure: SourceSyncFailure = {
+          source: ingester.source,
+          accepted: ingester.report().accepted,
+          error: err instanceof Error ? err.message : String(err),
+        };
+        failures.push(failure);
+        options.onSourceFailed?.(failure);
       }
-      options.onSourceReport?.({
-        ...ingester.report(),
-        pruned: pruned.length,
-        withheld: stale.length - pruned.length,
-      });
+    }
+
+    if (failures.length > 0) {
+      const codes = failures.map((f) => f.source);
+      throw serviceUnavailable(
+        `Sanctions harvest failed for ${codes.join(', ')} (${failures.length} of ${ingesters.length} sources); nothing was removed for a failed source. ${failures.map((f) => `${f.source}: ${f.error}`).join('; ')}`,
+        { failedSources: codes },
+      );
     }
   };
+}
+
+/**
+ * The error a harvest interrupted by the run's signal ends the run with. A time
+ * bound (a `TimeoutError` reason) is reported as that, naming the source it
+ * stopped in: the fetch it interrupted reports only that it was aborted. Any
+ * other abort is the caller's cancellation and stays as the harvest raised it.
+ */
+function abortedHarvest(signal: AbortSignal, source: SourceCode, err: unknown): unknown {
+  const reason: unknown = signal.reason;
+  if (!(reason instanceof DOMException) || reason.name !== 'TimeoutError') return err;
+  return timeout(
+    `Sanctions harvest of ${source} did not finish. ${reason.message}`,
+    { source },
+    {
+      cause: err,
+    },
+  );
 }
 
 /** Map a normalized designation to its primary-table row (no aux fields). */
@@ -1650,6 +2119,7 @@ export function toDesignationRow(d: NormalizedDesignation): Record<string, strin
     program: d.program ?? null,
     legal_basis: d.legalBasis ?? null,
     designation_date: d.designationDate ?? null,
+    reference_number: d.referenceNumber ?? null,
     payload: JSON.stringify(d.payload),
   };
 }

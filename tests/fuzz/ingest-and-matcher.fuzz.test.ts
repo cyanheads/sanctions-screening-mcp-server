@@ -31,11 +31,13 @@ import {
 import type {
   AddressRecord,
   DesignationPayload,
+  DobRecord,
   IdentifierRecord,
   NormalizedDesignation,
 } from '@/services/screening/types.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
+import { requireCompleteDocument } from '@/services/screening/xml-stream.js';
 import { freshService, type SeededService } from '../services/_helpers.js';
 
 const adversarialStrings = [
@@ -241,7 +243,7 @@ describe('ingest parser fuzz invariants', () => {
     expect(await collect(streamLeiLevel1FromBytes(bytes()))).toHaveLength(0);
   });
 
-  it('resolves OFAC cross-references that exist and drops only the dangling or partial ones', async () => {
+  it('resolves OFAC cross-references, feature identifiers, and birthdates the same buffered and streamed', async () => {
     const random = mulberry32(0x0fac22);
     for (let round = 0; round < 40; round++) {
       const doc = randomOfacCrossReferenceDocument(random);
@@ -264,6 +266,9 @@ describe('ingest parser fuzz invariants', () => {
         );
         expect(designation.payload.identifiers, `round ${round} party ${index}`).toEqual(
           expected?.identifiers,
+        );
+        expect(designation.payload.datesOfBirth, `round ${round} party ${index}`).toEqual(
+          expected?.datesOfBirth,
         );
       }
 
@@ -289,6 +294,64 @@ describe('ingest parser fuzz invariants', () => {
     const first = parseLeiLevel1(parseXml(xml));
     expect(first.map((e) => e.lei)).toEqual(['5493001KJTIIGC8Y1R12']);
     expect(parseLeiLevel1(parseXml(xml))).toEqual(first);
+  });
+});
+
+describe('document completeness fuzzing', () => {
+  it('passes every complete document at any chunking, and fails every cut that ends before its root closes or inside a trailing section', async () => {
+    const random = mulberry32(0xc105ed);
+    for (let round = 0; round < 60; round++) {
+      const doc = randomRootedDocument(random);
+      const size = 1 + Math.floor(random() * 17);
+      expect(await completeness(doc.text, size), `round ${round} chunk ${size}`).toBe('complete');
+      expect(await completeness(doc.text, 65_536), `round ${round}`).toBe('complete');
+
+      for (let cut = 0; cut < doc.text.length; cut++) {
+        const expected = doc.completeCuts.has(cut) ? 'complete' : 'truncated';
+        expect(
+          await completeness(doc.text.slice(0, cut), 65_536),
+          `round ${round} cut ${cut}`,
+        ).toBe(expected);
+      }
+    }
+  });
+});
+
+describe('OFAC standard identifier fuzzing', () => {
+  it('keeps only the identifier classes the advanced schema reads, whatever else idList carries', () => {
+    const random = mulberry32(0x5d11d);
+    const kept = ['Passport', 'Tax ID No.', 'Website', 'Digital Currency Address - ZZZ'];
+    const dropped = [
+      'Gender',
+      'Target Type',
+      'Organization Type:',
+      'Listing Date (EO 99999 Directive 9):',
+      'Aircraft Model',
+      'ID',
+    ];
+    for (let round = 0; round < 200; round++) {
+      const types = Array.from({ length: 1 + Math.floor(random() * 8) }, () => {
+        const pool = random() < 0.4 ? kept : random() < 0.5 ? dropped : null;
+        return pool
+          ? (pool[Math.floor(random() * pool.length)] as string)
+          : randomUnicode(random, 24) || 'Other';
+      });
+      const ids = types
+        .map((type, i) => `<id><idType>${escapeXml(type)}</idType><idNumber>N${i}</idNumber></id>`)
+        .join('');
+      const [record] = parseOfac(
+        parseXml(
+          `<sdnList><sdnEntry><uid>1</uid><lastName>FUZZ CO</lastName><idList>${ids}</idList></sdnEntry></sdnList>`,
+        ),
+        'ofac_sdn',
+      );
+      const expected = types.flatMap((type, i) =>
+        kept.includes(type) ? [{ type, value: `N${i}` }] : [],
+      );
+      expect(record?.payload.identifiers, `round ${round}: ${JSON.stringify(types)}`).toEqual(
+        expected,
+      );
+    }
   });
 });
 
@@ -379,7 +442,10 @@ function oneEditVariants(value: string): string[] {
 
 interface CrossReferenceDocument {
   /** Per party, the detail groups a correct resolution produces. */
-  expected: Pick<DesignationPayload, 'addresses' | 'identifiers' | 'nationalities'>[];
+  expected: Pick<
+    DesignationPayload,
+    'addresses' | 'datesOfBirth' | 'identifiers' | 'nationalities'
+  >[];
   partyIds: string[];
   xml: string;
 }
@@ -387,7 +453,9 @@ interface CrossReferenceDocument {
 /**
  * An OFAC advanced document whose parties point at a random mix of published,
  * never-published, placeholder, and partial `<Location>`s and `<IDRegDocument>`s,
- * with the detail groups a correct resolution yields computed alongside it.
+ * carry a random mix of identifier-class and descriptive text features, and
+ * publish Birthdates in every `DatePeriod` shape OFAC uses — with the detail
+ * groups a correct resolution yields computed alongside it.
  */
 function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceDocument {
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
@@ -490,6 +558,62 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
       if (target && !nationality) addresses.push(target);
     }
 
+    // Text features: identifier-class labels land after the documents, in document
+    // order; a descriptive label, an unresolved type, or an empty value adds nothing.
+    const featureIdentifiers: IdentifierRecord[] = [];
+    const textCount = Math.floor(random() * 4);
+    for (let t = 0; t < textCount; t++) {
+      const value = `V${p}-${Math.floor(random() * 3)}`;
+      const text = (typeId: string, detail: string) =>
+        `<Feature FeatureTypeID="${typeId}"><FeatureVersion><VersionDetail DetailTypeID="1432">${detail}</VersionDetail></FeatureVersion></Feature>`;
+      const kind = pick([
+        'swift',
+        'website',
+        'xbt',
+        'new-currency',
+        'title',
+        'unresolved',
+        'empty',
+      ]);
+      switch (kind) {
+        case 'swift':
+          features.push(text('13', value));
+          featureIdentifiers.push({ type: 'SWIFT/BIC', value });
+          break;
+        case 'website':
+          features.push(text('14', value));
+          featureIdentifiers.push({ type: 'Website', value });
+          break;
+        case 'xbt':
+          features.push(text('344', value));
+          featureIdentifiers.push({ type: 'Digital Currency Address - XBT', value });
+          break;
+        case 'new-currency':
+          features.push(text('4000', value));
+          featureIdentifiers.push({ type: 'Digital Currency Address - NEWC', value });
+          break;
+        case 'title':
+          features.push(text('26', value));
+          break;
+        case 'unresolved':
+          features.push(text('7777', value));
+          break;
+        case 'empty':
+          features.push(
+            '<Feature FeatureTypeID="14"><FeatureVersion><VersionDetail DetailTypeID="1432" /></FeatureVersion></Feature>',
+          );
+          break;
+      }
+    }
+
+    const datesOfBirth: DobRecord[] = [];
+    const birthCount = Math.floor(random() * 3);
+    for (let b = 0; b < birthCount; b++) {
+      const birth = randomOfacBirthdate(random, pick);
+      features.push(birth.xml);
+      datesOfBirth.push(birth.expected);
+    }
+
     const fixedRef = `900${p}`;
     partyIds.push(fixedRef);
     parties.push(
@@ -497,7 +621,8 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
     );
     expected.push({
       addresses: uniqueJson(addresses),
-      identifiers: uniqueJson(identifiers),
+      identifiers: uniqueJson([...identifiers, ...featureIdentifiers]),
+      datesOfBirth: uniqueJson(datesOfBirth),
       nationalities: uniqueJson(nationalities),
     });
   }
@@ -506,7 +631,16 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
     <ReferenceValueSets>
       <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
       <CountryValues>${[...countries].map(([id, name]) => `<Country ID="${id}">${name}</Country>`).join('')}<Country ID="9">undetermined</Country></CountryValues>
-      <FeatureTypeValues><FeatureType ID="10">Nationality Country</FeatureType><FeatureType ID="25">Location</FeatureType></FeatureTypeValues>
+      <FeatureTypeValues>
+        <FeatureType ID="8">Birthdate</FeatureType>
+        <FeatureType ID="10">Nationality Country</FeatureType>
+        <FeatureType ID="13">SWIFT/BIC</FeatureType>
+        <FeatureType ID="14">Website</FeatureType>
+        <FeatureType ID="25">Location</FeatureType>
+        <FeatureType ID="26">Title</FeatureType>
+        <FeatureType ID="344">Digital Currency Address - XBT</FeatureType>
+        <FeatureType ID="4000">Digital Currency Address - NEWC</FeatureType>
+      </FeatureTypeValues>
       <IDRegDocTypeValues><IDRegDocType ID="1570">Passport</IDRegDocType></IDRegDocTypeValues>
       <LocPartTypeValues><LocPartType ID="1">Unknown</LocPartType><LocPartType ID="1451">ADDRESS1</LocPartType><LocPartType ID="1454">CITY</LocPartType><LocPartType ID="1456">POSTAL CODE</LocPartType></LocPartTypeValues>
     </ReferenceValueSets>
@@ -515,6 +649,124 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
     <DistinctParties>${parties.join('')}</DistinctParties>
   </Sanctions>`;
   return { expected, partyIds, xml };
+}
+
+/**
+ * One Birthdate `<Feature>` in a random `DatePeriod` shape OFAC publishes — a day,
+ * a month, a year, a range of day points, of month windows, or of year windows —
+ * each maybe approximate, with the ISO 8601 date a correct read yields.
+ */
+function randomOfacBirthdate(
+  random: () => number,
+  pick: <T>(items: readonly T[]) => T,
+): { expected: DobRecord; xml: string } {
+  const year = 1930 + Math.floor(random() * 60);
+  const month = 1 + Math.floor(random() * 12);
+  const last = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const day = 1 + Math.floor(random() * last);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const iso = (y: number, m: number, d: number) => `${y}-${pad(m)}-${pad(d)}`;
+  const point = (tag: string, ymd: string) => {
+    const [y, m, d] = ymd.split('-');
+    return `<${tag}><Year>${y}</Year><Month>${Number(m)}</Month><Day>${Number(d)}</Day></${tag}>`;
+  };
+  const approximate = random() < 0.3;
+  const period = (start: [string, string], end: [string, string]) =>
+    `<Feature FeatureTypeID="8"><FeatureVersion><DatePeriod CalendarTypeID="1">
+      <Start Approximate="${approximate}">${point('From', start[0])}${point('To', start[1])}</Start>
+      <End Approximate="${approximate}">${point('From', end[0])}${point('To', end[1])}</End>
+    </DatePeriod></FeatureVersion></Feature>`;
+  const later = year + 1 + Math.floor(random() * 3);
+  let xml: string;
+  let date: string;
+  switch (pick(['day', 'month', 'year', 'day-range', 'month-range', 'year-range'])) {
+    case 'day': {
+      const d = iso(year, month, day);
+      xml = period([d, d], [d, d]);
+      date = d;
+      break;
+    }
+    case 'month':
+      xml = period(
+        [iso(year, month, 1), iso(year, month, 1)],
+        [iso(year, month, last), iso(year, month, last)],
+      );
+      date = `${year}-${pad(month)}`;
+      break;
+    case 'year':
+      xml = period([`${year}-01-01`, `${year}-01-01`], [`${year}-12-31`, `${year}-12-31`]);
+      date = String(year);
+      break;
+    case 'day-range': {
+      const from = iso(year, month, day);
+      const to = iso(later, month, 1);
+      xml = period([from, from], [to, to]);
+      date = `${from}/${to}`;
+      break;
+    }
+    case 'month-range': {
+      const endLast = new Date(Date.UTC(later, month, 0)).getUTCDate();
+      xml = period(
+        [iso(year, month, 1), iso(year, month, last)],
+        [iso(later, month, 1), iso(later, month, endLast)],
+      );
+      date = `${year}-${pad(month)}/${later}-${pad(month)}`;
+      break;
+    }
+    default:
+      xml = period([`${year}-01-01`, `${year}-12-31`], [`${later}-01-01`, `${later}-12-31`]);
+      date = `${year}/${later}`;
+  }
+  return { xml, expected: approximate ? { date, circa: true } : { date } };
+}
+
+/** The completeness verdict for `text` fed in `size`-character chunks. */
+async function completeness(text: string, size: number): Promise<'complete' | 'truncated'> {
+  try {
+    for await (const _chunk of requireCompleteDocument(chunks(text, size), 'fuzz'));
+  } catch (err) {
+    expect((err as Error).message, text).toMatch(/truncated|root element/);
+    return 'truncated';
+  }
+  return 'complete';
+}
+
+/**
+ * A random document rooted at `r` (or a namespaced name) with markup, text, and
+ * comment / CDATA / instruction sections in content — every section holding a
+ * decoy root end tag — then the root close, then an epilog of whitespace,
+ * comments, and instructions. `completeCuts` is every prefix length that is a
+ * complete document: the full text and each cut in the epilog that falls outside
+ * a comment or instruction.
+ */
+function randomRootedDocument(random: () => number): { completeCuts: Set<number>; text: string } {
+  const root = random() < 0.5 ? 'r' : 'ns:Root.List';
+  const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+  const dashes = () => '-'.repeat(Math.floor(random() * 4));
+  const content = [
+    () => 'text &amp; more',
+    () => '<a b="1">x</a>',
+    () => '<rr/>',
+    () => `<${root}x/>`,
+    () => `<!-- ${dashes()} </${root}> ${dashes()} -->`,
+    () => `<![CDATA[ ]] </${root}> ] ]]>`,
+    () => `<?pi </${root}> ?>`,
+    () => `</${root}x>`,
+  ];
+  const epilog = [' ', '\n\t', `<!-- ${dashes()} </${root}> -->`, `<?pi </${root}> ??>`];
+  let text = `${random() < 0.5 ? '<?xml version="1.0"?>\n<!-- p -->' : ''}<${root} a="1">`;
+  for (let i = Math.floor(random() * 8); i > 0; i--) text += pick(content)();
+  text += `</${root}${pick(['', ' ', '\n '])}>`;
+  const completeCuts = new Set([text.length]);
+  for (let i = Math.floor(random() * 6); i > 0; i--) {
+    const token = pick(epilog);
+    const whitespace = token.trim() === '';
+    for (let at = 1; at <= token.length; at++) {
+      if (whitespace || at === token.length) completeCuts.add(text.length + at);
+    }
+    text += token;
+  }
+  return { completeCuts, text };
 }
 
 /** Exact-duplicate collapse in first-seen order — the expected-value side of the dedupe rule. */

@@ -1,8 +1,9 @@
 /**
  * @fileoverview `mirror:init` — full out-of-band initialization of the local
  * mirror from the live upstream sources. Harvests all five sanctions lists in
- * full (via the MirrorService `init` sync), rebuilds the per-alias name index,
- * then streams the GLEIF golden copy (Level 1 entities + Level 2 relationships).
+ * full (via the MirrorService `init` sync), rebuilds the per-alias name index and
+ * the identifier index, then streams the GLEIF golden copy (Level 1 entities +
+ * Level 2 relationships).
  * Hours-long and safe to re-run: an interrupted run starts over, and a re-run
  * over a populated mirror removes what each list no longer publishes, as a
  * refresh does. Never run on the request path. Set
@@ -24,7 +25,8 @@ import {
   streamLeiLevel2,
 } from '@/services/screening/gleif-ingest.js';
 import { createRejections } from '@/services/screening/ingest-validation.js';
-import { bootstrap, ingestInBatches, longRunSignal } from './_mirror-context.js';
+import { longRunSignal } from '@/services/screening/sanctions-refresh.js';
+import { bootstrap, ingestInBatches } from './_mirror-context.js';
 
 /** Records per ingest batch for the streaming golden-copy load. */
 const GLEIF_INGEST_BATCH = 10_000;
@@ -34,17 +36,15 @@ async function main(): Promise<void> {
   const signal = longRunSignal(8);
 
   log.info('mirror:init — harvesting sanctions lists (full)', ctx);
-  const sanctions = await service.designations.runSync({ mode: 'init', signal });
+  const sanctions = await service.syncSanctions('init', signal);
   log.info(
-    'mirror:init — sanctions harvest complete',
+    'mirror:init — sanctions harvest complete, name and identifier indexes rebuilt',
     withExtra(ctx, {
       records: sanctions.recordsApplied,
       removed: sanctions.tombstonesApplied,
       total: sanctions.total,
     }),
   );
-  await service.rebuildNameIndex();
-  log.info('mirror:init — name index rebuilt', ctx);
 
   if (process.env.SANCTIONS_INIT_SKIP_GLEIF === '1') {
     log.notice(
