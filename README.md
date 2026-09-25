@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -93,14 +93,18 @@ All resource data is also reachable through the tools, for clients that don't su
 
 ### `sanctions_resolve_entity` <sub>tool</sub>
 
-- `name` in any script (same bound as `sanctions_screen_name`) plus optional ISO 3166-1 alpha-2 `jurisdiction`, `status` (`issued` default, `lapsed`, `any`), and `minScore`; same `matchMode` behavior as `sanctions_screen_name`; up to 50 candidates per page (`limit`, default 10) with `offset`
-- Candidates carry `lei`, `legalName`, the `matchedName` (legal or other/trading name), and `matchType`, with `score` and `queryTokenCoverage` on approximate matches; paged by the same `totalAvailable` / `totalAvailableBasis` / `hasMore` / `nextOffset` fields
+- `name` in any script (same bound as `sanctions_screen_name`) plus optional `jurisdiction`, `status`, and `minScore`; same `matchMode` behavior as `sanctions_screen_name`; up to 50 candidates per page (`limit`, default 10) with `offset`
+- `jurisdiction` is a country code, which matches the country and every subdivision under it (`US` matches `US-DE` and `US-CA`), or an ISO 3166-2 subdivision code (`US-DE`), matched exactly; case-insensitive
+- `status`: `issued` (default) matches `ISSUED`, `lapsed` matches exactly `LAPSED`, and `any` applies no filter — the only way to reach `RETIRED`, `DUPLICATE`, `ANNULLED`, `PENDING_TRANSFER`, `PENDING_ARCHIVAL`, or `MERGED` records, each candidate's `status` naming its state
+- Searches every name GLEIF publishes: the legal name, previous legal names, trading names, alternative-language legal names, and ASCII transliterations of a legal name in another script
+- Candidates carry `lei`, `legalName`, the `matchedName` and its `matchedNameType` (`LEGAL_NAME`, `PREVIOUS_LEGAL_NAME`, `TRADING_OR_OPERATING_NAME`, …, or `UNKNOWN` for a name stored without a type), and `matchType`, with `score` and `queryTokenCoverage` on approximate matches; one candidate per LEI, paged by the same `totalAvailable` / `totalAvailableBasis` / `hasMore` / `nextOffset` fields
 
 ---
 
 ### `sanctions_get_entity` <sub>tool</sub>
 
-- One 20-character `lei`; returns legal and other names, legal and headquarters addresses, `status`, `jurisdiction`, registration authority, and `lastUpdate`
+- One 20-character `lei`; returns the legal name, `otherNames`, legal and headquarters addresses, `status`, `jurisdiction`, registration authority, and `lastUpdate`
+- `alternateNames` lists every other and transliterated name with its GLEIF type; a name the mirror stored before types were kept reads as `UNKNOWN`
 - `sanctionsHits` screens the legal name against every watchlist, strict-only and capped at 25; `screeningStatus` (`screened` / `not_ready`) says whether that screen ran, and `sanctionsScreen.hasMore` flags a capped list
 
 ---
@@ -108,7 +112,8 @@ All resource data is also reachable through the tools, for clients that don't su
 ### `sanctions_trace_ownership` <sub>tool</sub>
 
 - Root `lei`, `direction` (`parents` / `children` / `both`, default `both`), and `depth` 1–5 (default 3); `screenNodes: true` screens every node's legal name, strict-only, up to 10 hits per node
-- `nodes` (with `role` and `depth`) and `edges` (with `relationshipType`); `complete` is false when the graph is `truncated` at the depth limit or `missingEntityLeis` lists nodes with no Level 1 record
+- `nodes` (with `role` and `depth`) and `edges` (with `relationshipType`); `complete` is false when the graph is `truncated` at the depth limit or `missingEntityLeis` lists nodes with no Level 1 record. It covers the loaded relationships only, and most entities publish no parent relationship.
+- Each node whose parents the walk read carries `parentStatus.direct` / `.ultimate`: `relationship`, `exception` (a GLEIF reporting exception, with every reason, such as `NATURAL_PERSONS`), `none`, or `unknown`. `unknown` means exception data is not loaded, which `reportingExceptionsLoaded: false` states.
 - `screeningStatus` (`screened` / `not_requested` / `not_ready`), `screenedNodeCount`, and `flaggedNodeCount`; each screened node reports its own `sanctionsScreen.hasMore`
 
 ---
@@ -117,6 +122,7 @@ All resource data is also reachable through the tools, for clients that don't su
 
 - No input; one row per sanctions list plus `gleif`, each with `recordCount`, `url`, and `license`
 - `sanctionsReady` / `sanctionsAsOf` and `leiReady` / `leiAsOf` report whether each mirror has synced and when; `sanctionsAsOf` is the last sync in which every sanctions list refreshed. Not gated on readiness, so it reports an empty mirror instead of failing
+- `reportingExceptionsLoaded`, and on the `gleif` row a `reportingExceptionCount` once the reporting exceptions are loaded
 
 ---
 
@@ -143,8 +149,8 @@ All resource data is also reachable through the tools, for clients that don't su
 
 ### `sanctions_vet_counterparty` <sub>prompt</sub>
 
-- Arguments: `name` required; `jurisdiction` (ISO 3166-1 alpha-2) optional
-- Returns one user message that screens the name (and any identifier the caller holds, with `sanctions_screen_identifier`), resolves it to an LEI, traces ownership with `screenNodes: true`, pulls each hit's designation record, and asks for a summary that treats every match as a candidate to verify
+- Arguments: `name` required; `jurisdiction` optional (a country code, which includes its subdivisions, or an ISO 3166-2 subdivision code)
+- Returns one user message that screens the name (and any identifier the caller holds, with `sanctions_screen_identifier`), resolves it to an LEI, traces ownership with `screenNodes: true`, pulls each hit's designation record, and asks for a summary that treats every match as a candidate to verify. It names GLEIF parents as accounting-consolidation parents, not beneficial owners, and reports a reporting exception's reasons rather than reading it as "no parent"
 
 ## Features
 
@@ -162,7 +168,7 @@ Agent-friendly output:
 
 - Real signal with provenance: approximate hits carry the raw Jaro-Winkler `score` and a literal `queryTokenCoverage` count, never a blended confidence; every hit names its list, program, designation date, and the name that matched, typed `primary` / `aka` / `fka` / `low-quality-aka`
 - Decision-support `caveat` in the output of `sanctions_screen_name`, `sanctions_screen_identifier`, `sanctions_get_designation`, `sanctions_get_entity`, and `sanctions_trace_ownership`
-- Disclosed gaps: `totalAvailableBasis`, `screeningStatus`, and `complete` / `truncated` / `missingEntityLeis` say what a response did not cover
+- Disclosed gaps: `totalAvailableBasis`, `screeningStatus`, `complete` / `truncated` / `missingEntityLeis`, and each node's `parentStatus` say what a response did not cover
 - Typed errors: every tool and resource except the sources listing fails as `mirror_not_ready` (retryable) until its mirror is loaded; unknown IDs fail as `designation_not_found` or `lei_not_found`, and a reference number two designations share as `reference_ambiguous`; a name with no letter or digit fails as `name_not_searchable`, one past the length bound as `name_too_long`, and an identifier with nothing left once spacing and separators are removed as `identifier_not_searchable`
 
 ## Getting started
@@ -272,7 +278,8 @@ Every source is keyless, so nothing here is required.
 | Variable | Description | Default |
 |:---|:---|:---|
 | `SANCTIONS_MIRROR_PATH` | Filesystem path for the SQLite mirror; use a persistent volume when hosted. | `./data/sanctions.db` |
-| `SANCTIONS_REFRESH_CRON` | Cron for the scheduled sanctions-list refresh (HTTP transport only). GLEIF deltas are applied manually with `mirror:refresh`. | `0 4 * * *` |
+| `SANCTIONS_REFRESH_CRON` | Cron for the scheduled refresh (HTTP transport only). It refreshes the sanctions lists, then applies the GLEIF delta windows the checkpoint calls for, under one 4-hour bound. A GLEIF gap that needs `mirror:init` is logged, never loaded in-process. | `0 4 * * *` |
+| `SANCTIONS_REFRESH_SKIP_GLEIF` | Set to `1` to skip the GLEIF leg of the scheduled refresh and of `mirror:refresh`. | unset |
 | `SANCTIONS_FUZZY_MIN_SCORE` | Jaro-Winkler floor for fuzzy matches when `minScore` is omitted. | `0.85` |
 | `SANCTIONS_FUZZY_MAX_RESULTS` | Cap on fuzzy candidates scored per query. | `50` |
 | `OFAC_SDN_URL` | OFAC SDN advanced-XML URL. | official OFAC URL |
@@ -318,16 +325,18 @@ The mirror loads out-of-band, never on the request path.
 
 | Script | Purpose |
 |:---|:---|
-| `bun run mirror:init` | Full load: all five sanctions lists, the name and identifier indexes, then the GLEIF golden copy (Level 1 + Level 2). Safe to re-run; an interrupted run starts over. Set `SANCTIONS_INIT_SKIP_GLEIF=1` to load the sanctions lists only. |
-| `bun run mirror:refresh` | Re-harvest the sanctions lists, removing designations a list's complete document no longer publishes (at most half of a list per run), and apply the last day of GLEIF deltas. The sanctions half also runs on `SANCTIONS_REFRESH_CRON` under HTTP, bounded at 4 hours like this script. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to skip the deltas. |
-| `bun run mirror:verify` | Report mirror readiness and per-source record counts. |
+| `bun run mirror:init` | Full load: all five sanctions lists, the name and identifier indexes, then the GLEIF golden copies (Level 1 with its name index, Level 2, and reporting exceptions), recording each file's `ContentDate` as the GLEIF checkpoint. Safe to re-run; an interrupted run starts over. Set `SANCTIONS_INIT_SKIP_GLEIF=1` to load the sanctions lists only. |
+| `bun run mirror:refresh` | Re-harvest the sanctions lists, removing designations a list's complete document no longer publishes (at most half of a list per run). Then bring GLEIF current from its checkpoint: per dataset, the smallest delta window (`IntraDay` to `LastMonth`) that reaches back to the last file applied, deletions included. Reporting exceptions with no recorded load get their golden copy. The same refresh runs on `SANCTIONS_REFRESH_CRON` under HTTP (deltas only), bounded at 4 hours like this script. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to skip GLEIF. |
+| `bun run mirror:verify` | Report mirror readiness, per-source record counts, the GLEIF Level 1 / Level 2 / reporting-exception counts, whether GLEIF alternate names are indexed, and the GLEIF checkpoint. |
 | `bun run mirror:seed` | Load a small synthetic fixture for local smoke tests, with no downloads. |
 
-A list that fails to download or arrives truncated keeps its stored rows and removes nothing, while every other list still refreshes and the name and identifier indexes are rebuilt; the run then exits non-zero naming each failed list (`ofac_sdn`, `eu`, …) and stops before GLEIF. `sanctionsAsOf` advances only on a run in which every list refreshed, and a first `mirror:init` with a failed list leaves the mirror not ready.
+A list that fails to download or arrives truncated keeps its stored rows and removes nothing, while every other list still refreshes and the name and identifier indexes are rebuilt. GLEIF still refreshes after it, and the run then exits non-zero naming each failed list (`ofac_sdn`, `eu`, …). `sanctionsAsOf` advances only on a run in which every list refreshed, and a first `mirror:init` with a failed list leaves the mirror not ready.
+
+GLEIF advances all at once or not at all. `leiAsOf` and the checkpoint move only after every dataset's covering delta has applied, so an interrupted refresh leaves both where they were, and the next run re-applies from the same point. Two cases apply nothing to GLEIF, leave `leiAsOf` unchanged, and exit non-zero naming `mirror:init`: a checkpoint older than the one-month window, and a mirror with no checkpoint. Every mirror written by 0.3.0 or earlier has no checkpoint, so run `mirror:init` once after upgrading. Until then, traces read unpublished parents as `unknown`, and `sanctions_resolve_entity` searches legal names only, with a notice saying alternate names are not yet indexed: 0.3.0 stored other names without their types and no transliterated names at all, so the name index is built from the golden copy `mirror:init` loads, never from the stored rows. Every GLEIF write after that keeps the index current. A GLEIF write by an earlier release, after a rollback, leaves it behind, and resolution returns to legal names and the notice until the next `mirror:init`.
 
 A mirror written by an earlier release upgrades in place on first open: the `designation` table gains its `reference_number` column, and the identifier index is built from the stored records before the first lookup, so `sanctions_screen_identifier` answers from a populated mirror without a re-init. What the earlier release did not read — reference numbers, the OFAC and UK identifiers beyond identity documents, and dates at published precision — arrives with the next sanctions refresh, so run `mirror:refresh` after upgrading rather than waiting for the cron. The index is also rebuilt on open whenever a sync it did not follow has changed the stored records, such as one an earlier release ran after a rollback.
 
-Every leg of `mirror:init` streams in bounded batches, so peak memory tracks the batch size, not the source size. The sanctions XML totals about 172 MB; the GLEIF Level 1 golden copy is about 3.3M records (~892 MB compressed) and dominates disk use.
+Every leg of `mirror:init` and `mirror:refresh` streams in bounded batches, so peak memory tracks the batch size, not the source size. The sanctions XML totals about 172 MB. The GLEIF Level 1 golden copy is about 3.4M records (~890 MB compressed) and dominates disk use; its name index (~4M names) adds about 0.8 GB of that. The reporting exceptions add about 6.4M rows (~525 MiB on disk).
 
 ### Docker
 

@@ -2,7 +2,7 @@
 
 **Server:** sanctions-screening-mcp-server
 **Version:** 0.3.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.6`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.7`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0 (via the framework)
 **Zod:** ^4.6.5
@@ -17,7 +17,7 @@ Entity screening and resolution over the world's open sanctions data plus the gl
 
 **Screening aid, not a compliance determination.** Every tool returns *potential matches* with a transparent score and source provenance — never a verdict. This framing is load-bearing: it lives in `SCREENING_CAVEAT` (`src/mcp-server/tools/definitions/_shared.ts`), in every screening tool's description, and in its output. A hit is a candidate to verify against the official source; an empty result is never a clearance. Preserve it in any edit to the surface.
 
-**The data path is a local mirror, not a live API.** All five sources are bulk, keyless, and clear for redistribution. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys) and a per-identifier `designation_identifier` index, and a GLEIF `lei_entity` mirror with a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
+**The data path is a local mirror, not a live API.** All five sources are bulk, keyless, and clear for redistribution. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys) and a per-identifier `designation_identifier` index, and a GLEIF `lei_entity` mirror with a per-name `lei_name` index (legal, other, and transliterated names, typed) and a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
 
 **Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in or auto-on-empty. Surface only real signal: `matchType` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains. Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
 
@@ -131,10 +131,10 @@ import { prompt, z } from '@cyanheads/mcp-ts-core';
 
 export const vetCounterpartyPrompt = prompt('sanctions_vet_counterparty', {
   title: 'sanctions-screening-mcp-server: vet counterparty',
-  description: 'Structure a full counterparty due-diligence pass: resolve the name to an LEI, pull the ownership tree, screen the named entity and every beneficial owner, and summarize hits with provenance and the decision-support caveat.',
+  description: 'Structure a full counterparty due-diligence pass: resolve the name to an LEI, pull its GLEIF ownership graph, screen the named entity and every parent and subsidiary in that graph, and summarize hits with provenance and the decision-support caveat.',
   args: z.object({
     name: z.string().describe('The counterparty name to vet (person or organization).'),
-    jurisdiction: z.string().optional().describe('Optional ISO 3166-1 alpha-2 jurisdiction to disambiguate (e.g. "US").'),
+    jurisdiction: z.string().optional().describe('Optional jurisdiction: a country code, which includes its subdivisions ("US"), or an ISO 3166-2 subdivision code ("US-DE").'),
   }),
   generate: (args) => [
     { role: 'user', content: { type: 'text', text: `Run a counterparty due-diligence pass on "${args.name}". Screen the name, resolve it to an LEI, trace ownership with screenNodes:true, then summarize every potential match as a candidate to verify — never a determination.` } },
@@ -287,9 +287,10 @@ src/
   services/
     screening/
       screening-service.ts              # Owns the local mirrors + matching engine (init/accessor pattern)
-      schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_relationship schema + MirrorService defs + the v2 migration
+      schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_name/lei_relationship schema + MirrorService defs + the v2 migration
       sanctions-ingest.ts               # OFAC/EU/UK/UN streaming ingesters (record-at-a-time XML → normalized designations)
-      gleif-ingest.ts                   # GLEIF harvest — streaming golden-copy init + buffered deltas (L1/L2 records)
+      gleif-ingest.ts                   # GLEIF files — publication index, header-first streaming of L1/L2/reporting-exception files, deletion markers
+      gleif-sync.ts                     # GLEIF lifecycles — golden-copy load + checkpointed delta refresh (window per dataset, one commit)
       ingest-validation.ts              # Shared drop predicate + per-source rejection tally — no source identity or no usable name means no row
       text-matching.ts                  # Fold/tokenize, Jaro-Winkler, Double-Metaphone
       identifier-matching.ts            # Identifier label → category table + per-category exact-match keys (IMO, BIC8, wallet case by shape)
@@ -298,7 +299,7 @@ src/
       xml.ts                            # Attribute-preserving XML parser (fast-xml-parser wrapper)
       xml-stream.ts                     # UTF-8 stream decoder + record-boundary scanner (bounds every ingest) + root-close check
       source-fetch.ts                   # Streamed source download — 120 s headers bound, body bounded only by the run's signal
-      sanctions-refresh.ts              # HTTP refresh cron job + the long-run time bound every sanctions sync runs under
+      sanctions-refresh.ts              # The refresh run (sanctions, then GLEIF deltas), its HTTP cron job, and the long-run time bound
   mcp-server/
     tools/definitions/
       *.tool.ts                         # Seven tools (screen-name, screen-identifier, get-designation, resolve-entity, get-entity, trace-ownership, list-sources)
@@ -397,9 +398,9 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run test:coverage` | Run the Vitest suite with istanbul coverage |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
-| `bun run mirror:init` | Full out-of-band initial load of all sources (sanctions lists + GLEIF golden copy). Hours-long and safe to re-run (an interrupted run starts over); never on the request path. |
-| `bun run mirror:refresh` | Re-harvest sanctions lists, removing what a list's complete document no longer publishes, and apply GLEIF deltas. The sanctions half also runs on a cron under HTTP. |
-| `bun run mirror:verify` | Report mirror readiness and per-source record counts. |
+| `bun run mirror:init` | Full out-of-band initial load of all sources (sanctions lists + GLEIF golden copies, recording the GLEIF checkpoint). Hours-long and safe to re-run (an interrupted run starts over); never on the request path. |
+| `bun run mirror:refresh` | Re-harvest sanctions lists, removing what a list's complete document no longer publishes, then apply the GLEIF delta windows the checkpoint calls for. Exits non-zero naming `mirror:init` when a GLEIF gap cannot be covered. The same run is the HTTP cron (GLEIF deltas only). |
+| `bun run mirror:verify` | Report mirror readiness, per-source record counts, GLEIF counts, and the GLEIF checkpoint. |
 | `bun run mirror:seed` | Load a small synthetic fixture for local smoke tests (no downloads). |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
