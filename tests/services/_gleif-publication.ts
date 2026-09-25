@@ -218,7 +218,7 @@ export interface GleifStandIn {
  */
 export async function startGleifStandIn(): Promise<GleifStandIn> {
   let files: Partial<Record<Dataset, DatasetFiles>> = {};
-  let overrides: Record<string, Body> = {};
+  let overrides = new Map<string, Body>();
   const requested: string[] = [];
   let base = '';
   const server: Server = createServer((req, res) => {
@@ -250,7 +250,7 @@ export async function startGleifStandIn(): Promise<GleifStandIn> {
       return;
     }
     const file = path.match(/^\/files\/(lei2|rr|repex)-(\w+)\.xml$/);
-    const override = overrides[path];
+    const override = overrides.get(path);
     if (override) {
       if (typeof override === 'string') {
         res.writeHead(200, { 'content-type': 'application/xml' }).end(override);
@@ -281,7 +281,7 @@ export async function startGleifStandIn(): Promise<GleifStandIn> {
     requested,
     serve(next, nextOverrides = {}) {
       files = next;
-      overrides = nextOverrides;
+      overrides = new Map(Object.entries(nextOverrides));
     },
     async close() {
       server.closeAllConnections();
