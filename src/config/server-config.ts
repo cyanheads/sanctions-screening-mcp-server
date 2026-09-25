@@ -32,7 +32,7 @@ const ServerConfigSchema = z.object({
     .string()
     .default('0 4 * * *')
     .describe(
-      'Cron for the scheduled refresh of the sanctions lists + name index (HTTP transport only). GLEIF deltas are not applied on the cron — refresh them manually with mirror:refresh.',
+      'Cron for the scheduled sanctions refresh (HTTP transport only). Each run re-harvests the sanctions lists and rebuilds the name and identifier indexes under a 4-hour time bound. GLEIF deltas are not applied on the cron — refresh them manually with mirror:refresh.',
     ),
   fuzzyMinScore: z.coerce
     .number()
