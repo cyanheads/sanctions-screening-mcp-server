@@ -13,11 +13,11 @@
 
 ## What This Server Is
 
-Entity screening and resolution over the world's open sanctions data plus the global legal-entity registry, served offline. It screens a name against the consolidated OFAC (SDN + Consolidated), EU, UK (UKSL), and UN sanctions lists at once, and resolves legal entities against the GLEIF LEI database with corporate-ownership tracing.
+Entity screening and resolution over the world's open sanctions data plus the global legal-entity registry, served offline. It screens a name — or looks up an identifier such as an IMO number, SWIFT/BIC code, wallet address, or document number exactly — against the consolidated OFAC (SDN + Consolidated), EU, UK (UKSL), and UN sanctions lists at once, and resolves legal entities against the GLEIF LEI database with corporate-ownership tracing.
 
 **Screening aid, not a compliance determination.** Every tool returns *potential matches* with a transparent score and source provenance — never a verdict. This framing is load-bearing: it lives in `SCREENING_CAVEAT` (`src/mcp-server/tools/definitions/_shared.ts`), in every screening tool's description, and in its output. A hit is a candidate to verify against the official source; an empty result is never a clearance. Preserve it in any edit to the surface.
 
-**The data path is a local mirror, not a live API.** All five sources are bulk, keyless, and clear for redistribution. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys), and a GLEIF `lei_entity` mirror with a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
+**The data path is a local mirror, not a live API.** All five sources are bulk, keyless, and clear for redistribution. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys) and a per-identifier `designation_identifier` index, and a GLEIF `lei_entity` mirror with a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
 
 **Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in or auto-on-empty. Surface only real signal: `matchType` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains. Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
 
@@ -287,18 +287,21 @@ src/
   services/
     screening/
       screening-service.ts              # Owns the local mirrors + matching engine (init/accessor pattern)
-      schema.ts                         # Normalized designation/name/lei_entity/lei_relationship schema + MirrorService defs
+      schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_relationship schema + MirrorService defs + the v2 migration
       sanctions-ingest.ts               # OFAC/EU/UK/UN streaming ingesters (record-at-a-time XML → normalized designations)
       gleif-ingest.ts                   # GLEIF harvest — streaming golden-copy init + buffered deltas (L1/L2 records)
       ingest-validation.ts              # Shared drop predicate + per-source rejection tally — no source identity or no usable name means no row
       text-matching.ts                  # Fold/tokenize, Jaro-Winkler, Double-Metaphone
+      identifier-matching.ts            # Identifier label → category table + per-category exact-match keys (IMO, BIC8, wallet case by shape)
       types.ts                          # Source codes, labels, domain types
       fixtures.ts                       # Synthetic fixture for mirror:seed / tests
       xml.ts                            # Attribute-preserving XML parser (fast-xml-parser wrapper)
-      xml-stream.ts                     # UTF-8 stream decoder + record-boundary scanner (bounds every ingest)
+      xml-stream.ts                     # UTF-8 stream decoder + record-boundary scanner (bounds every ingest) + root-close check
+      source-fetch.ts                   # Streamed source download — 120 s headers bound, body bounded only by the run's signal
+      sanctions-refresh.ts              # HTTP refresh cron job + the long-run time bound every sanctions sync runs under
   mcp-server/
     tools/definitions/
-      *.tool.ts                         # Six tools (screen-name, get-designation, resolve-entity, get-entity, trace-ownership, list-sources)
+      *.tool.ts                         # Seven tools (screen-name, screen-identifier, get-designation, resolve-entity, get-entity, trace-ownership, list-sources)
       _shared.ts                        # SCREENING_CAVEAT (load-bearing decision-support caveat)
     resources/definitions/
       *.resource.ts                     # Three URI mirrors (designation, entity, sources)

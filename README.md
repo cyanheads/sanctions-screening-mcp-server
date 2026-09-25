@@ -1,7 +1,7 @@
 <div align="center">
   <h1>@cyanheads/sanctions-screening-mcp-server</h1>
   <p><b>Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, fuzzy-matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.</b>
-  <div>6 Tools • 3 Resources • 1 Prompt</div>
+  <div>7 Tools • 3 Resources • 1 Prompt</div>
   </p>
 </div>
 
@@ -39,7 +39,8 @@ Sanctions screening and legal-entity resolution over the consolidated OFAC, EU, 
 | Tool | Description |
 |:---|:---|
 | `sanctions_screen_name` | Screen a person, company, vessel, or aircraft name against every loaded watchlist at once |
-| `sanctions_get_designation` | Fetch the full record for one designation by source list and entry ID |
+| `sanctions_screen_identifier` | Look up an IMO number, SWIFT/BIC code, wallet address, or passport or national ID number exactly across every loaded watchlist |
+| `sanctions_get_designation` | Fetch the full record for one designation by source list and entry ID or published reference number |
 | `sanctions_resolve_entity` | Resolve a company name, optionally within a jurisdiction, to ranked GLEIF LEI candidates |
 | `sanctions_get_entity` | Fetch the GLEIF Level 1 record for an LEI, with a sanctions screen of its legal name |
 | `sanctions_trace_ownership` | Trace an LEI's parents and children, optionally screening every entity in the graph |
@@ -49,9 +50,9 @@ Sanctions screening and legal-entity resolution over the consolidated OFAC, EU, 
 
 | Resource | Description |
 |:---|:---|
-| `sanctions://designation/{source}/{entryId}` | One sanctions designation by source and entry ID |
+| `sanctions://designation/{source}/{entryId}` | One sanctions designation by source and entry ID or published reference number |
 | `sanctions://entity/{lei}` | One GLEIF Level 1 entity by LEI |
-| `sanctions://sources` | Loaded sources with counts and refresh timestamps |
+| `sanctions://sources` | Loaded sources with counts, plus each mirror's readiness and as-of timestamp |
 
 All resource data is also reachable through the tools, for clients that don't surface resources.
 
@@ -66,15 +67,27 @@ All resource data is also reachable through the tools, for clients that don't su
 ### `sanctions_screen_name` <sub>tool</sub>
 
 - `name` in any script (at most 64 words and 1,024 characters) plus optional `sources`, `entityType`, and `minScore` filters; `matchMode` is `strict` (default) or `fuzzy`, and strict falls back to fuzzy when it finds nothing; up to 100 hits per page (`limit`, default 25) with `offset`
-- Hits carry `source`, `sourceEntryId`, `matchedName` with its `matchedNameType`, and `matchType` (`exact` / `strong` / `approximate`); approximate hits add the raw Jaro-Winkler `score` (0–1) and `queryTokenCoverage`
+- Hits carry `source`, `sourceEntryId`, the list's published `referenceNumber` where it has one, `matchedName` with its `matchedNameType`, and `matchType` (`exact` / `strong` / `approximate`); approximate hits add the raw Jaro-Winkler `score` (0–1) and `queryTokenCoverage`
 - `totalAvailable`, `hasMore`, and `nextOffset` page the rest; `totalAvailableBasis` marks the count `exact` or a `lower_bound`
+
+---
+
+### `sanctions_screen_identifier` <sub>tool</sub>
+
+- `value` (an identifier as you hold it) plus optional `type` (`any` default, `imo`, `swift_bic`, `digital_currency_address`, `passport`, `national_id`) and `sources`
+- Exact match after normalization, never fuzzy and never scored: spacing, letter case, and `-` `.` `/` are ignored; an IMO number matches with or without its `IMO` prefix; a SWIFT/BIC compares on its first eight characters, so a branch BIC11 matches its institution's BIC8; a wallet address folds case only for hex (`0x…`), bech32 (`bc1…`, `ltc1…`, `bnb1…`), and cashaddr encodings, while base58 addresses compare exactly
+- `type` matches on each list's published label: `imo` is OFAC `Vessel Registration Identification`, UK `IMO Number`, and EU `IMO (vessel identification)`; `swift_bic` is `SWIFT/BIC` and `SWIFT BIC`; `digital_currency_address` is OFAC `Digital Currency Address - <code>`; `passport` and `national_id` cover the lists' passport and national-ID labels. `any` also reaches every label with no category (MMSI, call signs, tail numbers, tax and registration numbers, email, websites)
+- One hit per designation, ordered by list then entry ID, each with the `matchedIdentifiers` that matched as published; not paged. An identifier a list prints only in free-text remarks, or bundled with other numbers in one field, does not match
 
 ---
 
 ### `sanctions_get_designation` <sub>tool</sub>
 
-- `source` (`ofac_sdn`, `ofac_consolidated`, `eu`, `uk`, `un`) and `entryId`, the `sourceEntryId` from a screening hit
+- `source` (`ofac_sdn`, `ofac_consolidated`, `eu`, `uk`, `un`) and `entryId`: the `sourceEntryId` from a screening hit, or the reference number the list publishes (UN `QDe.004`, EU `EU.27.28`, UK OFSI Group ID `14196`). Matched trimmed and case-insensitive, entry ID first; a reference number two designations share fails as `reference_ambiguous`, naming both
+- Returns `referenceNumber` beside `sourceEntryId` where the list publishes one; OFAC publishes none, its entry ID being its published number
 - All published aliases, identifiers, addresses, dates and places of birth, nationalities, program, legal basis, and designation date; a field the source omitted is absent, never filled in
+- Identifiers cover identity documents plus the SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, and websites a list publishes, each typed with the list's own label and its value verbatim
+- Dates of birth are ISO 8601 at the precision the source published (`1952-10-07`, `1946-08`, `1938`, or an interval such as `1955/1957`), with `circa: true` where the source marks one approximate; `designationDate` is the source's own designation date as `YYYY-MM-DD`
 
 ---
 
@@ -103,13 +116,13 @@ All resource data is also reachable through the tools, for clients that don't su
 ### `sanctions_list_sources` <sub>tool</sub>
 
 - No input; one row per sanctions list plus `gleif`, each with `recordCount`, `url`, and `license`
-- `sanctionsReady` / `sanctionsAsOf` and `leiReady` / `leiAsOf` report whether each mirror has synced and when; not gated on readiness, so it reports an empty mirror instead of failing
+- `sanctionsReady` / `sanctionsAsOf` and `leiReady` / `leiAsOf` report whether each mirror has synced and when; `sanctionsAsOf` is the last sync in which every sanctions list refreshed. Not gated on readiness, so it reports an empty mirror instead of failing
 
 ---
 
 ### `sanctions://designation/{source}/{entryId}` <sub>resource</sub>
 
-- `source` is one of the five list codes, `entryId` the list's own ID; returns the `sanctions_get_designation` payload as `application/json`
+- `source` is one of the five list codes, `entryId` the list's own ID or its published reference number, resolved as `sanctions_get_designation` resolves it and decoded once when percent-encoded; returns the `sanctions_get_designation` payload as `application/json`
 - Cached for an hour, scoped `private`
 
 ---
@@ -131,7 +144,7 @@ All resource data is also reachable through the tools, for clients that don't su
 ### `sanctions_vet_counterparty` <sub>prompt</sub>
 
 - Arguments: `name` required; `jurisdiction` (ISO 3166-1 alpha-2) optional
-- Returns one user message that screens the name, resolves it to an LEI, traces ownership with `screenNodes: true`, pulls each hit's designation record, and asks for a summary that treats every match as a candidate to verify
+- Returns one user message that screens the name (and any identifier the caller holds, with `sanctions_screen_identifier`), resolves it to an LEI, traces ownership with `screenNodes: true`, pulls each hit's designation record, and asks for a summary that treats every match as a candidate to verify
 
 ## Features
 
@@ -141,16 +154,16 @@ Sanctions-screening-specific:
 
 - One screen covers OFAC SDN, OFAC Consolidated, EU, UK (UKSL), and UN; the matching list shows up as per-hit provenance
 - Offline and keyless, with no per-request rate limit: all five sources are normalized into local SQLite + FTS5 mirrors via the framework `MirrorService`
-- Per-alias name index, so a query matches any of an entity's names in one FTS scan
+- Per-alias name index, so a query matches any of an entity's names in one FTS scan, and a per-identifier index for exact lookup by IMO number, SWIFT/BIC, wallet address, or document number
 - Strict-then-fuzzy matching: exact-normalized, then all tokens present (FTS5), then Jaro-Winkler + Double-Metaphone, with fuzzy candidates capped by `SANCTIONS_FUZZY_MAX_RESULTS`
 - GLEIF Level 1 (who is who) and Level 2 (who owns whom) for entity resolution and ownership tracing
 
 Agent-friendly output:
 
 - Real signal with provenance: approximate hits carry the raw Jaro-Winkler `score` and a literal `queryTokenCoverage` count, never a blended confidence; every hit names its list, program, designation date, and the name that matched, typed `primary` / `aka` / `fka` / `low-quality-aka`
-- Decision-support `caveat` in the output of `sanctions_screen_name`, `sanctions_get_designation`, `sanctions_get_entity`, and `sanctions_trace_ownership`
+- Decision-support `caveat` in the output of `sanctions_screen_name`, `sanctions_screen_identifier`, `sanctions_get_designation`, `sanctions_get_entity`, and `sanctions_trace_ownership`
 - Disclosed gaps: `totalAvailableBasis`, `screeningStatus`, and `complete` / `truncated` / `missingEntityLeis` say what a response did not cover
-- Typed errors: every tool and resource except the sources listing fails as `mirror_not_ready` (retryable) until its mirror is loaded; unknown IDs fail as `designation_not_found` or `lei_not_found`; a name with no letter or digit fails as `name_not_searchable`, and one past the length bound as `name_too_long`
+- Typed errors: every tool and resource except the sources listing fails as `mirror_not_ready` (retryable) until its mirror is loaded; unknown IDs fail as `designation_not_found` or `lei_not_found`, and a reference number two designations share as `reference_ambiguous`; a name with no letter or digit fails as `name_not_searchable`, one past the length bound as `name_too_long`, and an identifier with nothing left once spacing and separators are removed as `identifier_not_searchable`
 
 ## Getting started
 
@@ -305,10 +318,14 @@ The mirror loads out-of-band, never on the request path.
 
 | Script | Purpose |
 |:---|:---|
-| `bun run mirror:init` | Full load: all five sanctions lists, the name index, then the GLEIF golden copy (Level 1 + Level 2). Safe to re-run; an interrupted run starts over. Set `SANCTIONS_INIT_SKIP_GLEIF=1` to load the sanctions lists only. |
-| `bun run mirror:refresh` | Re-harvest the sanctions lists, removing designations a list's complete document no longer publishes (at most half of a list per run), and apply the last day of GLEIF deltas. The sanctions half also runs on `SANCTIONS_REFRESH_CRON` under HTTP. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to skip the deltas. |
+| `bun run mirror:init` | Full load: all five sanctions lists, the name and identifier indexes, then the GLEIF golden copy (Level 1 + Level 2). Safe to re-run; an interrupted run starts over. Set `SANCTIONS_INIT_SKIP_GLEIF=1` to load the sanctions lists only. |
+| `bun run mirror:refresh` | Re-harvest the sanctions lists, removing designations a list's complete document no longer publishes (at most half of a list per run), and apply the last day of GLEIF deltas. The sanctions half also runs on `SANCTIONS_REFRESH_CRON` under HTTP, bounded at 4 hours like this script. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to skip the deltas. |
 | `bun run mirror:verify` | Report mirror readiness and per-source record counts. |
 | `bun run mirror:seed` | Load a small synthetic fixture for local smoke tests, with no downloads. |
+
+A list that fails to download or arrives truncated keeps its stored rows and removes nothing, while every other list still refreshes and the name and identifier indexes are rebuilt; the run then exits non-zero naming each failed list (`ofac_sdn`, `eu`, …) and stops before GLEIF. `sanctionsAsOf` advances only on a run in which every list refreshed, and a first `mirror:init` with a failed list leaves the mirror not ready.
+
+A mirror written by an earlier release upgrades in place on first open: the `designation` table gains its `reference_number` column, and the identifier index is built from the stored records before the first lookup, so `sanctions_screen_identifier` answers from a populated mirror without a re-init. What the earlier release did not read — reference numbers, the OFAC and UK identifiers beyond identity documents, and dates at published precision — arrives with the next sanctions refresh, so run `mirror:refresh` after upgrading rather than waiting for the cron. The index is also rebuilt on open whenever a sync it did not follow has changed the stored records, such as one an earlier release ran after a rollback.
 
 Every leg of `mirror:init` streams in bounded batches, so peak memory tracks the batch size, not the source size. The sanctions XML totals about 172 MB; the GLEIF Level 1 golden copy is about 3.3M records (~892 MB compressed) and dominates disk use.
 
