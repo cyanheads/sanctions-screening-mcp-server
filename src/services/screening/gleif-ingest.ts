@@ -29,22 +29,13 @@ import {
   type IngestRejections,
   isUsableName,
 } from '@/services/screening/ingest-validation.js';
+import { fetchSourceDownload } from '@/services/screening/source-fetch.js';
 import type { NormalizedLeiEntity, NormalizedLeiRelationship } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 import { decodeUtf8Stream, scanRecordFragments } from '@/services/screening/xml-stream.js';
 
 /** Bounds the buffered delta / fixture download (see {@link downloadGleifXml}). */
 const FETCH_TIMEOUT_MS = 600_000;
-
-/**
- * Bounds only time-to-response-headers on a streaming golden-copy download.
- * `fetchWithTimeout` clears its own timeout the moment the `Response` is returned
- * (headers received) — the body is then consumed lazily as the ingest drains it,
- * bounded solely by the external `signal` (the lifecycle script's `longRunSignal`).
- * A multi-GB golden-copy ingest legitimately runs far longer than any fixed fetch
- * timeout, so this value guards a stalled connection, not the transfer itself.
- */
-const STREAM_HEADERS_TIMEOUT_MS = 120_000;
 
 /** Which GLEIF dataset + window to fetch. */
 export type GleifFileKind = 'lei2-full' | 'lei2-delta' | 'rr-full' | 'rr-delta';
@@ -363,15 +354,18 @@ export async function harvestLeiLevel2(
 // boundary scan stand in for a streaming parser; each matched fragment is still
 // handed to the real parseXml for attribute-aware parsing.
 
-/** Open a GLEIF download as a stream of response-body byte chunks. The body is
- *  consumed lazily by the ingest and bounded by the caller's `signal`, not by a
- *  fetch timeout (see {@link STREAM_HEADERS_TIMEOUT_MS}). */
+/** Open a GLEIF download as a stream of response-body byte chunks, consumed
+ *  lazily by the ingest and bounded by the caller's `signal`. */
 async function openGleifByteStream(
   url: string,
   signal: AbortSignal,
 ): Promise<AsyncIterable<Uint8Array>> {
   const reqCtx = requestContextService.createRequestContext({ operation: 'gleif:stream' });
-  const res = await fetchWithTimeout(url, STREAM_HEADERS_TIMEOUT_MS, reqCtx, { signal });
+  const res = await fetchSourceDownload(url, {
+    source: 'GLEIF golden copy',
+    signal,
+    context: reqCtx,
+  });
   if (!res.body) throw serviceUnavailable('GLEIF streaming download returned an empty body.');
   return res.body as AsyncIterable<Uint8Array>;
 }
