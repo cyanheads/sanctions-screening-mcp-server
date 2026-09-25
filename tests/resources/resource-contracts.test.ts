@@ -105,10 +105,11 @@ describe('sanctions://designation/{source}/{entryId} readiness gate', () => {
     ).rejects.toMatchObject({ data: { reason: 'designation_not_found' } });
   });
 
-  it('declares both readiness and not-found reasons in its error contract', () => {
+  it('declares the readiness, not-found, and ambiguous-reference reasons in its error contract', () => {
     expect(designationResource.errors?.map((entry) => entry.reason).sort()).toEqual([
       'designation_not_found',
       'mirror_not_ready',
+      'reference_ambiguous',
     ]);
   });
 
@@ -121,7 +122,10 @@ describe('sanctions://designation/{source}/{entryId} readiness gate', () => {
           <ReferenceValueSets>
             <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
             <CountryValues><Country ID="11216">Venezuela</Country></CountryValues>
-            <FeatureTypeValues><FeatureType ID="10">Nationality Country</FeatureType><FeatureType ID="25">Location</FeatureType></FeatureTypeValues>
+            <FeatureTypeValues>
+              <FeatureType ID="8">Birthdate</FeatureType><FeatureType ID="10">Nationality Country</FeatureType>
+              <FeatureType ID="13">SWIFT/BIC</FeatureType><FeatureType ID="25">Location</FeatureType>
+            </FeatureTypeValues>
             <IDRegDocTypeValues><IDRegDocType ID="1570">Cedula No.</IDRegDocType></IDRegDocTypeValues>
             <LocPartTypeValues><LocPartType ID="1">Unknown</LocPartType><LocPartType ID="1454">CITY</LocPartType></LocPartTypeValues>
           </ReferenceValueSets>
@@ -139,6 +143,11 @@ describe('sanctions://designation/{source}/{entryId} readiness gate', () => {
             </Identity>
             <Feature FeatureTypeID="25"><FeatureVersion ID="1"><VersionLocation LocationID="1" /></FeatureVersion></Feature>
             <Feature FeatureTypeID="10"><FeatureVersion ID="2"><VersionLocation LocationID="2" /></FeatureVersion></Feature>
+            <Feature FeatureTypeID="13"><FeatureVersion ID="3"><VersionDetail DetailTypeID="1432">BCVEVECA</VersionDetail></FeatureVersion></Feature>
+            <Feature FeatureTypeID="8"><FeatureVersion ID="4"><DatePeriod CalendarTypeID="1">
+              <Start Approximate="true"><From><Year>1962</Year><Month>1</Month><Day>1</Day></From><To><Year>1962</Year><Month>1</Month><Day>1</Day></To></Start>
+              <End Approximate="true"><From><Year>1962</Year><Month>12</Month><Day>31</Day></From><To><Year>1962</Year><Month>12</Month><Day>31</Day></To></End>
+            </DatePeriod></FeatureVersion></Feature>
           </Profile></DistinctParty></DistinctParties>
         </Sanctions>`),
         'ofac_sdn',
@@ -155,14 +164,60 @@ describe('sanctions://designation/{source}/{entryId} readiness gate', () => {
     );
 
     const groups = {
-      identifiers: [{ type: 'Cedula No.', value: '5892464', country: 'Venezuela' }],
+      identifiers: [
+        { type: 'Cedula No.', value: '5892464', country: 'Venezuela' },
+        { type: 'SWIFT/BIC', value: 'BCVEVECA' },
+      ],
       addresses: [{ full: 'Caracas, Venezuela', country: 'Venezuela' }],
-      datesOfBirth: [],
+      datesOfBirth: [{ date: '1962', circa: true }],
       nationalities: ['Venezuela'],
     };
     expect(payload).toMatchObject(groups);
     expect(tool).toMatchObject(groups);
   });
+});
+
+describe('sanctions://designation/{source}/{entryId} percent-encoded entry IDs (#44)', () => {
+  it.each(['%46X-1001', 'FX%2D1001', '%46%58%2D%31%30%30%31'])(
+    'decodes %j once before the lookup',
+    async (entryId) => {
+      global = await seededGlobalService();
+      await expect(
+        designationResource.handler(
+          parseParams(designationResource, { source: 'ofac_sdn', entryId }),
+          ctxFor(designationResource.errors),
+        ),
+      ).resolves.toMatchObject({ sourceEntryId: 'FX-1001', primaryName: 'Ivan Testovich Volkov' });
+    },
+  );
+
+  it('decodes once only — an escaped percent sign stays a literal percent sign', async () => {
+    global = await seededGlobalService();
+    // `%2546X-1001` decodes to `%46X-1001`; a second pass would reach FX-1001.
+    await expect(
+      designationResource.handler(
+        parseParams(designationResource, { source: 'ofac_sdn', entryId: '%2546X-1001' }),
+        ctxFor(designationResource.errors),
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'designation_not_found' } });
+  });
+
+  it.each(['%E0%A4%A', '%', 'FX-1001%'])(
+    'answers the malformed escape %j as designation_not_found, not a URIError',
+    async (entryId) => {
+      global = await seededGlobalService();
+      const error = await Promise.resolve()
+        .then(() =>
+          designationResource.handler(
+            parseParams(designationResource, { source: 'ofac_sdn', entryId }),
+            ctxFor(designationResource.errors),
+          ),
+        )
+        .catch((e: unknown) => e);
+      expect(error).not.toBeInstanceOf(URIError);
+      expect(error).toMatchObject({ data: { reason: 'designation_not_found' } });
+    },
+  );
 });
 
 describe('sanctions://entity/{lei} readiness gate', () => {

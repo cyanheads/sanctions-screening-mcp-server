@@ -1,9 +1,10 @@
 /**
  * @fileoverview `sanctions_get_designation` — the full record for one sanctions
- * entry by source list + entry ID. The drill-in after sanctions_screen_name
- * surfaces a candidate: all aliases, identifiers, addresses, dates/places of
- * birth, nationalities, program, legal basis, and designation date. Still a
- * screening aid — the record is what the source published, not a determination.
+ * entry by source list + entry ID or published reference number. The drill-in
+ * after sanctions_screen_name surfaces a candidate: all aliases, identifiers,
+ * addresses, dates/places of birth, nationalities, program, legal basis, and
+ * designation date. Still a screening aid — the record is what the source
+ * published, not a determination.
  * @module mcp-server/tools/definitions/get-designation.tool
  */
 
@@ -16,7 +17,7 @@ import { SCREENING_CAVEAT } from './_shared.js';
 export const getDesignationTool = tool('sanctions_get_designation', {
   title: 'sanctions-screening-mcp-server: get designation',
   description:
-    'Fetch the full record for one sanctions designation by source list + entry ID — the drill-in after sanctions_screen_name surfaces a candidate. Returns all published aliases, identifiers (passport/national-ID/tax), addresses, dates and places of birth, nationalities, sanctioning program, legal basis, and designation date. The record reflects exactly what the source published; missing fields mean the source omitted them. This is a screening aid — the designation record supports a compliance review, it is not itself a determination.',
+    "Fetch the full record for one sanctions designation by source list + entry ID or the list's published reference number — the drill-in after sanctions_screen_name or sanctions_screen_identifier surfaces a candidate, or the lookup for a reference a notice cites (UN QDe.004, EU EU.27.28, UK OFSI Group ID). Returns all published aliases, identifiers (passport, national ID, tax and registration numbers, SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, websites), addresses, dates and places of birth at the precision the source published, nationalities, sanctioning program, legal basis, and designation date. The record reflects exactly what the source published; missing fields mean the source omitted them. This is a screening aid — the designation record supports a compliance review, it is not itself a determination.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     source: z
@@ -25,7 +26,9 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     entryId: z
       .string()
       .min(1)
-      .describe("The source list's own entry ID (the sourceEntryId from sanctions_screen_name)."),
+      .describe(
+        "The source list's own entry ID (the sourceEntryId from sanctions_screen_name), or the reference number the list publishes for the entry (UN QDe.004, EU EU.27.28, UK OFSI Group ID 14196). Matched trimmed and case-insensitive, entry ID first.",
+      ),
   }),
   output: z.object({
     source: z
@@ -33,13 +36,22 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       .describe('Source list the entry belongs to.'),
     sourceLabel: z.string().describe('Human-readable name of the source list.'),
     sourceEntryId: z.string().describe("The source list's own entry ID."),
+    referenceNumber: z
+      .string()
+      .optional()
+      .describe(
+        "The list's published reference number (UN, EU, UK OFSI Group ID); absent when the list publishes none for the entry. OFAC publishes none — its entry ID is its published number.",
+      ),
     entityType: z
       .enum(['person', 'organization', 'vessel', 'aircraft', 'unknown'])
       .describe('Entity classification as published.'),
     primaryName: z.string().describe('Primary published name.'),
     program: z.string().optional().describe('Sanctioning program / regime, when published.'),
     legalBasis: z.string().optional().describe('Statutory / regulatory basis, when published.'),
-    designationDate: z.string().optional().describe('Designation date, when published.'),
+    designationDate: z
+      .string()
+      .optional()
+      .describe("The source's own designation date as YYYY-MM-DD; absent when unpublished."),
     aliases: z
       .array(
         z
@@ -56,13 +68,21 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       .array(
         z
           .object({
-            type: z.string().describe('Identifier category (e.g. Passport, National ID, Tax ID).'),
-            value: z.string().describe('Identifier value as published.'),
+            type: z
+              .string()
+              .describe(
+                'Identifier category as the source labels it (e.g. Passport, National ID, SWIFT/BIC, Digital Currency Address - XBT, Phone Number, Website).',
+              ),
+            value: z
+              .string()
+              .describe('Identifier value exactly as published, letter case included.'),
             country: z.string().optional().describe('Issuing country/authority, when published.'),
           })
           .describe('One structured identifier.'),
       )
-      .describe('Published identifiers (passport, national ID, tax, registration, …).'),
+      .describe(
+        'Published identifiers: identity documents (passport, national ID, tax, registration) and, where the source publishes them, SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, and websites.',
+      ),
     addresses: z
       .array(
         z
@@ -77,7 +97,18 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       .array(
         z
           .object({
-            date: z.string().optional().describe('Date of birth as published.'),
+            date: z
+              .string()
+              .optional()
+              .describe(
+                'Date of birth in ISO 8601 at the precision the source published: YYYY-MM-DD, YYYY-MM, or YYYY. A range is an interval whose ends keep their own precision (1955/1957); an open end is .. (../1980). A value with no ISO form is kept as published.',
+              ),
+            circa: z
+              .literal(true)
+              .optional()
+              .describe(
+                'Present when the source flags the date as approximate; never without date.',
+              ),
             place: z.string().optional().describe('Place of birth, when published.'),
           })
           .describe('One date/place of birth.'),
@@ -98,9 +129,16 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     {
       reason: 'designation_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No designation exists for the given source + entry ID in the mirror.',
+      when: 'No designation in the given source has that entry ID or reference number in the mirror.',
       recovery:
         'Verify the source and entryId via sanctions_screen_name, which returns the exact sourceEntryId for each hit.',
+    },
+    {
+      reason: 'reference_ambiguous',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'The entry ID is a reference number more than one designation in the source publishes.',
+      recovery:
+        'Call again with one of the sourceEntryIds this error names; each one identifies a single designation.',
     },
     {
       reason: 'mirror_not_ready',
@@ -119,19 +157,28 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       });
     }
 
-    const d = await svc.getDesignation(input.source as SourceCode, input.entryId);
-    if (!d) {
+    const lookup = await svc.resolveDesignation(input.source as SourceCode, input.entryId);
+    if (lookup.kind === 'ambiguous') {
+      throw ctx.fail(
+        'reference_ambiguous',
+        `Reference number "${input.entryId.trim()}" is published by ${lookup.sourceEntryIds.length} ${input.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
+        { sourceEntryIds: lookup.sourceEntryIds, ...ctx.recoveryFor('reference_ambiguous') },
+      );
+    }
+    if (lookup.kind === 'not_found') {
       throw ctx.fail(
         'designation_not_found',
-        `No ${input.source} designation with entry ID "${input.entryId}".`,
+        `No ${input.source} designation with entry ID or reference number "${input.entryId}".`,
         { ...ctx.recoveryFor('designation_not_found') },
       );
     }
 
+    const d = lookup.designation;
     return {
       source: d.source,
       sourceLabel: SOURCE_LABELS[d.source],
       sourceEntryId: d.sourceEntryId,
+      ...(d.referenceNumber ? { referenceNumber: d.referenceNumber } : {}),
       entityType: d.entityType,
       primaryName: d.primaryName,
       ...(d.program ? { program: d.program } : {}),
@@ -149,7 +196,9 @@ export const getDesignationTool = tool('sanctions_get_designation', {
 
   format: (r) => {
     const lines = [`# ${r.primaryName}`, ''];
-    lines.push(`**List:** ${r.sourceLabel} (\`${r.source}\`) | **Entry ID:** ${r.sourceEntryId}`);
+    lines.push(
+      `**List:** ${r.sourceLabel} (\`${r.source}\`) | **Entry ID:** ${r.sourceEntryId}${r.referenceNumber ? ` | **Reference:** ${r.referenceNumber}` : ''}`,
+    );
     lines.push(`**Type:** ${r.entityType}`);
     if (r.program) lines.push(`**Program:** ${r.program}`);
     if (r.legalBasis) lines.push(`**Legal basis:** ${r.legalBasis}`);
@@ -179,8 +228,9 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       // Render only what the entry publishes: a source that lists dates and places
       // separately yields date-only and place-only entries.
       for (const d of r.datesOfBirth) {
-        if (d.date) lines.push(`- ${d.date}${d.place ? ` at ${d.place}` : ''}`);
-        else if (d.place) lines.push(`- Born in ${d.place}`);
+        if (d.date) {
+          lines.push(`- ${d.circa ? 'circa ' : ''}${d.date}${d.place ? ` at ${d.place}` : ''}`);
+        } else if (d.place) lines.push(`- Born in ${d.place}`);
       }
     }
     if (r.nationalities.length > 0)

@@ -2,7 +2,8 @@
  * @fileoverview `sanctions://designation/{source}/{entryId}` — read-only mirror
  * of sanctions_get_designation for clients that inject context by URI. All data
  * here is reachable via the tool, which is the primary path for tool-only
- * clients.
+ * clients. Resolves the entry ID the way the tool does — entry ID or published
+ * reference number, trimmed and case-insensitive.
  * @module mcp-server/resources/definitions/designation.resource
  */
 
@@ -12,11 +13,26 @@ import { SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
 
+/**
+ * A URI template variable as the caller meant it. The variable reaches the
+ * handler exactly as it appeared in the URI, so a client that percent-encodes
+ * an entry ID per RFC 3986 (`%52US0251`) would otherwise miss a designation that
+ * exists. Decoded once — an escaped `%` stays literal. A malformed escape names
+ * no entry, so it resolves to nothing rather than throwing.
+ */
+function decodeVariable(value: string): string | undefined {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return;
+  }
+}
+
 export const designationResource = resource('sanctions://designation/{source}/{entryId}', {
   name: 'sanctions-screening-mcp-server: designation',
   title: 'sanctions-screening-mcp-server: designation',
   description:
-    'Fetch one sanctions designation by source list + entry ID — a read-only URI mirror of sanctions_get_designation. The record is what the source published; a screening aid, not a determination.',
+    "Fetch one sanctions designation by source list + entry ID or the list's published reference number — a read-only URI mirror of sanctions_get_designation. The record is what the source published; a screening aid, not a determination.",
   mimeType: 'application/json',
   // A designation only changes when its source list republishes, which this
   // server picks up on the daily refresh cron. Scoped private, not public: the
@@ -27,14 +43,26 @@ export const designationResource = resource('sanctions://designation/{source}/{e
     source: z
       .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])
       .describe('Source list the entry belongs to.'),
-    entryId: z.string().min(1).describe("The source list's own entry ID."),
+    entryId: z
+      .string()
+      .min(1)
+      .describe(
+        "The source list's own entry ID, or the reference number the list publishes for the entry, percent-encoded as a URI segment. Matched trimmed and case-insensitive, entry ID first.",
+      ),
   }),
   errors: [
     {
       reason: 'designation_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No designation exists for the given source + entry ID in the mirror.',
+      when: 'No designation in the given source has that entry ID or reference number in the mirror.',
       recovery: 'Use sanctions_screen_name to discover valid source/entryId pairs first.',
+    },
+    {
+      reason: 'reference_ambiguous',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'The entry ID is a reference number more than one designation in the source publishes.',
+      recovery:
+        'Read the resource again with one of the sourceEntryIds this error names; each one identifies a single designation.',
     },
     {
       reason: 'mirror_not_ready',
@@ -54,18 +82,30 @@ export const designationResource = resource('sanctions://designation/{source}/{e
         ...ctx.recoveryFor('mirror_not_ready'),
       });
     }
-    const d = await svc.getDesignation(params.source as SourceCode, params.entryId);
-    if (!d) {
+    const entryId = decodeVariable(params.entryId);
+    const lookup = entryId
+      ? await svc.resolveDesignation(params.source as SourceCode, entryId)
+      : ({ kind: 'not_found' } as const);
+    if (lookup.kind === 'ambiguous') {
+      throw ctx.fail(
+        'reference_ambiguous',
+        `Reference number "${entryId?.trim()}" is published by ${lookup.sourceEntryIds.length} ${params.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
+        { sourceEntryIds: lookup.sourceEntryIds, ...ctx.recoveryFor('reference_ambiguous') },
+      );
+    }
+    if (lookup.kind === 'not_found') {
       throw ctx.fail(
         'designation_not_found',
-        `No ${params.source} designation with entry ID "${params.entryId}".`,
+        `No ${params.source} designation with entry ID or reference number "${entryId ?? params.entryId}".`,
         { ...ctx.recoveryFor('designation_not_found') },
       );
     }
+    const d = lookup.designation;
     return {
       source: d.source,
       sourceLabel: SOURCE_LABELS[d.source],
       sourceEntryId: d.sourceEntryId,
+      referenceNumber: d.referenceNumber,
       entityType: d.entityType,
       primaryName: d.primaryName,
       program: d.program,

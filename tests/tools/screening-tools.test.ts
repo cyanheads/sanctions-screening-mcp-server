@@ -544,7 +544,10 @@ describe('published designation details on both surfaces (issue #22)', () => {
                 <DocumentedNamePart><NamePartValue>MADURO MOROS</NamePartValue></DocumentedNamePart>
                 <DocumentedNamePart><NamePartValue>Nicolas</NamePartValue></DocumentedNamePart>
               </DocumentedName></Alias></Identity>
-              <Feature FeatureTypeID="8"><FeatureVersion ID="1"><DatePeriod><Start><From><Year>1962</Year><Month>11</Month><Day>23</Day></From></Start></DatePeriod></FeatureVersion></Feature>
+              <Feature FeatureTypeID="8"><FeatureVersion ID="1"><DatePeriod CalendarTypeID="1">
+                <Start Approximate="false"><From><Year>1962</Year><Month>11</Month><Day>23</Day></From><To><Year>1962</Year><Month>11</Month><Day>23</Day></To></Start>
+                <End Approximate="false"><From><Year>1962</Year><Month>11</Month><Day>23</Day></From><To><Year>1962</Year><Month>11</Month><Day>23</Day></To></End>
+              </DatePeriod></FeatureVersion></Feature>
               <Feature FeatureTypeID="9"><FeatureVersion ID="2"><VersionDetail DetailTypeID="1432">Caracas, Venezuela</VersionDetail></FeatureVersion></Feature>
               <Feature FeatureTypeID="11"><FeatureVersion ID="3"><VersionLocation LocationID="186216" /></FeatureVersion></Feature>
               <Feature FeatureTypeID="25"><FeatureVersion ID="4"><VersionLocation LocationID="34442" /></FeatureVersion></Feature>
@@ -642,8 +645,8 @@ describe('published designation details on both surfaces (issue #22)', () => {
         identifiers: [{ type: 'Passport', value: 'D0009871' }],
         addresses: [{ full: 'Kabul, Afghanistan', country: 'Afghanistan' }],
         datesOfBirth: [
-          { date: 'dd/mm/1971' },
-          { date: '24/10/1972' },
+          { date: '1971' },
+          { date: '1972-10-24' },
           { place: 'Moni village, Afghanistan' },
         ],
         nationalities: ['Afghanistan'],
@@ -651,7 +654,8 @@ describe('published designation details on both surfaces (issue #22)', () => {
       [
         '**Passport:** D0009871',
         '- Kabul, Afghanistan\n',
-        '- dd/mm/1971\n',
+        '- 1971\n',
+        '- 1972-10-24\n',
         '- Born in Moni village, Afghanistan',
         '**Nationalities:** Afghanistan',
       ],
@@ -702,6 +706,194 @@ describe('published designation details on both surfaces (issue #22)', () => {
     // The populated sibling from the same document renders every group.
     const full = renderFormat(getDesignationTool, await getDesignation('ofac_sdn', '22790'));
     for (const heading of headings) expect(full).toContain(heading);
+  });
+});
+
+describe('published precision and feature identifiers on both surfaces (issues #39, #40, #45)', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+    // Parsed from source-shaped XML, so each field is the normalizer's own read.
+    const period = (start: string[], end: string[], approximate: boolean) => {
+      const point = (tag: string, ymd: string) => {
+        const [y, m, d] = ymd.split('-');
+        return `<${tag}><Year>${y}</Year><Month>${Number(m)}</Month><Day>${Number(d)}</Day></${tag}>`;
+      };
+      return `<Feature FeatureTypeID="8"><FeatureVersion><DatePeriod CalendarTypeID="1">
+        <Start Approximate="${approximate}">${point('From', start[0] ?? '')}${point('To', start[1] ?? '')}</Start>
+        <End Approximate="${approximate}">${point('From', end[0] ?? '')}${point('To', end[1] ?? '')}</End>
+      </DatePeriod></FeatureVersion></Feature>`;
+    };
+    await seeded.service.ingestDesignations([
+      ...parseOfac(
+        parseXml(`<Sanctions>
+          <ReferenceValueSets>
+            <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+            <CountryValues><Country ID="11247">United Kingdom</Country></CountryValues>
+            <FeatureTypeValues>
+              <FeatureType ID="8">Birthdate</FeatureType><FeatureType ID="9">Place of Birth</FeatureType>
+              <FeatureType ID="13">SWIFT/BIC</FeatureType><FeatureType ID="14">Website</FeatureType>
+              <FeatureType ID="344">Digital Currency Address - XBT</FeatureType>
+            </FeatureTypeValues>
+            <IDRegDocTypeValues><IDRegDocType ID="1583">Company Number</IDRegDocType></IDRegDocTypeValues>
+          </ReferenceValueSets>
+          <IDRegDocuments>
+            <IDRegDocument IDRegDocTypeID="1583" IdentityID="4267" IssuedBy-CountryID="11247"><IDRegistrationNo>01074897</IDRegistrationNo></IDRegDocument>
+          </IDRegDocuments>
+          <DistinctParties>
+            <DistinctParty FixedRef="7782"><Profile ID="7782"><Identity ID="2186">
+              <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>CIRCA YEAR PERSON</NamePartValue></DocumentedNamePart></DocumentedName></Alias></Identity>
+              ${period(['1951-01-01', '1951-01-01'], ['1951-12-31', '1951-12-31'], true)}
+              <Feature FeatureTypeID="9"><FeatureVersion><VersionDetail DetailTypeID="1432">Mosul, Iraq</VersionDetail></FeatureVersion></Feature>
+            </Profile></DistinctParty>
+            <DistinctParty FixedRef="8868"><Profile ID="8868"><Identity ID="6593">
+              <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>YEAR RANGE PERSON</NamePartValue></DocumentedNamePart></DocumentedName></Alias></Identity>
+              ${period(['1955-01-01', '1955-12-31'], ['1957-01-01', '1957-12-31'], false)}
+              ${period(['1946-08-01', '1946-08-01'], ['1946-08-31', '1946-08-31'], false)}
+            </Profile></DistinctParty>
+            <DistinctParty FixedRef="906"><Profile ID="906"><Identity ID="4267">
+              <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>HAVANA INTERNATIONAL BANK LTD</NamePartValue></DocumentedNamePart></DocumentedName></Alias></Identity>
+              <Feature FeatureTypeID="13"><FeatureVersion><VersionDetail DetailTypeID="1432">HAVIGB2L</VersionDetail></FeatureVersion></Feature>
+              <Feature FeatureTypeID="14"><FeatureVersion><VersionDetail DetailTypeID="1432">www.havanaintbank.co.uk</VersionDetail></FeatureVersion></Feature>
+              <Feature FeatureTypeID="344"><FeatureVersion><VersionDetail DetailTypeID="1432">12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL</VersionDetail></FeatureVersion></Feature>
+            </Profile></DistinctParty>
+          </DistinctParties>
+        </Sanctions>`),
+        'ofac_sdn',
+      ),
+      ...parseUk(
+        parseXml(`<Designations><Designation>
+          <LastUpdated>09/04/2025</LastUpdated><DateDesignated>25/02/2022</DateDesignated>
+          <UniqueID>RUS0251</UniqueID>
+          <Names><Name><Name1>Vladimir</Name1><Name6>PUTIN</Name6><NameType>Primary Name</NameType></Name></Names>
+          <IndividualEntityShip>Individual</IndividualEntityShip>
+          <PhoneNumbers><PhoneNumber>+7 495 606 36 02</PhoneNumber></PhoneNumbers>
+          <EmailAddresses><EmailAddress>info@example.test</EmailAddress></EmailAddresses>
+          <Websites><Website>http://kremlin.example</Website></Websites>
+          <IndividualDetails><Individual><DOBs><DOB>07/10/1952</DOB><DOB>dd/mm/1952</DOB></DOBs></Individual></IndividualDetails>
+        </Designation></Designations>`),
+      ),
+      ...parseEu(
+        parseXml(`<export><sanctionEntity designationDate="2002-06-18" logicalId="201">
+          <regulation regulationType="amendment" publicationDate="2025-01-31" programme="TERR"/>
+          <subjectType code="enterprise"/><nameAlias wholeName="Example Organisation 201" strong="true"/>
+        </sanctionEntity></export>`),
+      ),
+      ...parseUn(
+        parseXml(`<CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL>
+          <DATAID>6908457</DATAID><FIRST_NAME>OFFSET</FIRST_NAME><SECOND_NAME>LISTING</SECOND_NAME>
+          <LISTED_ON>2015-07-01-04:00</LISTED_ON>
+        </INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>`),
+      ),
+    ]);
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  const getDesignation = (source: 'ofac_sdn' | 'eu' | 'uk' | 'un', entryId: string) =>
+    getDesignationTool.handler(
+      getDesignationTool.input.parse({ source, entryId }),
+      ctxFor(getDesignationTool.errors),
+    );
+
+  it('get_designation carries a circa year with its place, and renders it as circa', async () => {
+    const result = await getDesignation('ofac_sdn', '7782');
+    expect(result.datesOfBirth).toEqual([{ date: '1951', circa: true, place: 'Mosul, Iraq' }]);
+    expect(renderFormat(getDesignationTool, result).split('\n')).toContain(
+      '- circa 1951 at Mosul, Iraq',
+    );
+  });
+
+  it('get_designation carries a range as an ISO interval and a month at month precision', async () => {
+    const result = await getDesignation('ofac_sdn', '8868');
+    expect(result.datesOfBirth).toEqual([{ date: '1955/1957' }, { date: '1946-08' }]);
+    const lines = renderFormat(getDesignationTool, result).split('\n');
+    expect(lines).toContain('- 1955/1957');
+    expect(lines).toContain('- 1946-08');
+    expect(lines.join('\n')).not.toContain('circa');
+  });
+
+  it('get_designation lists feature identifiers after the identity documents on both surfaces', async () => {
+    const result = await getDesignation('ofac_sdn', '906');
+    expect(result.identifiers).toEqual([
+      { type: 'Company Number', value: '01074897', country: 'United Kingdom' },
+      { type: 'SWIFT/BIC', value: 'HAVIGB2L' },
+      { type: 'Website', value: 'www.havanaintbank.co.uk' },
+      { type: 'Digital Currency Address - XBT', value: '12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL' },
+    ]);
+    const text = renderFormat(getDesignationTool, result);
+    expect(text).toContain('**Company Number:** 01074897 (United Kingdom)');
+    expect(text).toContain('**SWIFT/BIC:** HAVIGB2L\n');
+    expect(text).toContain('**Website:** www.havanaintbank.co.uk\n');
+    expect(text).toContain(
+      '**Digital Currency Address - XBT:** 12aNKp2iDKuhEde2YfPdd4DFGenRUTKupL',
+    );
+  });
+
+  it('get_designation returns a UK record with ISO dates and its contact details as identifiers', async () => {
+    const result = await getDesignation('uk', 'RUS0251');
+    expect(result).toMatchObject({
+      designationDate: '2022-02-25',
+      datesOfBirth: [{ date: '1952-10-07' }, { date: '1952' }],
+      identifiers: [
+        { type: 'Phone Number', value: '+7 495 606 36 02' },
+        { type: 'Email Address', value: 'info@example.test' },
+        { type: 'Website', value: 'http://kremlin.example' },
+      ],
+    });
+    const text = renderFormat(getDesignationTool, result);
+    expect(text).toContain('**Designated:** 2022-02-25');
+    expect(text).toContain('**Phone Number:** +7 495 606 36 02');
+    expect(text).toContain('**Email Address:** info@example.test');
+    expect(text).toContain('**Website:** http://kremlin.example');
+  });
+
+  it.each([
+    ['eu', '201', '2002-06-18'],
+    ['un', '6908457', '2015-07-01'],
+  ] as const)('get_designation returns %s/%s designated %s', async (source, entryId, date) => {
+    const result = await getDesignation(source, entryId);
+    expect(result.designationDate).toBe(date);
+    expect(renderFormat(getDesignationTool, result)).toContain(`**Designated:** ${date}`);
+  });
+
+  it('keeps circa and the feature identifiers in structuredContent through the output schema', async () => {
+    const circa = await runToolContract(getDesignationTool, {
+      source: 'ofac_sdn',
+      entryId: '7782',
+    });
+    expect(circa.isError).toBeFalsy();
+    expect(circa.structuredContent).toMatchObject({
+      datesOfBirth: [{ date: '1951', circa: true, place: 'Mosul, Iraq' }],
+    });
+    const features = await runToolContract(getDesignationTool, {
+      source: 'ofac_sdn',
+      entryId: '906',
+    });
+    expect((features.structuredContent as { identifiers: unknown[] }).identifiers).toHaveLength(4);
+    const content = features.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(content).toContain('**SWIFT/BIC:** HAVIGB2L');
+  });
+
+  it('screen_name reports the UK designation date as YYYY-MM-DD on both surfaces', async () => {
+    const result = await screenNameTool.handler(
+      screenNameTool.input.parse({ name: 'Vladimir PUTIN', sources: ['uk'] }),
+      ctxFor(screenNameTool.errors),
+    );
+    expect(result.hits[0]).toMatchObject({
+      sourceEntryId: 'RUS0251',
+      designationDate: '2022-02-25',
+    });
+    expect(renderFormat(screenNameTool, result)).toContain('**Designated:** 2022-02-25');
+  });
+
+  it('still rejects an empty entry ID and reports an unknown one as designation_not_found', async () => {
+    const empty = await runToolContract(getDesignationTool, { source: 'uk', entryId: '' });
+    expect(empty.isError).toBe(true);
+    await expect(getDesignation('uk', 'RUS9999')).rejects.toMatchObject({
+      data: { reason: 'designation_not_found' },
+    });
   });
 });
 

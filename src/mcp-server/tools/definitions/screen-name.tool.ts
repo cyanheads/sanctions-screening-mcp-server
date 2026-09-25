@@ -24,6 +24,12 @@ const HitSchema = z
     sourceEntryId: z
       .string()
       .describe("The list's own entry ID — pass to sanctions_get_designation for the full record."),
+    referenceNumber: z
+      .string()
+      .optional()
+      .describe(
+        "The list's published reference number (UN, EU, UK OFSI Group ID); absent when the list publishes none for the entry.",
+      ),
     entityType: z
       .enum(['person', 'organization', 'vessel', 'aircraft', 'unknown'])
       .describe('Entity classification as published by the source.'),
@@ -64,7 +70,7 @@ const HitSchema = z
     designationDate: z
       .string()
       .optional()
-      .describe('Designation date as published, when available.'),
+      .describe("The source's own designation date as YYYY-MM-DD; absent when unpublished."),
   })
   .describe('One potential match — a candidate to verify, never a determination.');
 
@@ -248,6 +254,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
         source: h.source,
         sourceLabel: SOURCE_LABELS[h.source],
         sourceEntryId: h.sourceEntryId,
+        ...(h.referenceNumber ? { referenceNumber: h.referenceNumber } : {}),
         entityType: h.entityType,
         primaryName: h.primaryName,
         matchedName: h.matchedName,
@@ -276,7 +283,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
         const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
         lines.push(`### ${h.primaryName} — ${h.matchType}${scoreStr}${coverStr}`);
         lines.push(
-          `**List:** ${h.sourceLabel} (\`${h.source}\`) | **Entry ID:** ${h.sourceEntryId} | **Type:** ${h.entityType}`,
+          `**List:** ${h.sourceLabel} (\`${h.source}\`) | **Entry ID:** ${h.sourceEntryId}${h.referenceNumber ? ` | **Reference:** ${h.referenceNumber}` : ''} | **Type:** ${h.entityType}`,
         );
         lines.push(`**Matched on:** "${h.matchedName}" (${h.matchedNameType})`);
         if (h.program) lines.push(`**Program:** ${h.program}`);
