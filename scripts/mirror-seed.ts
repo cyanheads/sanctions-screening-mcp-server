@@ -13,8 +13,9 @@ import {
   FIXTURE_DESIGNATIONS,
   FIXTURE_LEI_ENTITIES,
   FIXTURE_LEI_RELATIONSHIPS,
+  FIXTURE_REPORTING_EXCEPTIONS,
 } from '@/services/screening/fixtures.js';
-import { bootstrap } from './_mirror-context.js';
+import { bootstrap, runScript } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const { service, log, ctx } = await bootstrap('mirror:seed');
@@ -22,6 +23,7 @@ async function main(): Promise<void> {
     designations: FIXTURE_DESIGNATIONS,
     leiEntities: FIXTURE_LEI_ENTITIES,
     leiRelationships: FIXTURE_LEI_RELATIONSHIPS,
+    reportingExceptions: FIXTURE_REPORTING_EXCEPTIONS,
   });
   log.notice(
     'mirror:seed — synthetic fixture loaded (NOT real sanctions data)',
@@ -33,8 +35,4 @@ async function main(): Promise<void> {
   await service.close();
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error('mirror:seed failed:', err);
-  process.exit(1);
-});
+runScript('mirror:seed', main);

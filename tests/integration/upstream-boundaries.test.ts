@@ -7,11 +7,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SOURCE_URLS, resetServerConfig } from '@/config/server-config.js';
-import {
-  downloadGleifXml,
-  harvestLeiLevel1,
-  resolveGleifFileUrl,
-} from '@/services/screening/gleif-ingest.js';
+import { openGleifFile, resolveGleifPublication } from '@/services/screening/gleif-ingest.js';
 import { buildSanctionsIngesters } from '@/services/screening/sanctions-ingest.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
 
@@ -84,46 +80,82 @@ describe('sanctions source boundaries', () => {
 });
 
 describe('GLEIF boundaries', () => {
-  it('resolves full and delta URLs from a faked Golden Copy index', async () => {
-    const index = {
-      data: [
+  it.each(['lei2', 'rr', 'repex'] as const)(
+    'resolves the %s golden copy and every delta window from one index request',
+    async (dataset) => {
+      const link = (name: string) => ({
+        xml: { url: `https://offline.test/${dataset}-${name}.xml.zip` },
+      });
+      const index = {
+        data: [
+          {
+            full_file: link('full'),
+            delta_files: {
+              IntraDay: link('intra-day'),
+              LastDay: link('last-day'),
+              LastWeek: link('last-week'),
+              LastMonth: link('last-month'),
+            },
+          },
+        ],
+      };
+      const fetch = vi.fn(async () => Response.json(index));
+      vi.stubGlobal('fetch', fetch);
+
+      await expect(resolveGleifPublication(dataset, new AbortController().signal)).resolves.toEqual(
         {
-          full_file: { xml: { url: 'https://offline.test/lei-full.xml.zip' } },
-          delta_files: {
-            LastDay: { xml: { url: 'https://offline.test/lei-delta.xml.zip' } },
+          full: `https://offline.test/${dataset}-full.xml.zip`,
+          deltas: {
+            IntraDay: `https://offline.test/${dataset}-intra-day.xml.zip`,
+            LastDay: `https://offline.test/${dataset}-last-day.xml.zip`,
+            LastWeek: `https://offline.test/${dataset}-last-week.xml.zip`,
+            LastMonth: `https://offline.test/${dataset}-last-month.xml.zip`,
           },
         },
-      ],
-    };
-    const fetch = vi.fn(async () => Response.json(index));
-    vi.stubGlobal('fetch', fetch);
+      );
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(String((fetch.mock.calls[0] as unknown[])[0])).toBe(
+        `${DEFAULT_SOURCE_URLS.gleifGoldenCopyBase}/api/v2/golden-copies/publishes/${dataset}?format=xml`,
+      );
+    },
+  );
 
-    await expect(resolveGleifFileUrl('lei2-full', new AbortController().signal)).resolves.toBe(
-      'https://offline.test/lei-full.xml.zip',
+  it('fails an index that publishes no golden copy', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({ data: [{ delta_files: {} }] })),
     );
-    await expect(
-      resolveGleifFileUrl('lei2-delta', new AbortController().signal, 'LastDay'),
-    ).resolves.toBe('https://offline.test/lei-delta.xml.zip');
-    expect(fetch).toHaveBeenCalledTimes(2);
+    await expect(resolveGleifPublication('repex', new AbortController().signal)).rejects.toThrow(
+      /repex/,
+    );
   });
 
-  it('downloads and normalizes Level 1 XML through a faked response', async () => {
-    const xml = `
-      <LEIData><LEIRecords><LEIRecord>
-        <LEI>5493001KJTIIGC8Y1R12</LEI>
-        <Entity><LegalName>Offline GLEIF Entity</LegalName><LegalJurisdiction>US</LegalJurisdiction></Entity>
-        <Registration><RegistrationStatus>ISSUED</RegistrationStatus></Registration>
-      </LEIRecord></LEIRecords></LEIData>
-    `;
-    const fetch = vi.fn(async () => new Response(xml));
-    vi.stubGlobal('fetch', fetch);
+  it('streams a GLEIF file through a faked response: header first, then records', async () => {
+    const xml = `<lei:LEIData xmlns:lei="http://www.gleif.org/data/schema/leidata/2016">
+      <lei:LEIHeader><lei:ContentDate>2026-09-25T10:00:00Z</lei:ContentDate><lei:DeltaStart>2026-09-24T02:00:00Z</lei:DeltaStart></lei:LEIHeader>
+      <lei:LEIRecords><lei:LEIRecord>
+        <lei:LEI>5493001KJTIIGC8Y1R12</lei:LEI>
+        <lei:Entity><lei:LegalName>Offline GLEIF Entity</lei:LegalName><lei:LegalJurisdiction>US</lei:LegalJurisdiction></lei:Entity>
+        <lei:Registration><lei:RegistrationStatus>ISSUED</lei:RegistrationStatus></lei:Registration>
+      </lei:LEIRecord></lei:LEIRecords></lei:LEIData>`;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(xml)),
+    );
 
-    await expect(
-      downloadGleifXml('https://offline.test/lei.xml', new AbortController().signal),
-    ).resolves.toContain('Offline GLEIF Entity');
-    await expect(
-      harvestLeiLevel1('https://offline.test/lei.xml', new AbortController().signal),
-    ).resolves.toEqual([
+    const file = await openGleifFile(
+      'lei2',
+      'https://offline.test/lei.xml',
+      new AbortController().signal,
+    );
+    const records = [];
+    for await (const record of file.records) records.push(record);
+
+    expect(file.header).toEqual({
+      contentDate: '2026-09-25T10:00:00Z',
+      deltaStart: '2026-09-24T02:00:00Z',
+    });
+    expect(records).toEqual([
       {
         lei: '5493001KJTIIGC8Y1R12',
         legalName: 'Offline GLEIF Entity',
@@ -132,6 +164,5 @@ describe('GLEIF boundaries', () => {
         status: 'ISSUED',
       },
     ]);
-    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

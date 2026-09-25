@@ -21,7 +21,7 @@ import {
 export const listSourcesTool = tool('sanctions_list_sources', {
   title: 'sanctions-screening-mcp-server: list sources',
   description:
-    "List the sanctions watchlists (OFAC SDN + Consolidated, EU, UK, UN) and GLEIF datasets currently loaded in the local mirror, each with its record count, source URL, license, and the mirror's readiness and as-of timestamp. Use this for provenance and freshness on any result — results are only as current as the last mirror refresh, and a not-ready mirror means screening cannot run yet. Attribution: UK data is under the Open Government Licence v3.0; all sources are cited here.",
+    "List the sanctions watchlists (OFAC SDN + Consolidated, EU, UK, UN) and GLEIF datasets currently loaded in the local mirror, each with its record count, source URL, license, and the mirror's readiness and as-of timestamp — for GLEIF, also whether its reporting exceptions are loaded and how many. Use this for provenance and freshness on any result — results are only as current as the last mirror refresh, and a not-ready mirror means screening cannot run yet. Attribution: UK data is under the Open Government Licence v3.0; all sources are cited here.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({}),
   output: z.object({
@@ -39,13 +39,26 @@ export const listSourcesTool = tool('sanctions_list_sources', {
       .string()
       .optional()
       .describe('ISO 8601 timestamp of the last completed GLEIF sync, when available.'),
+    reportingExceptionsLoaded: z
+      .boolean()
+      .describe(
+        'Whether GLEIF reporting exceptions are loaded. When false, sanctions_trace_ownership reads a parent level with no published relationship as unknown.',
+      ),
     sources: z
       .array(
         z
           .object({
             code: z.string().describe('Source code (ofac_sdn, eu, …, or gleif).'),
             label: z.string().describe('Human-readable source name.'),
-            recordCount: z.number().describe('Records currently loaded for this source.'),
+            recordCount: z
+              .number()
+              .describe('Records currently loaded for this source (Level 1 entities for gleif).'),
+            reportingExceptionCount: z
+              .number()
+              .optional()
+              .describe(
+                'GLEIF reporting-exception records loaded (gleif only). Absent when the dataset has never been loaded — never read as zero.',
+              ),
             url: z.string().describe('Upstream source URL the mirror harvests from.'),
             license: z.string().describe('Redistribution license / terms for this source.'),
           })
@@ -74,6 +87,7 @@ export const listSourcesTool = tool('sanctions_list_sources', {
       code: 'gleif',
       label: GLEIF_SOURCE_LABEL,
       recordCount: lei.entityCount,
+      ...(lei.exceptionsLoaded ? { reportingExceptionCount: lei.exceptionCount } : {}),
       url: gleifSourceUrl(),
       license: GLEIF_LICENSE,
     });
@@ -85,6 +99,7 @@ export const listSourcesTool = tool('sanctions_list_sources', {
       ...(sanctions.completedAt ? { sanctionsAsOf: sanctions.completedAt } : {}),
       leiReady: lei.ready,
       ...(lei.completedAt ? { leiAsOf: lei.completedAt } : {}),
+      reportingExceptionsLoaded: lei.exceptionsLoaded,
       sources,
     };
   },
@@ -97,10 +112,18 @@ export const listSourcesTool = tool('sanctions_list_sources', {
     lines.push(
       `**GLEIF mirror:** ${r.leiReady ? 'ready' : 'NOT ready'}${r.leiAsOf ? ` (as of ${r.leiAsOf})` : ''}`,
     );
+    if (!r.reportingExceptionsLoaded) {
+      lines.push(
+        '**GLEIF reporting exceptions:** not loaded — ownership traces read an unpublished parent as unknown. mirror:refresh loads them, or mirror:init on a mirror loaded before they existed.',
+      );
+    }
     lines.push('');
     for (const s of r.sources) {
       lines.push(`### ${s.label} (\`${s.code}\`)`);
       lines.push(`**Records:** ${s.recordCount} | **License:** ${s.license}`);
+      if (s.reportingExceptionCount !== undefined) {
+        lines.push(`**Reporting exceptions:** ${s.reportingExceptionCount}`);
+      }
       lines.push(`**Source:** ${s.url}`);
       lines.push('');
     }

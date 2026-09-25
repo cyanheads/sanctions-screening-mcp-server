@@ -125,10 +125,16 @@
         },
         {
           "name": "SANCTIONS_REFRESH_CRON",
-          "description": "Cron for the scheduled sanctions refresh (HTTP transport only). Each run re-harvests the sanctions lists and rebuilds the name and identifier indexes under a 4-hour time bound. GLEIF deltas are refreshed manually via mirror:refresh.",
+          "description": "Cron for the scheduled mirror refresh (HTTP transport only). Each run re-harvests the sanctions lists and rebuilds the name and identifier indexes, then applies the GLEIF delta windows its checkpoint calls for, under one 4-hour time bound. A GLEIF gap that needs mirror:init is logged, never loaded in-process.",
           "format": "string",
           "isRequired": false,
           "default": "0 4 * * *"
+        },
+        {
+          "name": "SANCTIONS_REFRESH_SKIP_GLEIF",
+          "description": "Set to 1 to skip the GLEIF leg of the scheduled refresh and of mirror:refresh, refreshing only the sanctions lists.",
+          "format": "string",
+          "isRequired": false
         },
         {
           "name": "SANCTIONS_FUZZY_MIN_SCORE",

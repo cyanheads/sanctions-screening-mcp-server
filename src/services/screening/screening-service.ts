@@ -2,7 +2,8 @@
  * @fileoverview The screening service — owns the two local mirrors (sanctions
  * `designation` + GLEIF `lei_entity`, both SQLite + FTS5 via the framework
  * MirrorService), the normalized-schema write path that keeps the per-alias
- * `name` index and `lei_relationship` table in lockstep, and the matching
+ * `name` index, the per-name `lei_name` index, and the `lei_relationship` table
+ * in lockstep, and the matching
  * engine (exact → strict-token → scored Jaro-Winkler / phonetic fuzzy) and the
  * exact identifier lookup. All seven tools compose against this service; the
  * agent never sees the source boundary.
@@ -46,6 +47,10 @@ import {
   ensureLeiAuxSchema,
   IDENTIFIER_STAMP_TABLE,
   IDENTIFIER_TABLE,
+  LEI_EXCEPTION_TABLE,
+  LEI_NAME_FTS_TABLE,
+  LEI_NAME_STAMP_TABLE,
+  LEI_NAME_TABLE,
   LEI_RELATIONSHIP_TABLE,
   leiStoreSpec,
   NAME_FTS_TABLE,
@@ -64,18 +69,24 @@ import {
 import type {
   DesignationPayload,
   EntityType,
+  GleifCheckpoint,
   IdentifierRecord,
+  LeiAlternateName,
+  LeiEntityRecord,
   LeiMatch,
+  LeiRelationshipChange,
   MatchMode,
   NameRecord,
   NormalizedDesignation,
   NormalizedLeiEntity,
   NormalizedLeiRelationship,
+  NormalizedReportingException,
   QueryTokenCoverage,
+  ReportingExceptionChange,
   ScreeningHit,
   SourceCode,
 } from '@/services/screening/types.js';
-import { SOURCE_CODES } from '@/services/screening/types.js';
+import { LEGAL_NAME_TYPE, SOURCE_CODES, UNKNOWN_NAME_TYPE } from '@/services/screening/types.js';
 
 /** A loaded source's provenance + freshness, surfaced by `sanctions_list_sources`. */
 export interface SourceStatus {
@@ -142,6 +153,10 @@ export interface ScreenNameResult {
 
 /** Options for {@link ScreeningService.resolveEntity}. */
 export interface ResolveEntityOptions {
+  /**
+   * Upper-case legal jurisdiction: a country (`US`), which also matches every
+   * subdivision under it (`US-DE`, `US-CA`), or a subdivision, matched exactly.
+   */
   jurisdiction?: string;
   limit: number;
   matchMode: MatchMode;
@@ -149,11 +164,18 @@ export interface ResolveEntityOptions {
   /** Zero-based index of the first candidate to return; defaults to 0. */
   offset?: number;
   query: string;
+  /** `issued` matches ISSUED, `lapsed` exactly LAPSED; `any` applies no status predicate. */
   status: 'any' | 'issued' | 'lapsed';
 }
 
 /** Result of an LEI resolution pass. */
 export interface ResolveEntityResult {
+  /**
+   * False on a mirror whose GLEIF name index was never built: only legal names
+   * took part in retrieval, and a name published only as an other or
+   * transliterated name could not be found.
+   */
+  alternateNamesIndexed: boolean;
   fuzzyFallbackTriggered: boolean;
   matches: LeiMatch[];
   modeUsed: MatchMode;
@@ -229,13 +251,25 @@ interface RelRow {
   relationship_type: string;
 }
 
-/** Internal LEI candidate row used during resolution. */
+/** An LEI candidate row read by the pre-index resolution path, straight off `lei_entity`. */
 interface LeiCandidateRow {
   jurisdiction: string | null;
   legal_name: string;
   lei: string;
   normalized_name: string;
   other_names: string;
+  status: string | null;
+}
+
+/** One `lei_name` row joined to its entity, as the indexed resolution path reads it. */
+interface LeiNameRow {
+  jurisdiction: string | null;
+  legal_name: string;
+  lei: string;
+  name: string;
+  name_type: string;
+  normalized: string;
+  rowid: number;
   status: string | null;
 }
 
@@ -262,7 +296,10 @@ const WHOLE_STRING_MIN_LENGTH_RATIO = 0.5;
  */
 const STRICT_RAW_ROW_CAP = 5000;
 
-/** The same bound for the strict LEI scan; one row per entity, so a lower cap suffices. */
+/**
+ * The same bound for the strict LEI scan. It counts name rows, about 1.2 per
+ * entity across GLEIF, so a lower cap than the designation scan's suffices.
+ */
 const LEI_STRICT_RAW_ROW_CAP = 2000;
 
 /**
@@ -290,6 +327,14 @@ export class ScreeningService {
   private readonly leiMirror: Mirror;
   private designationAuxReady = false;
   private leiAuxReady = false;
+  /**
+   * The reporting-exception row count, keyed by the GLEIF sync state it was taken
+   * under. The table holds millions of rows and SQLite keeps no row count, so a
+   * `COUNT(*)` scans all of it — seconds cold — and `sanctions_list_sources` would
+   * pay that per call. The rows change only as a load or refresh applies, and each
+   * of those commits a new `completedAt` and checkpoint, so the key moves with them.
+   */
+  private exceptionCountByState: { count: number; state: string } | undefined;
 
   constructor(private readonly config: ServerConfig) {
     // The two mirrors use SEPARATE database files. `mirror_sync_state` is a
@@ -345,9 +390,9 @@ export class ScreeningService {
     this.leiMirror = defineMirror({
       name: 'gleif-entities',
       store: sqliteMirrorStore({ path: gleifPath(config.mirrorPath), ...leiStoreSpec }),
-      // GLEIF ingest is driven directly via ingestLeiEntities/ingestLeiRelationships
-      // (golden-copy init + delta refresh), so the mirror's own sync yields no
-      // pages — the lifecycle scripts call the ingest methods.
+      // GLEIF ingest is driven directly through the ingest methods (golden-copy
+      // load + checkpointed delta refresh, `gleif-sync.ts`), so the mirror's own
+      // sync yields no pages.
       sync: emptySync,
     });
   }
@@ -387,11 +432,22 @@ export class ScreeningService {
     return raw;
   }
 
-  /** Open the GLEIF mirror's raw handle, ensuring `lei_relationship` exists first. */
+  /**
+   * Open the GLEIF mirror's raw handle, ensuring the auxiliary tables exist first.
+   *
+   * A mirror that holds no entity yet has its name index complete by definition,
+   * and every write from here on keeps it so, so the first open records that
+   * build. A mirror an earlier release populated gains the tables empty and no
+   * record: its index is built by the next golden-copy load (`mirror:init`).
+   */
   private async leiHandle(): Promise<SqliteHandle> {
     const raw = await this.leiMirror.raw();
     if (!this.leiAuxReady) {
       ensureLeiAuxSchema(raw);
+      const empty = !raw.prepare(`SELECT 1 FROM ${leiStoreSpec.table} LIMIT 1`).get();
+      if (empty && leiNameStamp(raw) === undefined) {
+        writeLeiNameStamp(raw, leiStateStamp(await this.leiMirror.store.readState()));
+      }
       this.leiAuxReady = true;
     }
     return raw;
@@ -603,62 +659,89 @@ export class ScreeningService {
     });
   }
 
-  /** Apply a batch of GLEIF Level 1 entity records via the LEI mirror store. */
+  /**
+   * Apply a batch of GLEIF Level 1 entity records, upserting by LEI in batch
+   * order and replacing each entity's `lei_name` rows in the same transaction, so
+   * no reader sees an entity without its names or with another version's. Every
+   * Level 1 write — golden copy, delta, or fixture — goes through here, so the
+   * name index follows every one of them. Level 1 files publish no deletion
+   * marker, so there is no removal path.
+   */
   async ingestLeiEntities(entities: NormalizedLeiEntity[]): Promise<void> {
     if (entities.length === 0) return;
-    await this.leiMirror.store.applyBatch(
-      entities.map((e) => ({
-        lei: e.lei,
-        legal_name: e.legalName,
-        normalized_name: fold(e.legalName),
-        other_names: JSON.stringify(e.otherNames),
-        jurisdiction: e.jurisdiction ?? null,
-        status: e.status ?? null,
-        legal_address: e.legalAddress ?? null,
-        headquarters_address: e.headquartersAddress ?? null,
-        registration_authority_id: e.registrationAuthorityId ?? null,
-        registration_authority_entity_id: e.registrationAuthorityEntityId ?? null,
-        last_update: e.lastUpdate ?? null,
-        payload: JSON.stringify(e),
-      })),
-      [],
-    );
+    const handle = await this.leiHandle();
+    handle.transaction(() => {
+      const upsert = handle.prepare(
+        `INSERT INTO ${leiStoreSpec.table}
+           (lei, legal_name, normalized_name, other_names, jurisdiction, status, legal_address,
+            headquarters_address, registration_authority_id, registration_authority_entity_id,
+            last_update, payload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(lei) DO UPDATE SET
+           legal_name=excluded.legal_name, normalized_name=excluded.normalized_name,
+           other_names=excluded.other_names, jurisdiction=excluded.jurisdiction,
+           status=excluded.status, legal_address=excluded.legal_address,
+           headquarters_address=excluded.headquarters_address,
+           registration_authority_id=excluded.registration_authority_id,
+           registration_authority_entity_id=excluded.registration_authority_entity_id,
+           last_update=excluded.last_update, payload=excluded.payload`,
+      );
+      const deleteNames = handle.prepare(`DELETE FROM ${LEI_NAME_TABLE} WHERE lei = ?`);
+      const insertName = handle.prepare(
+        `INSERT INTO ${LEI_NAME_TABLE}
+           (lei, name, normalized, name_type, suffix_terms, jurisdiction_terms)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      for (const e of entities) {
+        upsert.run(
+          e.lei,
+          e.legalName,
+          fold(e.legalName),
+          JSON.stringify(e.otherNames),
+          e.jurisdiction ?? null,
+          e.status ?? null,
+          e.legalAddress ?? null,
+          e.headquartersAddress ?? null,
+          e.registrationAuthorityId ?? null,
+          e.registrationAuthorityEntityId ?? null,
+          e.lastUpdate ?? null,
+          JSON.stringify(e),
+        );
+        deleteNames.run(e.lei);
+        writeLeiNames(insertName, e);
+      }
+    });
   }
 
   /**
-   * Apply a batch of GLEIF Level 2 relationships. Two modes:
-   *
-   * - `replaceByChild` (default — the delta-refresh path): replaces all rows for
-   *   each child LEI present in the batch, so re-stating a child's relationships is
-   *   idempotent. Correct only when a child's FULL relationship set is contained in
-   *   one call, which holds for a whole-delta harvest ingested in a single batch.
-   * - `replaceByChild: false` (the streaming golden-copy init path): pure
-   *   INSERT-OR-REPLACE with no per-child delete. The init orchestration clears the
-   *   whole table ONCE up front ({@link clearLeiRelationships}) and then streams
-   *   batches through this path — so a child whose relationships straddle a batch
-   *   boundary keeps every row. A per-child delete on the second batch would
-   *   otherwise wipe the first batch's rows for that child.
+   * Apply a batch of GLEIF Level 2 records in document order, each on its own
+   * (child, parent, type) key: a record GLEIF marked deleted removes its row, any
+   * other replaces it. A child's rows the batch does not name are left alone —
+   * a delta publishes only what changed, and a golden copy streams one child's
+   * relationships across batches. A key named twice ends in its last record's
+   * state. Deleting a row that is not stored is a no-op, so a re-applied delta
+   * converges.
    */
-  async ingestLeiRelationships(
-    relationships: NormalizedLeiRelationship[],
-    opts?: { replaceByChild?: boolean },
-  ): Promise<void> {
+  async ingestLeiRelationships(relationships: readonly LeiRelationshipChange[]): Promise<void> {
     if (relationships.length === 0) return;
     const handle = await this.leiHandle();
-    const replaceByChild = opts?.replaceByChild ?? true;
 
     handle.transaction(() => {
-      if (replaceByChild) {
-        const clear = handle.prepare(`DELETE FROM ${LEI_RELATIONSHIP_TABLE} WHERE child_lei = ?`);
-        for (const child of new Set(relationships.map((r) => r.childLei))) clear.run(child);
-      }
-      const insert = handle.prepare(
+      const remove = handle.prepare(
+        `DELETE FROM ${LEI_RELATIONSHIP_TABLE}
+         WHERE child_lei = ? AND parent_lei = ? AND relationship_type = ?`,
+      );
+      const upsert = handle.prepare(
         `INSERT OR REPLACE INTO ${LEI_RELATIONSHIP_TABLE}
            (child_lei, parent_lei, relationship_type, relationship_status, relationship_period)
          VALUES (?, ?, ?, ?, ?)`,
       );
       for (const r of relationships) {
-        insert.run(
+        if (r.deleted) {
+          remove.run(r.childLei, r.parentLei, r.relationshipType);
+          continue;
+        }
+        upsert.run(
           r.childLei,
           r.parentLei,
           r.relationshipType,
@@ -669,14 +752,80 @@ export class ScreeningService {
     });
   }
 
-  /**
-   * Wipe every GLEIF Level 2 relationship. The single up-front clear before a full
-   * golden-copy (init) reload, which then inserts in batches without per-child
-   * deletes (see {@link ingestLeiRelationships}, `replaceByChild: false`).
-   */
+  /** Wipe every GLEIF Level 2 relationship — the single clear before a golden-copy load. */
   async clearLeiRelationships(): Promise<void> {
     const handle = await this.leiHandle();
     handle.exec(`DELETE FROM ${LEI_RELATIONSHIP_TABLE}`);
+  }
+
+  /**
+   * Apply a batch of reporting-exception records in document order, each on its
+   * (LEI, category) key: a record GLEIF marked deleted removes its row, any other
+   * replaces it — the same per-record rule as {@link ingestLeiRelationships}.
+   */
+  async ingestReportingExceptions(exceptions: readonly ReportingExceptionChange[]): Promise<void> {
+    if (exceptions.length === 0) return;
+    const handle = await this.leiHandle();
+    handle.transaction(() => {
+      const remove = handle.prepare(
+        `DELETE FROM ${LEI_EXCEPTION_TABLE} WHERE lei = ? AND category = ?`,
+      );
+      const upsert = handle.prepare(
+        `INSERT OR REPLACE INTO ${LEI_EXCEPTION_TABLE} (lei, category, reasons) VALUES (?, ?, ?)`,
+      );
+      for (const e of exceptions) {
+        if (e.deleted) remove.run(e.lei, e.category);
+        else upsert.run(e.lei, e.category, JSON.stringify(e.reasons));
+      }
+    });
+  }
+
+  /** Wipe every reporting exception — the single clear before a golden-copy load. */
+  async clearReportingExceptions(): Promise<void> {
+    const handle = await this.leiHandle();
+    handle.exec(`DELETE FROM ${LEI_EXCEPTION_TABLE}`);
+  }
+
+  /**
+   * The reporting exceptions stored for each of `leis`, category-ordered; an LEI
+   * with none is absent from the map. One query per call. Whether the dataset is
+   * loaded at all is {@link reportingExceptionsLoaded}'s question, not this one's.
+   */
+  async getReportingExceptions(
+    leis: readonly string[],
+  ): Promise<Map<string, Omit<NormalizedReportingException, 'lei'>[]>> {
+    const byLei = new Map<string, Omit<NormalizedReportingException, 'lei'>[]>();
+    if (leis.length === 0) return byLei;
+    const handle = await this.leiHandle();
+    const rows = handle
+      .prepare<{ category: string; lei: string; reasons: string }>(
+        `SELECT lei, category, reasons FROM ${LEI_EXCEPTION_TABLE}
+         WHERE lei IN (SELECT value FROM json_each(?))
+         ORDER BY lei, category`,
+      )
+      .all(JSON.stringify(leis));
+    for (const row of rows) {
+      const entry = { category: row.category, reasons: JSON.parse(row.reasons) as string[] };
+      const list = byLei.get(row.lei);
+      if (list) list.push(entry);
+      else byLei.set(row.lei, [entry]);
+    }
+    return byLei;
+  }
+
+  /** The GLEIF mirror's per-dataset checkpoint; empty when none is recorded. */
+  async gleifCheckpoint(): Promise<GleifCheckpoint> {
+    return parseGleifCheckpoint((await this.leiMirror.store.readState()).checkpoint);
+  }
+
+  /**
+   * True once a reporting-exceptions load is recorded in the checkpoint. Never
+   * inferred from the table: a mirror written before the dataset existed gains the
+   * table empty, and an empty table read as "no exceptions" would claim an entity
+   * reports its parents when nothing was ever loaded.
+   */
+  async reportingExceptionsLoaded(): Promise<boolean> {
+    return (await this.gleifCheckpoint()).repex !== undefined;
   }
 
   /**
@@ -693,51 +842,76 @@ export class ScreeningService {
     });
   }
 
-  /** Mark the GLEIF mirror's sync state complete — see {@link markSanctionsReady}. */
-  async markLeiReady(total: number): Promise<void> {
+  /**
+   * Mark the GLEIF mirror's sync state complete as of now — see
+   * {@link markSanctionsReady} — recording `checkpoint` as its per-dataset
+   * checkpoint, or keeping the stored one when none is given. The store writes
+   * every non-durable field it is handed and clears the rest, so the checkpoint is
+   * always passed explicitly here: a write that omitted it would erase it.
+   */
+  async markLeiReady(
+    total: number,
+    checkpoint?: GleifCheckpoint,
+    options: { namesIndexed?: true } = {},
+  ): Promise<void> {
+    const kept = checkpoint ?? (await this.gleifCheckpoint());
+    // The name index stays built across this commit when it was built before it —
+    // every write since went through ingestLeiEntities — or when the caller just
+    // rewrote every entity (a golden-copy load). The stamp follows the state write:
+    // a crash between the two reads as unbuilt, the safe direction.
+    const indexed = options.namesIndexed === true || (await this.leiNamesIndexed());
+    const completedAt = new Date().toISOString();
     await this.leiMirror.store.writeState({
       status: 'complete',
-      completedAt: new Date().toISOString(),
+      completedAt,
       total,
+      ...(Object.keys(kept).length > 0 ? { checkpoint: JSON.stringify(kept) } : {}),
+    });
+    if (indexed) writeLeiNameStamp(await this.leiHandle(), completedAt);
+  }
+
+  /**
+   * True when the GLEIF name index is known complete: its stamp is the sync
+   * state's current `completedAt`. Never inferred from the table — a mirror an
+   * earlier release wrote gains it empty. An earlier release's write after a
+   * rollback moves `completedAt` without re-stamping, so its entities, whose
+   * names the index never saw, read as unindexed too.
+   */
+  async leiNamesIndexed(): Promise<boolean> {
+    const stamp = leiNameStamp(await this.leiHandle());
+    return stamp !== undefined && stamp === leiStateStamp(await this.leiMirror.store.readState());
+  }
+
+  /**
+   * Record that a GLEIF golden-copy load has started: the checkpoint is cleared, so
+   * a load that never finishes leaves nothing for a refresh to apply deltas onto.
+   * `completedAt` and `total` are durable in the store, so the mirror stays ready —
+   * and queryable — on its last completed load while this one runs.
+   */
+  async beginLeiLoad(): Promise<void> {
+    await this.leiMirror.store.writeState({
+      status: 'in_progress',
+      startedAt: new Date().toISOString(),
     });
   }
 
   /**
-   * After a GLEIF delta apply, advance the LEI mirror's freshness — a fresh
-   * `completedAt` and the resulting live entity count as `total` — so
-   * `sanctions_list_sources` / `sanctions://sources` report the data actually
-   * loaded, not the last init's timestamp.
-   *
-   * Guarded: freshness advances ONLY when the mirror is already ready (a full sync
-   * has completed). Applying a small delta to a never-initialized mirror is not
-   * completion, so a delta must never flip an empty GLEIF mirror to ready — the
-   * caller logs a notice and leaves it for `mirror:init`. `total` is the live
-   * entity count from {@link leiReadiness}, never the size of the delta batch just
-   * applied. `writeState` preserves `completedAt`/`total` when omitted, so
-   * {@link markLeiReady} passes all three (`status`, `completedAt`, `total`)
-   * explicitly to actually move them.
-   */
-  async advanceLeiFreshnessIfReady(): Promise<{ advanced: boolean; entityCount: number }> {
-    const readiness = await this.leiReadiness();
-    if (!readiness.ready) return { advanced: false, entityCount: readiness.entityCount };
-    await this.markLeiReady(readiness.entityCount);
-    return { advanced: true, entityCount: readiness.entityCount };
-  }
-
-  /**
-   * Load a synthetic fixture into both mirrors and mark them ready. For tests and
-   * a quick local smoke run — NOT the real corpus, which loads via `mirror:init`.
+   * Load a synthetic fixture into both mirrors and mark them ready, reporting
+   * exceptions recorded as loaded. For tests and a quick local smoke run — NOT the
+   * real corpus, which loads via `mirror:init`.
    */
   async seedFixtures(fixtures: {
     designations: NormalizedDesignation[];
     leiEntities: NormalizedLeiEntity[];
     leiRelationships: NormalizedLeiRelationship[];
+    reportingExceptions: NormalizedReportingException[];
   }): Promise<void> {
     await this.ingestDesignations(fixtures.designations);
     await this.ingestLeiEntities(fixtures.leiEntities);
     await this.ingestLeiRelationships(fixtures.leiRelationships);
+    await this.ingestReportingExceptions(fixtures.reportingExceptions);
     await this.markSanctionsReady(fixtures.designations.length);
-    await this.markLeiReady(fixtures.leiEntities.length);
+    await this.markLeiReady(fixtures.leiEntities.length, { repex: new Date().toISOString() });
   }
 
   // ─── Matching engine: screen a name against the sanctions lists ────────────
@@ -913,9 +1087,7 @@ export class ScreeningService {
          FROM ${NAME_TABLE} n
          JOIN designation d ON d.id = n.designation_id`;
     const prefixes = blockingPrefixes(args.queryTokens);
-    // Per-strategy budget keeps total work bounded while guaranteeing fair
-    // representation; the final scored set is still capped to `args.cap`.
-    const perStrategyLimit = Math.max(args.cap * 4, 200);
+    const limit = perStrategyLimit(args.cap);
     const byRowid = new Map<number, NameJoinRow & { rowid: number }>();
     const collect = (rows: (NameJoinRow & { rowid: number })[]): void => {
       for (const r of rows) if (!byRowid.has(r.rowid)) byRowid.set(r.rowid, r);
@@ -928,7 +1100,7 @@ export class ScreeningService {
           .prepare<NameJoinRow & { rowid: number }>(
             `${select} WHERE n.phonetic IN (${placeholders})${args.sourceFilter}${args.typeFilter} LIMIT ?`,
           )
-          .all(...phoneticKeys, perStrategyLimit),
+          .all(...phoneticKeys, limit),
       );
     }
     for (const prefix of prefixes) {
@@ -937,7 +1109,7 @@ export class ScreeningService {
           .prepare<NameJoinRow & { rowid: number }>(
             `${select} WHERE n.normalized LIKE ?${args.sourceFilter}${args.typeFilter} LIMIT ?`,
           )
-          .all(`%${prefix}%`, perStrategyLimit),
+          .all(`%${prefix}%`, limit),
       );
     }
     if (byRowid.size === 0) return [];
@@ -1000,7 +1172,7 @@ export class ScreeningService {
   }
 
   /**
-   * Fuzzy admission gate, shared by {@link runFuzzy} and {@link runLeiFuzzy} so both
+   * Fuzzy admission gate, shared by {@link runFuzzy} and {@link rankFuzzy} so both
    * paths admit on one consistent rule. This is a SEPARATE predicate from the
    * surfaced score, which stays the raw Jaro-Winkler max of the whole-string and
    * best token-pair measurements (never a composite). A candidate is admitted when
@@ -1199,25 +1371,50 @@ export class ScreeningService {
 
   // ─── LEI resolution ──────────────────────────────────────────────────────
 
-  /** Resolve a company name to ranked GLEIF LEI candidates. */
+  /**
+   * Resolve a company name to ranked GLEIF LEI candidates, one per LEI.
+   *
+   * On a mirror whose name index is built, every published name — legal, other,
+   * and transliterated — takes part, and both passes are FTS lookups with the
+   * jurisdiction resolved inside them. On a mirror an earlier release wrote, the
+   * index does not exist yet: resolution runs over legal names as that release
+   * did, under the same status and jurisdiction rules, and says so in
+   * `alternateNamesIndexed`.
+   *
+   * The status predicate wraps the column in `UPPER()` on purpose. Non-sargable,
+   * it cannot become the access path: ISSUED is 57% of the corpus, and the planner
+   * choosing `lei_entity_status_idx` over the name lookup or the jurisdiction index
+   * ran ~45× slower. Strict, fuzzy, and the strict→fuzzy fallback share it.
+   */
   async resolveEntity(opts: ResolveEntityOptions, ctx: Context): Promise<ResolveEntityResult> {
     const normalizedQuery = fold(opts.query);
     const queryTokens = tokenize(normalizedQuery);
     const handle = await this.leiHandle();
     const offset = opts.offset ?? 0;
+    const indexed = await this.leiNamesIndexed();
 
-    const filters: string[] = [];
-    if (opts.jurisdiction)
-      filters.push(`e.jurisdiction = '${this.escapeLiteral(opts.jurisdiction)}'`);
-    if (opts.status === 'issued') filters.push(`UPPER(e.status) = 'ISSUED'`);
-    else if (opts.status === 'lapsed') filters.push(`UPPER(e.status) != 'ISSUED'`);
-    const filterClause = filters.length ? ` AND ${filters.join(' AND ')}` : '';
+    const statusClause =
+      opts.status === 'any'
+        ? ''
+        : ` AND UPPER(e.status) = '${opts.status === 'issued' ? 'ISSUED' : 'LAPSED'}'`;
+    // The index path intersects the jurisdiction inside its FTS lookup; the
+    // pre-index path filters the joined row, as it always has.
+    const indexScope = {
+      jurisdictionMatch: opts.jurisdiction ? jurisdictionMatch(opts.jurisdiction) : '',
+      statusClause,
+    };
+    const legacyScope = {
+      filterClause: `${opts.jurisdiction ? ` AND ${this.jurisdictionClause(opts.jurisdiction)}` : ''}${statusClause}`,
+    };
 
-    const strictScan = this.runLeiStrict(handle, { normalizedQuery, filterClause });
+    const strictScan = indexed
+      ? this.runLeiStrict(handle, { normalizedQuery, queryTokens, ...indexScope })
+      : this.runLegacyLeiStrict(handle, { normalizedQuery, ...legacyScope });
     const strict = strictScan.results;
     const wantFuzzy = opts.matchMode === 'fuzzy' || strict.length === 0;
     if (!wantFuzzy || queryTokens.length === 0) {
       return {
+        alternateNamesIndexed: indexed,
         matches: strict.slice(offset, offset + opts.limit),
         modeUsed: 'strict',
         normalizedQuery,
@@ -1227,22 +1424,25 @@ export class ScreeningService {
       };
     }
 
-    const minScore = opts.minScore ?? this.config.fuzzyMinScore;
-    const fuzzy = this.runLeiFuzzy(handle, {
+    const scoring = {
       normalizedQuery,
       queryTokens,
-      filterClause,
-      minScore,
+      minScore: opts.minScore ?? this.config.fuzzyMinScore,
       cap: this.config.fuzzyMaxResults,
-    });
+    };
+    const fuzzy = indexed
+      ? this.runLeiFuzzy(handle, { ...scoring, ...indexScope })
+      : this.runLegacyLeiFuzzy(handle, { ...scoring, ...legacyScope });
     const seen = new Set(strict.map((m) => m.lei));
     const merged = [...strict, ...fuzzy.filter((m) => !seen.has(m.lei))];
     ctx.log.debug('LEI resolution complete', {
       normalizedQuery,
+      alternateNamesIndexed: indexed,
       strictCount: strict.length,
       fuzzyCount: fuzzy.length,
     });
     return {
+      alternateNamesIndexed: indexed,
       matches: merged.slice(offset, offset + opts.limit),
       modeUsed: 'fuzzy',
       normalizedQuery,
@@ -1254,9 +1454,128 @@ export class ScreeningService {
     };
   }
 
+  /**
+   * Strict pass over the name index: every query token present in one name, the
+   * jurisdiction intersected inside the same FTS lookup. An LEI several of whose
+   * names match yields one candidate: its exact name if any, else its legal name,
+   * else its first-written name — so matchedName and matchType describe one name.
+   */
   private runLeiStrict(
     handle: SqliteHandle,
-    args: { normalizedQuery: string; filterClause: string },
+    args: {
+      jurisdictionMatch: string;
+      normalizedQuery: string;
+      queryTokens: string[];
+      statusClause: string;
+    },
+  ): BoundedScan<LeiMatch> {
+    if (args.queryTokens.length === 0) return { results: [], capped: false };
+    const match = [...args.queryTokens.map((t) => `normalized : "${t}"`), args.jurisdictionMatch]
+      .filter(Boolean)
+      .join(' AND ');
+    const rows = handle
+      .prepare<LeiNameRow>(
+        `${LEI_NAME_SELECT}
+         FROM ${LEI_NAME_FTS_TABLE} f
+         JOIN ${LEI_NAME_TABLE} n ON n.rowid = f.rowid
+         JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
+         WHERE ${LEI_NAME_FTS_TABLE} MATCH ?${args.statusClause}
+         LIMIT ${LEI_STRICT_RAW_ROW_CAP}`,
+      )
+      .all(match);
+
+    const byLei = new Map<string, { exact: boolean; row: LeiNameRow }>();
+    for (const row of rows) {
+      const exact = row.normalized === args.normalizedQuery;
+      const held = byLei.get(row.lei);
+      if (
+        !held ||
+        (exact && !held.exact) ||
+        (exact === held.exact && compareNameRows(row, held.row) < 0)
+      ) {
+        byLei.set(row.lei, { exact, row });
+      }
+    }
+    return {
+      // LEI breaks same-band ties — the total order offset pagination requires.
+      results: [...byLei.values()]
+        .map(({ exact, row }) => leiMatch(row, exact ? 'exact' : 'strong', row))
+        .sort(
+          (a, b) => matchRank(b.matchType) - matchRank(a.matchType) || a.lei.localeCompare(b.lei),
+        ),
+      capped: rows.length >= LEI_STRICT_RAW_ROW_CAP,
+    };
+  }
+
+  /**
+   * Fuzzy pass over the name index. Each distinct query-token prefix is one FTS
+   * prefix lookup against the names and the unsegmented-script suffix terms, with
+   * the jurisdiction intersected inside it — so its cost follows the names that
+   * match, not the table. The pooled LEIs' names are then read by LEI and scored.
+   */
+  private runLeiFuzzy(
+    handle: SqliteHandle,
+    args: LeiFuzzyArgs & { jurisdictionMatch: string; statusClause: string },
+  ): LeiMatch[] {
+    // Every query token blocks, one bounded lookup each: blocking on only the
+    // first token starved the pool when it wasn't the entity's leading word
+    // (order swaps) or was a common word that exhausted the cap.
+    const block = handle.prepare<{ lei: string }>(
+      `SELECT n.lei
+       FROM ${LEI_NAME_FTS_TABLE} f
+       JOIN ${LEI_NAME_TABLE} n ON n.rowid = f.rowid
+       JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
+       WHERE ${LEI_NAME_FTS_TABLE} MATCH ?${args.statusClause}
+       LIMIT ?`,
+    );
+    const within = args.jurisdictionMatch ? ` AND ${args.jurisdictionMatch}` : '';
+    const pooled = new Set<string>();
+    for (const prefix of blockingPrefixes(args.queryTokens)) {
+      for (const { lei } of block.all(
+        `{normalized suffix_terms} : "${prefix}"*${within}`,
+        perStrategyLimit(args.cap),
+      )) {
+        pooled.add(lei);
+      }
+    }
+    if (pooled.size === 0) return [];
+
+    const rows = handle
+      .prepare<LeiNameRow>(
+        `${LEI_NAME_SELECT}
+         FROM ${LEI_NAME_TABLE} n
+         JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
+         WHERE n.lei IN (SELECT value FROM json_each(?))`,
+      )
+      .all(JSON.stringify([...pooled]));
+    const byLei = new Map<string, LeiNameRow[]>();
+    for (const row of rows) {
+      const names = byLei.get(row.lei);
+      if (names) names.push(row);
+      else byLei.set(row.lei, [row]);
+    }
+    return this.rankFuzzy(
+      [...byLei.values()].map((names) => names.sort(compareNameRows)),
+      args,
+    );
+  }
+
+  /**
+   * `(e.jurisdiction = 'US' OR e.jurisdiction GLOB 'US-*')` for a country, plain
+   * equality for a subdivision — the pre-index path's predicate. Both forms stay
+   * on `lei_entity_jurisdiction_idx`: `LIKE` would not (case-insensitive over a
+   * BINARY column).
+   */
+  private jurisdictionClause(code: string): string {
+    return COUNTRY_CODE.test(code)
+      ? `(e.jurisdiction = '${code}' OR e.jurisdiction GLOB '${code}-*')`
+      : `e.jurisdiction = '${this.escapeLiteral(code)}'`;
+  }
+
+  /** Strict pass of a mirror whose name index is not built: legal names only, as 0.3.0 ran it. */
+  private runLegacyLeiStrict(
+    handle: SqliteHandle,
+    args: { filterClause: string; normalizedQuery: string },
   ): BoundedScan<LeiMatch> {
     const match = buildFtsMatch(args.normalizedQuery);
     if (!match) return { results: [], capped: false };
@@ -1270,12 +1589,13 @@ export class ScreeningService {
       )
       .all(match);
     return {
-      // LEI breaks same-band ties — the total order offset pagination requires.
       results: rows
-        .map((row) => {
-          const isExact = row.normalized_name === args.normalizedQuery;
-          return this.leiRowToMatch(row, isExact ? 'exact' : 'strong', row.legal_name);
-        })
+        .map((row) =>
+          leiMatch(row, row.normalized_name === args.normalizedQuery ? 'exact' : 'strong', {
+            name: row.legal_name,
+            name_type: LEGAL_NAME_TYPE,
+          }),
+        )
         .sort(
           (a, b) => matchRank(b.matchType) - matchRank(a.matchType) || a.lei.localeCompare(b.lei),
         ),
@@ -1283,24 +1603,17 @@ export class ScreeningService {
     };
   }
 
-  private runLeiFuzzy(
+  /**
+   * Fuzzy pass of a mirror whose name index is not built, as 0.3.0 ran it: a
+   * `LIKE '%prefix%'` scan of legal names per query token. Other names stored
+   * with the record are scored for an entity the scan pools, but never pool one.
+   */
+  private runLegacyLeiFuzzy(
     handle: SqliteHandle,
-    args: {
-      normalizedQuery: string;
-      queryTokens: string[];
-      filterClause: string;
-      minScore: number;
-      cap: number;
-    },
+    args: LeiFuzzyArgs & { filterClause: string },
   ): LeiMatch[] {
-    // Block on EVERY query token's leading 3 chars, one bounded query each, then
-    // merge deduped by LEI. Blocking on only the first token starved the pool
-    // when the first token wasn't the entity's leading word (order swaps) or was
-    // a common word that exhausted the cap before the distinctive token's rows.
-    const prefixes = blockingPrefixes(args.queryTokens);
-    const perStrategyLimit = Math.max(args.cap * 4, 200);
     const byLei = new Map<string, LeiCandidateRow>();
-    for (const prefix of prefixes) {
+    for (const prefix of blockingPrefixes(args.queryTokens)) {
       const part = handle
         .prepare<LeiCandidateRow>(
           `SELECT e.lei, e.legal_name, e.normalized_name, e.other_names, e.jurisdiction, e.status
@@ -1308,56 +1621,63 @@ export class ScreeningService {
            WHERE e.normalized_name LIKE ?${args.filterClause}
            LIMIT ?`,
         )
-        .all(`%${prefix}%`, perStrategyLimit);
+        .all(`%${prefix}%`, perStrategyLimit(args.cap));
       for (const r of part) if (!byLei.has(r.lei)) byLei.set(r.lei, r);
     }
-    const rows = [...byLei.values()];
+    return this.rankFuzzy(
+      [...byLei.values()].map((row) => [
+        { ...row, name: row.legal_name, name_type: LEGAL_NAME_TYPE },
+        ...(JSON.parse(row.other_names || '[]') as string[]).map((name) => ({
+          ...row,
+          name,
+          name_type: UNKNOWN_NAME_TYPE,
+        })),
+      ]),
+      args,
+    );
+  }
 
+  /**
+   * Score each pooled LEI's names — legal name first — and keep its best
+   * admitted name, then rank and cap. The admission gate is runFuzzy's, applied
+   * per name: a name is eligible only when it explains enough of the query (the
+   * whole string clears the floor, or at least half the query tokens do), so one
+   * strong token pair can't carry an unrelated multi-token query on a short name.
+   * The surfaced score is the raw Jaro-Winkler max of that one name, and coverage
+   * is the same name's, so matchedName / matchedNameType / score / coverage
+   * describe one name. Ties on score go to higher coverage, then to the earlier name.
+   */
+  private rankFuzzy(candidates: LeiCandidateName[][], args: LeiFuzzyArgs): LeiMatch[] {
     const scored: LeiMatch[] = [];
-    for (const row of rows) {
-      const names = [row.legal_name, ...(JSON.parse(row.other_names || '[]') as string[])];
-      // Same admission gate as runFuzzy, applied per candidate name: a name is
-      // eligible only when it explains enough of the query (the whole string clears
-      // the floor, or at least half the query tokens do), so one strong token pair
-      // can't carry an unrelated multi-token query on a short legal/trading name.
-      // The surfaced score stays the raw Jaro-Winkler max of the best ELIGIBLE name;
-      // coverage is that same name's, so matchedName/score/coverage stay consistent.
-      let best = 0;
-      let bestName = row.legal_name;
-      let bestCovered = 0;
-      let admitted = false;
+    for (const names of candidates) {
+      let best: { covered: number; name: (typeof names)[number]; score: number } | undefined;
       for (const name of names) {
-        const folded = fold(name);
+        const folded = fold(name.name);
         const candidateTokens = tokenize(folded);
         const wholeScore = jaroWinkler(args.normalizedQuery, folded);
         const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
         const covered = tokenCoverage(args.queryTokens, candidateTokens, args.minScore);
-        if (
-          !this.admitFuzzy(
-            args.normalizedQuery,
-            folded,
-            args.queryTokens.length,
-            covered,
-            wholeScore,
-            tokenScore,
-            args.minScore,
-          )
-        ) {
-          continue;
+        const admitted = this.admitFuzzy(
+          args.normalizedQuery,
+          folded,
+          args.queryTokens.length,
+          covered,
+          wholeScore,
+          tokenScore,
+          args.minScore,
+        );
+        if (!admitted) continue;
+        const score = Math.max(wholeScore, tokenScore);
+        if (!best || score > best.score || (score === best.score && covered > best.covered)) {
+          best = { name, score, covered };
         }
-        const s = Math.max(wholeScore, tokenScore);
-        if (!admitted || s > best || (s === best && covered > bestCovered)) {
-          best = s;
-          bestName = name;
-          bestCovered = covered;
-        }
-        admitted = true;
       }
-      if (admitted) {
-        const m = this.leiRowToMatch(row, 'approximate', bestName);
-        m.score = Number(best.toFixed(4));
-        m.queryTokenCoverage = { covered: bestCovered, total: args.queryTokens.length };
-        scored.push(m);
+      if (best) {
+        scored.push({
+          ...leiMatch(best.name, 'approximate', best.name),
+          score: Number(best.score.toFixed(4)),
+          queryTokenCoverage: { covered: best.covered, total: args.queryTokens.length },
+        });
       }
     }
     return scored
@@ -1365,27 +1685,12 @@ export class ScreeningService {
       .slice(0, args.cap);
   }
 
-  private leiRowToMatch(
-    row: LeiCandidateRow,
-    matchType: LeiMatch['matchType'],
-    matchedName: string,
-  ): LeiMatch {
-    return {
-      lei: row.lei,
-      legalName: row.legal_name,
-      matchedName,
-      matchType,
-      ...(row.jurisdiction ? { jurisdiction: row.jurisdiction } : {}),
-      ...(row.status ? { status: row.status } : {}),
-    };
-  }
-
-  /** Full GLEIF Level 1 entity by LEI, or null. */
-  async getLeiEntity(lei: string): Promise<NormalizedLeiEntity | null> {
+  /** Full GLEIF Level 1 entity by LEI, or null — in one shape whichever release stored it. */
+  async getLeiEntity(lei: string): Promise<LeiEntityRecord | null> {
     const rows = await this.leiMirror.getByIds([lei]);
     const row = rows[0];
     if (!row?.payload) return null;
-    return JSON.parse(String(row.payload)) as NormalizedLeiEntity;
+    return readLeiPayload(String(row.payload));
   }
 
   /** Direct relationship edges for an LEI in the requested direction(s). */
@@ -1423,12 +1728,10 @@ export class ScreeningService {
   }
 
   /** Hydrate multiple LEIs to name/jurisdiction/status, preserving order. */
-  async getLeiEntitiesBatch(leis: string[]): Promise<NormalizedLeiEntity[]> {
+  async getLeiEntitiesBatch(leis: string[]): Promise<LeiEntityRecord[]> {
     if (leis.length === 0) return [];
     const rows = await this.leiMirror.getByIds(leis);
-    return rows
-      .filter((r) => r.payload)
-      .map((r) => JSON.parse(String(r.payload)) as NormalizedLeiEntity);
+    return rows.filter((r) => r.payload).map((r) => readLeiPayload(String(r.payload)));
   }
 
   // ─── Sources / freshness ───────────────────────────────────────────────────
@@ -1450,19 +1753,35 @@ export class ScreeningService {
     return this.toReadiness(await this.designationMirror.status());
   }
 
-  /** GLEIF mirror readiness + freshness, plus L1/L2 counts. */
+  /**
+   * GLEIF mirror readiness + freshness, the Level 1 / Level 2 / reporting-exception
+   * row counts, and whether the exceptions are loaded — a count of an unloaded
+   * dataset is not a count of zero exceptions.
+   */
   async leiReadiness(): Promise<
-    MirrorReadiness & { entityCount: number; relationshipCount: number }
+    MirrorReadiness & {
+      entityCount: number;
+      exceptionCount: number;
+      exceptionsLoaded: boolean;
+      relationshipCount: number;
+    }
   > {
     const status = this.toReadiness(await this.leiMirror.status());
     const handle = await this.leiHandle();
-    const entityCount =
-      handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${leiStoreSpec.table}`).get()?.n ??
-      0;
-    const relationshipCount =
-      handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${LEI_RELATIONSHIP_TABLE}`).get()
-        ?.n ?? 0;
-    return { ...status, entityCount, relationshipCount };
+    const count = (table: string) =>
+      handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n ?? 0;
+    const state = await this.leiMirror.store.readState();
+    const stateKey = `${state.completedAt ?? ''}|${state.checkpoint ?? ''}`;
+    if (this.exceptionCountByState?.state !== stateKey) {
+      this.exceptionCountByState = { state: stateKey, count: count(LEI_EXCEPTION_TABLE) };
+    }
+    return {
+      ...status,
+      entityCount: count(leiStoreSpec.table),
+      relationshipCount: count(LEI_RELATIONSHIP_TABLE),
+      exceptionCount: this.exceptionCountByState.count,
+      exceptionsLoaded: parseGleifCheckpoint(state.checkpoint).repex !== undefined,
+    };
   }
 
   private toReadiness(s: {
@@ -1495,8 +1814,8 @@ export class ScreeningService {
  * The distinct leading-trigram blocking prefixes of a query's tokens, shared by
  * both fuzzy paths. Counted in code points, not UTF-16 code units: a code-unit
  * slice cuts a supplementary-plane letter (CJK Extension B, e.g. `𠀀`) in half,
- * and the lone surrogate reaches SQLite as U+FFFD, a `LIKE` pattern that matches
- * nothing. A token shorter than two code points blocks nothing. For BMP tokens
+ * and the lone surrogate reaches SQLite as U+FFFD, a `LIKE` pattern or FTS prefix
+ * term that matches nothing. A token shorter than two code points blocks nothing. For BMP tokens
  * code points and code units coincide, so their prefixes are unchanged.
  */
 function blockingPrefixes(tokens: readonly string[]): string[] {
@@ -1505,6 +1824,167 @@ function blockingPrefixes(tokens: readonly string[]): string[] {
     .filter((codePoints) => codePoints.length >= 2)
     .map((codePoints) => codePoints.join(''));
   return [...new Set(prefixes)];
+}
+
+/**
+ * Rows each fuzzy blocking lookup may pool: the per-strategy budget keeps total
+ * work bounded while every query token contributes; the scored set is still
+ * capped to `cap` afterwards.
+ */
+function perStrategyLimit(cap: number): number {
+  return Math.max(cap * 4, 200);
+}
+
+// ─── GLEIF name index ────────────────────────────────────────────────────────
+
+/** The inputs of a fuzzy LEI pass that scoring needs. */
+interface LeiFuzzyArgs {
+  cap: number;
+  minScore: number;
+  normalizedQuery: string;
+  queryTokens: string[];
+}
+
+/** One candidate name with the entity fields a match reports. */
+interface LeiCandidateName {
+  jurisdiction: string | null;
+  legal_name: string;
+  lei: string;
+  name: string;
+  name_type: string;
+  status: string | null;
+}
+
+/** The columns every indexed resolution query reads: a name row and its entity. */
+const LEI_NAME_SELECT = `SELECT n.rowid AS rowid, n.lei, n.name, n.normalized, n.name_type,
+                e.legal_name, e.jurisdiction, e.status`;
+
+/** A two-letter country code, as opposed to an ISO 3166-2 subdivision code. */
+const COUNTRY_CODE = /^[A-Z]{2}$/;
+
+/**
+ * A token in a script written without word separators: its fold is one token
+ * however many words it holds, so it is also indexed by its suffixes.
+ */
+const UNSEGMENTED_SCRIPT =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+
+/** Build a {@link LeiMatch} from an entity row and the one name it matched on. */
+function leiMatch(
+  entity: { jurisdiction: string | null; legal_name: string; lei: string; status: string | null },
+  matchType: LeiMatch['matchType'],
+  matched: { name: string; name_type: string },
+): LeiMatch {
+  return {
+    lei: entity.lei,
+    legalName: entity.legal_name,
+    matchedName: matched.name,
+    matchedNameType: matched.name_type,
+    matchType,
+    ...(entity.jurisdiction ? { jurisdiction: entity.jurisdiction } : {}),
+    ...(entity.status ? { status: entity.status } : {}),
+  };
+}
+
+/** Order an entity's name rows: the legal name first, then the order they were written. */
+function compareNameRows(a: LeiNameRow, b: LeiNameRow): number {
+  return (
+    Number(a.name_type !== LEGAL_NAME_TYPE) - Number(b.name_type !== LEGAL_NAME_TYPE) ||
+    a.rowid - b.rowid
+  );
+}
+
+/**
+ * The FTS clause matching a jurisdiction filter against `jurisdiction_terms`
+ * (see {@link jurisdictionTerms}): a country matches its `jc` term, which every
+ * subdivision under it carries too; a subdivision matches its own `jx` term.
+ */
+function jurisdictionMatch(code: string): string {
+  const term = code.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return `jurisdiction_terms : "${COUNTRY_CODE.test(code) ? 'jc' : 'jx'}${term}"`;
+}
+
+/**
+ * The index terms of a legal jurisdiction: `jc<country>` and `jx<code>`, each one
+ * whole unicode61 token. `US-CA` → `jcus jxusca`; `US` → `jcus jxus`. A country
+ * code is two letters and a subdivision code longer, so no two codes share a `jx`
+ * term, and `CA` never reaches `US-CA`.
+ */
+function jurisdictionTerms(code: string | undefined): string {
+  if (!code) return '';
+  const upper = code.toUpperCase();
+  const country = upper.split('-')[0] ?? '';
+  const clean = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return `jc${clean(country)} jx${clean(upper)}`;
+}
+
+/**
+ * Every proper suffix of two or more code points of each unsegmented-script
+ * token in a folded name, space-separated — so a prefix lookup for `國際證`
+ * reaches `交銀國際證券有限公司`. Empty for a name with no such token.
+ */
+function suffixTerms(normalized: string): string {
+  const terms: string[] = [];
+  for (const token of tokenize(normalized)) {
+    if (!UNSEGMENTED_SCRIPT.test(token)) continue;
+    const codePoints = [...token];
+    for (let i = 1; i <= codePoints.length - 2; i++) terms.push(codePoints.slice(i).join(''));
+  }
+  return terms.join(' ');
+}
+
+/**
+ * An entity's alternate names with their types. A record stored before names
+ * were typed carries bare `otherNames` only; each reads as type unknown.
+ */
+function alternateNamesOf(entity: NormalizedLeiEntity): LeiAlternateName[] {
+  return (
+    entity.alternateNames ?? entity.otherNames.map((name) => ({ name, type: UNKNOWN_NAME_TYPE }))
+  );
+}
+
+/**
+ * Index an entity's legal name, then each alternate name, one row per distinct
+ * fold — a name that folds to the legal name's (or an earlier one's) adds
+ * nothing to retrieval, and the earlier row reports it. A name that folds to
+ * nothing is skipped.
+ */
+function writeLeiNames(insert: SqliteStatement, entity: NormalizedLeiEntity): void {
+  const jurisdiction = jurisdictionTerms(entity.jurisdiction);
+  const seen = new Set<string>();
+  for (const { name, type } of [
+    { name: entity.legalName, type: LEGAL_NAME_TYPE },
+    ...alternateNamesOf(entity),
+  ]) {
+    const normalized = fold(name);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    insert.run(entity.lei, name, normalized, type, suffixTerms(normalized), jurisdiction);
+  }
+}
+
+/** A stored entity payload in the current shape, whichever release wrote it. */
+function readLeiPayload(payload: string): LeiEntityRecord {
+  const entity = JSON.parse(payload) as NormalizedLeiEntity;
+  return { ...entity, alternateNames: alternateNamesOf(entity) };
+}
+
+/** What the name-index stamp is compared against: the GLEIF sync state's `completedAt`. */
+function leiStateStamp(state: SyncState): string {
+  return state.completedAt ?? '';
+}
+
+/** The state the name index was last recorded complete under, or undefined when it never was. */
+function leiNameStamp(handle: SqliteHandle): string | undefined {
+  return handle
+    .prepare<{ stamp: string }>(`SELECT stamp FROM ${LEI_NAME_STAMP_TABLE} WHERE id = 1`)
+    .get()?.stamp;
+}
+
+function writeLeiNameStamp(handle: SqliteHandle, stamp: string): void {
+  handle
+    .prepare(`INSERT OR REPLACE INTO ${LEI_NAME_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
+    .run(stamp);
 }
 
 /** A designation row as the index rebuilds read it. */
@@ -1639,7 +2119,7 @@ function matchRank(type: ScreeningHit['matchType']): number {
 /**
  * Rank two admitted fuzzy candidates: raw score descending, then query-token
  * coverage descending. Shared by {@link ScreeningService.runFuzzy} and
- * {@link ScreeningService.runLeiFuzzy} so both surfaces order by the same rule.
+ * {@link ScreeningService.rankFuzzy} so both surfaces order by the same rule.
  *
  * The score stays the primary key AND keeps its raw Jaro-Winkler value — coverage
  * is a separate real measurement that orders candidates, never a term blended into
@@ -1677,9 +2157,25 @@ function gleifPath(sanctionsPath: string): string {
 }
 
 /**
+ * Read the GLEIF checkpoint the sync state stores as JSON (see {@link GleifCheckpoint}).
+ * A mirror written before the checkpoint existed stores none, which reads as no
+ * recorded load for any dataset — never as a guessed date.
+ */
+function parseGleifCheckpoint(stored: string | undefined): GleifCheckpoint {
+  if (!stored) return {};
+  const parsed = JSON.parse(stored) as Record<string, unknown>;
+  const checkpoint: GleifCheckpoint = {};
+  for (const dataset of ['lei2', 'rr', 'repex'] as const) {
+    const value = parsed[dataset];
+    if (typeof value === 'string') checkpoint[dataset] = value;
+  }
+  return checkpoint;
+}
+
+/**
  * A {@link SyncGenerator} that yields no pages — the GLEIF mirror's sync. GLEIF
- * data is ingested via the service's `ingestLeiEntities`/`ingestLeiRelationships`
- * methods (called by the lifecycle scripts), not through `runSync`.
+ * data is ingested through the service's ingest methods, driven by the load and
+ * refresh lifecycles in `gleif-sync.ts`, not through `runSync`.
  */
 async function* emptySync(): AsyncGenerator<SyncPage> {
   yield* [];

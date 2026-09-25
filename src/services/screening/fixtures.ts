@@ -1,7 +1,8 @@
 /**
  * @fileoverview Small synthetic fixture mirror — a handful of designations (one
  * per source, with aliases and transliteration-class variants) plus a couple of
- * GLEIF entities and an ownership relationship. Lets `bun run test` exercise the
+ * GLEIF entities, an ownership relationship, and an entity that files reporting
+ * exceptions instead of naming its parents. Lets `bun run test` exercise the
  * matching engine, the tools, and ownership tracing WITHOUT downloading the real
  * multi-source corpus (which loads out-of-band via `mirror:init`). The names
  * here are invented for testing — they are NOT real sanctions designations.
@@ -12,6 +13,7 @@ import type {
   NormalizedDesignation,
   NormalizedLeiEntity,
   NormalizedLeiRelationship,
+  NormalizedReportingException,
 } from '@/services/screening/types.js';
 
 /** Invented designations spanning all five sources, with aliases for fuzzy tests. */
@@ -244,12 +246,18 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
   },
 ];
 
-/** Two invented GLEIF entities — a parent and a subsidiary — for resolution + tracing. */
+/**
+ * Invented GLEIF entities for resolution + tracing: a parent and a subsidiary; a
+ * nominee company that reports no parent relationship, only exceptions, and a
+ * retired sibling of it; and an entity whose Cyrillic legal name no Latin query
+ * reaches, found only through its previous legal name and transliteration.
+ */
 export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
   {
     lei: '5493001KJTIIGC8Y1R12',
     legalName: 'Fictional Trading Company LLC',
     otherNames: ['Fictional Trading Co'],
+    alternateNames: [{ name: 'Fictional Trading Co', type: 'PREVIOUS_LEGAL_NAME' }],
     jurisdiction: 'US',
     status: 'ISSUED',
     legalAddress: '99 Commerce Way, Testopolis, US',
@@ -262,6 +270,7 @@ export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
     lei: '529900T8BM49AURSDO55',
     legalName: 'Testland Holdings PLC',
     otherNames: ['Testland Holdings'],
+    alternateNames: [{ name: 'Testland Holdings', type: 'TRADING_OR_OPERATING_NAME' }],
     jurisdiction: 'GB',
     status: 'ISSUED',
     legalAddress: '1 Holding Square, London, GB',
@@ -269,6 +278,34 @@ export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
     registrationAuthorityId: 'RA000585',
     registrationAuthorityEntityId: 'TEST-REG-2',
     lastUpdate: '2026-01-10T10:00:00Z',
+  },
+  {
+    lei: '254900SPRNGTRUST0028',
+    legalName: 'Qorvath Nominee Services Ltd',
+    otherNames: [],
+    jurisdiction: 'NG',
+    status: 'LAPSED',
+    lastUpdate: '2026-02-01T10:00:00Z',
+  },
+  {
+    lei: '254900SPRNGRETIRD042',
+    legalName: 'Qorvath Nominee Services Holdings Ltd',
+    otherNames: [],
+    jurisdiction: 'NG',
+    status: 'RETIRED',
+    lastUpdate: '2026-02-01T10:00:00Z',
+  },
+  {
+    lei: '253400ZORNEFTPAO0042',
+    legalName: 'Публичное акционерное общество "Нефтяная компания "Зорнефть"',
+    otherNames: ['Zorneft Oil Company'],
+    alternateNames: [
+      { name: 'Zorneft Oil Company', type: 'PREVIOUS_LEGAL_NAME' },
+      { name: 'PAO NK ZORNEFT', type: 'PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME' },
+    ],
+    jurisdiction: 'RU',
+    status: 'ISSUED',
+    lastUpdate: '2026-02-01T10:00:00Z',
   },
 ];
 
@@ -280,5 +317,23 @@ export const FIXTURE_LEI_RELATIONSHIPS: NormalizedLeiRelationship[] = [
     relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
     relationshipStatus: 'ACTIVE',
     relationshipPeriod: '2020-01-01',
+  },
+];
+
+/**
+ * Qorvath Nominee Services Ltd publishes no parent relationship: it files a
+ * reporting exception at both levels instead, so a trace reads its parents as
+ * exceptions with these reasons rather than as absent.
+ */
+export const FIXTURE_REPORTING_EXCEPTIONS: NormalizedReportingException[] = [
+  {
+    lei: '254900SPRNGTRUST0028',
+    category: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT',
+    reasons: ['NATURAL_PERSONS'],
+  },
+  {
+    lei: '254900SPRNGTRUST0028',
+    category: 'ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT',
+    reasons: ['NATURAL_PERSONS', 'NO_KNOWN_PERSON'],
   },
 ];

@@ -18,7 +18,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetServerConfig } from '@/config/server-config.js';
-import { streamLeiLevel1 } from '@/services/screening/gleif-ingest.js';
+import { openGleifFile } from '@/services/screening/gleif-ingest.js';
 import { buildSanctionsIngesters } from '@/services/screening/sanctions-ingest.js';
 import {
   fetchSourceDownload,
@@ -259,14 +259,13 @@ describe('source downloads past the production headers bound', () => {
     const record = (lei: string, name: string) =>
       `<LEIRecord><LEI>${lei}</LEI><Entity><LegalName>${name}</LegalName></Entity></LEIRecord>`;
     holdOpen(
-      `<?xml version="1.0"?><LEIData><LEIRecords>${record('5493001KJTIIGC8Y1R12', 'First Slow Holdings')}`,
+      `<?xml version="1.0"?><LEIData><LEIHeader><ContentDate>2026-09-25T08:08:49Z</ContentDate></LEIHeader><LEIRecords>${record('5493001KJTIIGC8Y1R12', 'First Slow Holdings')}`,
       `${record('5493001KJTIIGC8Y1R13', 'Second Slow Holdings')}</LEIRecords></LEIData>`,
     );
     const headersArrived = watchHeaders();
 
-    const streamed = outcome(
-      streamLeiLevel1(`${base}/lei2.xml`, new AbortController().signal),
-      (entity) => entity.lei,
+    const streamed = openGleifFile('lei2', `${base}/lei2.xml`, new AbortController().signal).then(
+      (file) => outcome(file.records, (entity) => entity.lei),
     );
     await Promise.all([headersArrived, firstChunkSent]);
     await flush();

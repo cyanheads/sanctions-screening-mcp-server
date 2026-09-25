@@ -16,7 +16,7 @@ import { MAX_NAME_CHARS, MAX_NAME_WORDS } from './_shared.js';
 export const resolveEntityTool = tool('sanctions_resolve_entity', {
   title: 'sanctions-screening-mcp-server: resolve entity',
   description:
-    'Resolve a company or organization name (with an optional ISO 3166-1 alpha-2 jurisdiction) to candidate GLEIF Legal Entity Identifiers (LEIs), ranked. This turns a free-text counterparty name into a stable global identifier that sanctions_get_entity and sanctions_trace_ownership key off. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler scoring labeled approximate with a raw 0–1 score plus the count of query tokens the matched name covers, which orders candidates that tie on score. Results are paged: totalAvailable and hasMore report candidates beyond the returned page, and nextOffset retrieves them. Returns potential matches to confirm against the GLEIF record — name resolution is a candidate ranking, not an authoritative identification.',
+    "Resolve a company or organization name (with an optional jurisdiction: a country code, which includes its subdivisions, or an ISO 3166-2 subdivision code) to candidate GLEIF Legal Entity Identifiers (LEIs), ranked. This turns a free-text counterparty name into a stable global identifier that sanctions_get_entity and sanctions_trace_ownership key off. Every name GLEIF publishes takes part: the legal name, previous legal names, trading names, alternative-language legal names, and ASCII transliterations of a legal name in another script — each candidate reports the name it matched on and that name's type, one candidate per LEI. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler scoring labeled approximate with a raw 0–1 score plus the count of query tokens the matched name covers, which orders candidates that tie on score. Results are paged: totalAvailable and hasMore report candidates beyond the returned page, and nextOffset retrieves them. Returns potential matches to confirm against the GLEIF record — name resolution is a candidate ranking, not an authoritative identification.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z
@@ -30,12 +30,17 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
         z.literal(''),
         z
           .string()
-          .regex(/^[A-Za-z]{2}$/, 'ISO 3166-1 alpha-2 code (e.g. US, GB)')
-          .describe('ISO 3166-1 alpha-2 jurisdiction code (e.g. US, GB).'),
+          .regex(
+            /^[A-Za-z]{2}(-[A-Za-z0-9]{1,3})?$/,
+            'ISO 3166-1 alpha-2 country (e.g. US) or ISO 3166-2 subdivision (e.g. US-DE)',
+          )
+          .describe(
+            'ISO 3166-1 alpha-2 country code (e.g. US) or ISO 3166-2 subdivision code (e.g. US-DE), case-insensitive.',
+          ),
       ])
       .optional()
       .describe(
-        'Optional ISO 3166-1 alpha-2 jurisdiction filter (e.g. "US", "GB"). Empty string disables it.',
+        'Optional legal-jurisdiction filter. A country code ("US") matches that country and every subdivision under it (US-DE, US-CA); a subdivision code ("US-DE") matches exactly. Case-insensitive. Empty string disables it.',
       ),
     matchMode: z
       .enum(['strict', 'fuzzy'])
@@ -46,7 +51,9 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     status: z
       .enum(['any', 'issued', 'lapsed'])
       .default('issued')
-      .describe('Registration status filter: issued (default), lapsed, or any.'),
+      .describe(
+        "Registration status filter. issued (default) matches ISSUED; lapsed matches exactly LAPSED; any applies no filter and is the only value that reaches the other states (RETIRED, DUPLICATE, ANNULLED, PENDING_TRANSFER, PENDING_ARCHIVAL, MERGED) — each candidate's status field names its state.",
+      ),
     minScore: z
       .number()
       .min(0)
@@ -80,7 +87,14 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
             legalName: z.string().describe('Registered legal name of the entity.'),
             matchedName: z
               .string()
-              .describe('The name (legal or other/trading) that matched the query.'),
+              .describe(
+                'The name that matched the query — the legal name or one of the other or transliterated names GLEIF publishes for the entity.',
+              ),
+            matchedNameType: z
+              .string()
+              .describe(
+                "Type of matchedName: LEGAL_NAME, PREVIOUS_LEGAL_NAME (a former legal name, not the current one), TRADING_OR_OPERATING_NAME, ALTERNATIVE_LANGUAGE_LEGAL_NAME, PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME, AUTO_ASCII_TRANSLITERATED_LEGAL_NAME, or UNKNOWN for a name the mirror stored without GLEIF's type.",
+              ),
             matchType: z
               .enum(['exact', 'strong', 'approximate'])
               .describe(
@@ -143,7 +157,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       .string()
       .optional()
       .describe(
-        'Guidance when no LEI matched and how to broaden, or when the requested offset sits past the end of the result set.',
+        "Guidance when no LEI matched and how to broaden, when the requested offset sits past the end of the result set, or when the mirror has not indexed GLEIF's other and transliterated names yet, so only legal names were searched.",
       ),
   },
   errors: [
@@ -217,22 +231,36 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     ctx.enrich.total(result.matches.length);
     // An empty page has two very different causes; conflating them would either
     // hide an out-of-range offset or read a paging artifact as "no LEI exists".
+    // An empty result always follows a fuzzy pass (an empty strict pass falls
+    // back), so the notice never suggests one.
+    const notices: string[] = [];
     if (result.totalAvailable === 0) {
-      ctx.enrich.notice(
+      const broaden = [
+        jurisdiction ? 'drop the jurisdiction filter' : '',
+        input.status === 'any' ? '' : 'set status:"any"',
+      ].filter(Boolean);
+      notices.push(
         `No LEI candidate for "${input.name}"${jurisdiction ? ` in ${jurisdiction}` : ''} (mode: ${result.modeUsed}). ` +
-          'Try matchMode:"fuzzy", drop the jurisdiction/status filter, or set status:"any" — an unmatched name is not proof the entity has no LEI.',
+          `${broaden.length > 0 ? `Try a broader name, or ${broaden.join(' or ')}` : 'Try a broader name'} — an unmatched name is not proof the entity has no LEI.`,
       );
     } else if (result.matches.length === 0) {
-      ctx.enrich.notice(
+      notices.push(
         `Offset ${input.offset} is past the end of this result set — ${result.totalAvailable} LEI candidate(s) are available. Re-request from offset 0 and page forward with nextOffset.`,
       );
     }
+    if (!result.alternateNamesIndexed) {
+      notices.push(
+        "Alternate names — GLEIF's trading, previous, alternative-language, and ASCII-transliterated names — are not yet indexed on this mirror, so only legal names were searched; an entity published only under one of them cannot be found until mirror:init reloads the GLEIF golden copy.",
+      );
+    }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       matches: result.matches.map((m) => ({
         lei: m.lei,
         legalName: m.legalName,
         matchedName: m.matchedName,
+        matchedNameType: m.matchedNameType,
         matchType: m.matchType,
         ...(m.score !== undefined ? { score: m.score } : {}),
         ...(m.queryTokenCoverage ? { queryTokenCoverage: m.queryTokenCoverage } : {}),
@@ -251,7 +279,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
       lines.push(`### ${m.legalName} — ${m.matchType}${scoreStr}${coverStr}`);
       lines.push(`**LEI:** \`${m.lei}\``);
-      lines.push(`**Matched on:** "${m.matchedName}"`);
+      lines.push(`**Matched on:** "${m.matchedName}" (${m.matchedNameType})`);
       const meta = [
         m.jurisdiction ? `Jurisdiction: ${m.jurisdiction}` : null,
         m.status ? `Status: ${m.status}` : null,

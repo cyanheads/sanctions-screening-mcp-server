@@ -2,8 +2,9 @@
  * @fileoverview Shared bootstrap for the mirror lifecycle scripts
  * (`mirror:init`, `mirror:refresh`, `mirror:verify`, `mirror:seed`). Builds a
  * standalone ScreeningService outside the MCP request pipeline and exposes the
- * framework logger. Imported by the three named scripts, so it must travel with
- * them in the npm tarball / Docker image.
+ * framework logger, and ends each script's process once its work settles.
+ * Imported by the lifecycle scripts, so it must travel with them in the npm
+ * tarball / Docker image.
  * @module scripts/_mirror-context
  */
 
@@ -33,32 +34,24 @@ export async function bootstrap(operation: string) {
 }
 
 /**
- * Drain an async source into a sink in fixed-size batches, returning the total
- * count. Keeps peak memory bounded during a streaming golden-copy ingest — only
- * one batch is resident at a time. `onBatch(total)` reports cumulative progress
- * after each flush for progress logging.
+ * Run a lifecycle script's body, then end the process: exit 0 when it resolves,
+ * or print its failure and exit 1. The logger is flushed and closed first either
+ * way. The exit is explicit because the logger's transport runs on worker
+ * threads that do not always stop when closed under Bun, and a left-over thread
+ * holds the process open after its work is done — a script run by cron would
+ * then never finish.
  */
-export async function ingestInBatches<T>(
-  source: AsyncIterable<T>,
-  batchSize: number,
-  sink: (batch: T[]) => Promise<void>,
-  onBatch?: (total: number) => void,
-): Promise<number> {
-  let total = 0;
-  let batch: T[] = [];
-  for await (const item of source) {
-    batch.push(item);
-    if (batch.length >= batchSize) {
-      await sink(batch);
-      total += batch.length;
-      onBatch?.(total);
-      batch = [];
-    }
-  }
-  if (batch.length > 0) {
-    await sink(batch);
-    total += batch.length;
-    onBatch?.(total);
-  }
-  return total;
+export function runScript(name: string, main: () => Promise<void>): void {
+  main().then(
+    async () => {
+      await logger.close();
+      process.exit(0);
+    },
+    async (err: unknown) => {
+      // eslint-disable-next-line no-console
+      console.error(`${name} failed:`, err);
+      await logger.close();
+      process.exit(1);
+    },
+  );
 }

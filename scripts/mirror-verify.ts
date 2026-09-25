@@ -1,14 +1,16 @@
 /**
  * @fileoverview `mirror:verify` — readiness + freshness report for both mirrors.
- * Prints per-source record counts, the sanctions/GLEIF readiness flags, and the
- * last-completed timestamps. Read-only; safe to run anytime.
+ * Prints per-source record counts, the sanctions/GLEIF readiness flags, the GLEIF
+ * Level 1 / Level 2 / reporting-exception counts and per-dataset checkpoint,
+ * whether GLEIF's other and transliterated names are indexed for resolution, and
+ * the last-completed timestamps. Read-only; safe to run anytime.
  *
  * Usage: `bun run mirror:verify`
  * @module scripts/mirror-verify
  */
 
 import { withExtra } from '@cyanheads/mcp-ts-core/utils';
-import { bootstrap } from './_mirror-context.js';
+import { bootstrap, runScript } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const { service, log, ctx } = await bootstrap('mirror:verify');
@@ -37,6 +39,9 @@ async function main(): Promise<void> {
       ready: lei.ready,
       entities: lei.entityCount,
       relationships: lei.relationshipCount,
+      reportingExceptions: lei.exceptionsLoaded ? lei.exceptionCount : 'not loaded',
+      alternateNamesIndexed: await service.leiNamesIndexed(),
+      checkpoint: await service.gleifCheckpoint(),
       completedAt: lei.completedAt ?? 'never',
       status: lei.status,
       ...(lei.error ? { lastError: lei.error } : {}),
@@ -46,8 +51,4 @@ async function main(): Promise<void> {
   await service.close();
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error('mirror:verify failed:', err);
-  process.exit(1);
-});
+runScript('mirror:verify', main);

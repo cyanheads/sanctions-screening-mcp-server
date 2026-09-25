@@ -64,9 +64,9 @@ await createApp({
   },
   setup() {
     initScreeningService();
-    // HTTP deployments refresh on a cron. stdio operators run `bun run
-    // mirror:refresh` out-of-band, where a cron would be redundant and could
-    // collide with a manual run.
+    // HTTP deployments refresh on a cron: the sanctions lists, then the GLEIF
+    // deltas. stdio operators run `bun run mirror:refresh` out-of-band, where a
+    // cron would be redundant and could collide with a manual run.
     if (config.mcpTransportType === 'http') void scheduleSanctionsRefresh();
   },
   // The service holds open SQLite handles for both mirrors. Releasing them here

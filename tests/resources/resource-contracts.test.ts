@@ -44,6 +44,7 @@ const SourcesPayload = z.object({
   sanctionsAsOf: z.string().optional(),
   leiReady: z.boolean(),
   leiAsOf: z.string().optional(),
+  reportingExceptionsLoaded: z.boolean(),
   gleifBaseUrl: z.string(),
   sources: z.array(z.looseObject({ code: z.string() })),
 });
@@ -253,6 +254,15 @@ describe('sanctions://entity/{lei} readiness gate', () => {
     ).rejects.toMatchObject({ data: { reason: 'lei_not_found' } });
   });
 
+  it('returns the entity record for a known LEI', async () => {
+    global = await seededGlobalService();
+    const payload = await entityResource.handler(
+      parseParams(entityResource, { lei: '5493001KJTIIGC8Y1R12' }),
+      ctxFor(entityResource.errors),
+    );
+    expect(payload).toEqual(FIXTURE_LEI_ENTITIES[0]);
+  });
+
   it('declares both readiness and not-found reasons in its error contract', () => {
     expect(entityResource.errors?.map((entry) => entry.reason).sort()).toEqual([
       'lei_not_found',
@@ -287,6 +297,48 @@ describe('sanctions://sources provenance parity', () => {
     expect(payload.sources.find((source) => source.code === 'gleif')).toMatchObject({
       relationshipCount: FIXTURE_LEI_RELATIONSHIPS.length,
     });
+  });
+
+  it('reports the reporting-exception count on both surfaces once the dataset is loaded', async () => {
+    global = await seededGlobalService();
+    const tool = await listSourcesTool.handler(
+      listSourcesTool.input.parse({}),
+      createMockContext(),
+    );
+    const payload = SourcesPayload.parse(
+      await sourcesResource.handler(parseParams(sourcesResource, {}), createMockContext()),
+    );
+
+    const expected = (await global.service.leiReadiness()).exceptionCount;
+    expect(expected).toBeGreaterThan(0);
+    expect(tool.reportingExceptionsLoaded).toBe(true);
+    expect(payload).toMatchObject({ reportingExceptionsLoaded: true });
+    expect(tool.sources.find((source) => source.code === 'gleif')).toMatchObject({
+      reportingExceptionCount: expected,
+    });
+    expect(payload.sources.find((source) => source.code === 'gleif')).toMatchObject({
+      reportingExceptionCount: expected,
+    });
+  });
+
+  it('omits the count on both surfaces, and says so, when the dataset has no recorded load', async () => {
+    global = await gleifOnlyService();
+    const tool = await listSourcesTool.handler(
+      listSourcesTool.input.parse({}),
+      createMockContext(),
+    );
+    const payload = SourcesPayload.parse(
+      await sourcesResource.handler(parseParams(sourcesResource, {}), createMockContext()),
+    );
+
+    expect(tool.reportingExceptionsLoaded).toBe(false);
+    expect(payload).toMatchObject({ reportingExceptionsLoaded: false });
+    expect(tool.sources.find((source) => source.code === 'gleif')).not.toHaveProperty(
+      'reportingExceptionCount',
+    );
+    expect(payload.sources.find((source) => source.code === 'gleif')).not.toHaveProperty(
+      'reportingExceptionCount',
+    );
   });
 
   it('preserves the top-level readiness and freshness fields', async () => {

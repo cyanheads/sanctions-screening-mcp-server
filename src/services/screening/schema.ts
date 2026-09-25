@@ -2,7 +2,9 @@
  * @fileoverview SQLite schema specs and auxiliary-table DDL for the two mirrors
  * this server owns: the sanctions `designation` mirror (with a per-alias `name`
  * matching index + its own FTS) and the GLEIF `lei_entity` mirror (with a
- * `lei_relationship` aux table for ownership traversal). The MirrorService owns
+ * per-name `lei_name` matching index + its own FTS, a `lei_relationship` aux table
+ * for ownership traversal, and a `lei_reporting_exception` aux table for the
+ * parents entities decline to report). The MirrorService owns
  * the primary tables + their FTS + sync state via `sqliteMirrorStore`; the
  * auxiliary tables below are created idempotently on the raw handle.
  *
@@ -39,6 +41,14 @@ export const IDENTIFIER_STAMP_TABLE = 'designation_identifier_stamp';
 export const LEI_ENTITY_TABLE = 'lei_entity';
 /** GLEIF Level 2 ownership relationships. */
 export const LEI_RELATIONSHIP_TABLE = 'lei_relationship';
+/** GLEIF reporting exceptions, one row per (LEI, category). */
+export const LEI_EXCEPTION_TABLE = 'lei_reporting_exception';
+/** Per-name GLEIF matching index: the legal name and every other and transliterated name. */
+export const LEI_NAME_TABLE = 'lei_name';
+/** FTS5 external-content index over `lei_name`, with a prefix index for fuzzy blocking. */
+export const LEI_NAME_FTS_TABLE = 'lei_name_fts';
+/** One row: the GLEIF sync-state `completedAt` the name index was last known complete under. */
+export const LEI_NAME_STAMP_TABLE = 'lei_name_stamp';
 
 /**
  * `sqliteMirrorStore` spec for the sanctions designation mirror. Columns mirror
@@ -94,9 +104,10 @@ export const designationStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
 };
 
 /**
- * `sqliteMirrorStore` spec for the GLEIF Level 1 entity mirror. `normalized_name`
- * is FTS-indexed for name → LEI resolution. The `lei_relationship` table is
- * created by {@link ensureLeiAuxSchema}.
+ * `sqliteMirrorStore` spec for the GLEIF Level 1 entity mirror. The legal-name
+ * FTS on `normalized_name` serves resolution until a mirror's `lei_name` index is
+ * built (see {@link ensureLeiAuxSchema}), and keeps an earlier release working
+ * after a rollback. The auxiliary tables are created by {@link ensureLeiAuxSchema}.
  */
 export const leiStoreSpec: SchemaSpec = {
   table: LEI_ENTITY_TABLE,
@@ -172,8 +183,26 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
 }
 
 /**
- * Create the GLEIF mirror's auxiliary `lei_relationship` table, indexed on both
- * `child_lei` and `parent_lei` for bidirectional ownership traversal. Idempotent.
+ * Create the GLEIF mirror's auxiliary tables. Idempotent.
+ *
+ * - `lei_relationship`, indexed on both `child_lei` and `parent_lei` for
+ *   bidirectional ownership traversal.
+ * - `lei_reporting_exception`, one row per (LEI, category) with the reasons as a
+ *   JSON array. Whether its data is loaded is read from the sync-state
+ *   checkpoint, never from the table.
+ * - `lei_name`, one row per distinct folded name of an entity — the legal name
+ *   and every other and transliterated name, with its type — and `lei_name_fts`
+ *   over it, kept in lockstep by triggers. The FTS indexes three columns:
+ *   `normalized` (the name's fold tokens), `suffix_terms` (every proper suffix of
+ *   a token in a script written without word separators, so a prefix lookup
+ *   reaches it mid-name), and `jurisdiction_terms` (`jc<country>` and
+ *   `jx<code>`, so a country and a subdivision each match one whole token —
+ *   unicode61 would split `US-CA` into `us` and `ca`). `prefix='2 3'` makes the
+ *   fuzzy pass's two- and three-code-point blocking prefixes index lookups.
+ * - `lei_name_stamp`, the record of a completed build. A mirror written before
+ *   the index existed gains these tables empty on open, and an empty index read
+ *   as "no alternate names" would hide the legal names too — so whether the
+ *   index serves resolution is read from the stamp, never from the table.
  */
 export function ensureLeiAuxSchema(handle: SqliteHandle): void {
   handle.exec(`
@@ -187,5 +216,41 @@ export function ensureLeiAuxSchema(handle: SqliteHandle): void {
     );
     CREATE INDEX IF NOT EXISTS idx_rel_child ON ${LEI_RELATIONSHIP_TABLE}(child_lei);
     CREATE INDEX IF NOT EXISTS idx_rel_parent ON ${LEI_RELATIONSHIP_TABLE}(parent_lei);
+
+    CREATE TABLE IF NOT EXISTS ${LEI_EXCEPTION_TABLE} (
+      lei      TEXT NOT NULL,
+      category TEXT NOT NULL,
+      reasons  TEXT NOT NULL,
+      PRIMARY KEY (lei, category)
+    ) WITHOUT ROWID;
+
+    CREATE TABLE IF NOT EXISTS ${LEI_NAME_TABLE} (
+      lei                TEXT NOT NULL,
+      name               TEXT NOT NULL,
+      normalized         TEXT NOT NULL,
+      name_type          TEXT NOT NULL,
+      suffix_terms       TEXT NOT NULL,
+      jurisdiction_terms TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_lei_name_lei ON ${LEI_NAME_TABLE}(lei);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS ${LEI_NAME_FTS_TABLE}
+      USING fts5(normalized, suffix_terms, jurisdiction_terms,
+                 content='${LEI_NAME_TABLE}', content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3');
+
+    CREATE TRIGGER IF NOT EXISTS ${LEI_NAME_TABLE}_ai AFTER INSERT ON ${LEI_NAME_TABLE} BEGIN
+      INSERT INTO ${LEI_NAME_FTS_TABLE}(rowid, normalized, suffix_terms, jurisdiction_terms)
+        VALUES (new.rowid, new.normalized, new.suffix_terms, new.jurisdiction_terms);
+    END;
+    CREATE TRIGGER IF NOT EXISTS ${LEI_NAME_TABLE}_ad AFTER DELETE ON ${LEI_NAME_TABLE} BEGIN
+      INSERT INTO ${LEI_NAME_FTS_TABLE}(${LEI_NAME_FTS_TABLE}, rowid, normalized, suffix_terms, jurisdiction_terms)
+        VALUES ('delete', old.rowid, old.normalized, old.suffix_terms, old.jurisdiction_terms);
+    END;
+
+    CREATE TABLE IF NOT EXISTS ${LEI_NAME_STAMP_TABLE} (
+      id    INTEGER PRIMARY KEY CHECK (id = 1),
+      stamp TEXT NOT NULL
+    );
   `);
 }

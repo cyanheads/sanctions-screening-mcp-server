@@ -13,7 +13,7 @@
 import { deflateRawSync, gzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import {
-  decompressGleifBuffer,
+  openGleifFileFromBytes,
   parseLeiLevel1,
   parseLeiLevel2,
   streamLeiLevel1FromBytes,
@@ -36,6 +36,7 @@ import {
 } from '@/services/screening/sanctions-ingest.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
+import { leiFile, repexFile, rrFile } from './_gleif-publication.js';
 
 // ─── OFAC advanced schema (attribute-driven) ────────────────────────────────────
 
@@ -2666,8 +2667,9 @@ describe('GLEIF namespace-prefixed corpus (issue #7)', () => {
     expect(entities.find((e) => e.lei === '529900T8BM49AURSDO55')?.legalName).toBe(
       'Société Générale Placement SA',
     );
-    // Sparse record: status falls back to EntityStatus when Registration is absent.
-    expect(entities.find((e) => e.lei === '213800MINIMAL00000X1')?.status).toBe('ACTIVE');
+    // Sparse record: no Registration, so no registration status — never the
+    // EntityStatus vocabulary (ACTIVE / INACTIVE) in its place (#23).
+    expect(entities.find((e) => e.lei === '213800MINIMAL00000X1')).not.toHaveProperty('status');
   });
 
   it('DOM parseLeiLevel2 retains relationships with correct child/parent LEIs', () => {
@@ -2697,29 +2699,25 @@ describe('GLEIF namespace-prefixed corpus (issue #7)', () => {
   });
 });
 
-// ─── GLEIF download decompression (ZIP / gzip / plain) ──────────────────────────
+// ─── GLEIF download containers (ZIP stored entry) ───────────────────────────────
 
-describe('decompressGleifBuffer', () => {
-  it('extracts the XML entry from a ZIP container (the golden-copy format)', () => {
-    // Build a minimal ZIP (stored, no compression) wrapping one XML file, by hand:
-    // local file header + filename + data + central directory + EOCD.
+describe('GLEIF stored-ZIP container', () => {
+  it('reads the XML entry of a stored (uncompressed) ZIP on the streaming path', async () => {
+    // A minimal ZIP (stored, no compression) wrapping one XML file, by hand:
+    // local file header + filename + data.
     const name = Buffer.from('lei.xml');
-    const data = Buffer.from('<LEIData/>');
-    const crc = 0; // stored entries still carry a CRC field; value is not validated here
+    const data = Buffer.from(LEI_L1_XML, 'utf8');
     const lfh = Buffer.alloc(30);
     lfh.writeUInt32LE(0x04034b50, 0); // local file header signature
     lfh.writeUInt16LE(0, 8); // method 0 = stored
-    lfh.writeUInt32LE(crc, 14);
     lfh.writeUInt32LE(data.length, 18); // compressed size
     lfh.writeUInt32LE(data.length, 22); // uncompressed size
     lfh.writeUInt16LE(name.length, 26);
     lfh.writeUInt16LE(0, 28);
     const zip = Buffer.concat([lfh, name, data]);
-    expect(decompressGleifBuffer(zip)).toBe('<LEIData/>');
-  });
-
-  it('passes through plain XML unchanged', () => {
-    expect(decompressGleifBuffer(Buffer.from('<LEIData/>'))).toBe('<LEIData/>');
+    expect(await collect(streamLeiLevel1FromBytes(chunkBytes(zip, 7)))).toEqual(
+      parseLeiLevel1(parseXml(LEI_L1_XML)),
+    );
   });
 });
 
@@ -2932,6 +2930,180 @@ describe('GLEIF streaming L2 — equivalence with the DOM parser', () => {
       ),
     );
     expect(streamed).toHaveLength(0);
+  });
+});
+
+// ─── GLEIF delta files: header dates and deletion markers (#49, #26) ───────────
+//
+// A delta file states its span in its header (`DeltaStart` → `ContentDate`), and a
+// Level 2 or reporting-exception record GLEIF removed carries
+// `<Extension><gleif:Deletion>`. Both drive the refresh: the header picks the
+// window, the marker decides upsert or delete.
+
+const DELTA_HEADER = { contentDate: '2026-09-25T10:00:00Z', deltaStart: '2026-09-25T02:00:00Z' };
+const CHILD_LEI = '2138005ZEOWWBQI5ZU43';
+const PARENT_LEI = 'ZOMOLU8CGIZRYZ7PFU34';
+
+describe('GLEIF Level 2 deletion marker', () => {
+  const xml = rrFile(DELTA_HEADER, [
+    { childLei: CHILD_LEI, parentLei: PARENT_LEI, relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY' },
+    {
+      childLei: CHILD_LEI,
+      parentLei: PARENT_LEI,
+      relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
+      deleted: true,
+    },
+  ]);
+
+  it('marks a record carrying gleif:Deletion as deleted, and only that record', () => {
+    expect(parseLeiLevel2(parseXml(xml))).toEqual([
+      {
+        childLei: CHILD_LEI,
+        parentLei: PARENT_LEI,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+        relationshipStatus: 'ACTIVE',
+      },
+      {
+        childLei: CHILD_LEI,
+        parentLei: PARENT_LEI,
+        relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
+        relationshipStatus: 'ACTIVE',
+        deleted: true,
+      },
+    ]);
+  });
+
+  it('streams the same records as the DOM parser, marker included', async () => {
+    const oracle = parseLeiLevel2(parseXml(xml));
+    for (const size of [1, 7, 100_000]) {
+      expect(await collect(streamLeiLevel2FromText(chunkStr(xml, size)))).toEqual(oracle);
+    }
+  });
+});
+
+describe('openGleifFileFromBytes — header dates, then records', () => {
+  const zip = (xml: string) => buildDeflateZip(Buffer.from(xml, 'utf8'));
+
+  it('reads a Level 1 delta header before its records, through ZIP at 1-byte chunks', async () => {
+    const xml = leiFile(DELTA_HEADER, [
+      { lei: '213800132UA5BEF2LB10', legalName: 'EUCLID TRANSACTIONAL UK LIMITED' },
+    ]);
+    const file = await openGleifFileFromBytes('lei2', chunkBytes(zip(xml), 1));
+    expect(file.header).toEqual(DELTA_HEADER);
+    expect(await collect(file.records)).toEqual([
+      {
+        lei: '213800132UA5BEF2LB10',
+        legalName: 'EUCLID TRANSACTIONAL UK LIMITED',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+    ]);
+  });
+
+  it('reads a golden copy header, which states no DeltaStart', async () => {
+    const file = await openGleifFileFromBytes(
+      'rr',
+      chunkBytes(zip(rrFile({ contentDate: '2026-09-25T09:17:31Z' }, [])), 16),
+    );
+    expect(file.header).toEqual({ contentDate: '2026-09-25T09:17:31Z' });
+    expect(await collect(file.records)).toEqual([]);
+  });
+
+  it('streams Level 2 records in document order with their deletion markers', async () => {
+    const xml = rrFile(DELTA_HEADER, [
+      {
+        childLei: CHILD_LEI,
+        parentLei: PARENT_LEI,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+      },
+      {
+        childLei: CHILD_LEI,
+        parentLei: PARENT_LEI,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+        deleted: true,
+      },
+    ]);
+    const file = await openGleifFileFromBytes('rr', chunkBytes(Buffer.from(xml), 3));
+    expect(file.header).toEqual(DELTA_HEADER);
+    expect((await collect(file.records)).map((r) => r.deleted ?? false)).toEqual([false, true]);
+  });
+
+  it('normalizes reporting exceptions: repeated reasons, the prefix, and the marker', async () => {
+    const xml = repexFile(DELTA_HEADER, [
+      {
+        lei: '0292001156F2T0UFG565',
+        category: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT',
+        reasons: ['NATURAL_PERSONS'],
+      },
+      {
+        lei: '0292001156F2T0UFG565',
+        category: 'ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT',
+        reasons: ['NON_CONSOLIDATING', 'NO_KNOWN_PERSON', 'NON_PUBLIC'],
+      },
+      {
+        lei: '097900BHKT0000085647',
+        category: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT',
+        reasons: ['NON_PUBLIC'],
+        deleted: true,
+      },
+    ]);
+    for (const size of [1, 5, 100_000]) {
+      const file = await openGleifFileFromBytes('repex', chunkBytes(zip(xml), size));
+      expect(file.header).toEqual(DELTA_HEADER);
+      expect(await collect(file.records), `chunk size ${size}`).toEqual([
+        {
+          lei: '0292001156F2T0UFG565',
+          category: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT',
+          reasons: ['NATURAL_PERSONS'],
+        },
+        {
+          lei: '0292001156F2T0UFG565',
+          category: 'ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT',
+          reasons: ['NON_CONSOLIDATING', 'NO_KNOWN_PERSON', 'NON_PUBLIC'],
+        },
+        {
+          lei: '097900BHKT0000085647',
+          category: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT',
+          reasons: ['NON_PUBLIC'],
+          deleted: true,
+        },
+      ]);
+    }
+  });
+
+  it('drops a reporting exception with no LEI or no category', async () => {
+    const xml = repexFile(DELTA_HEADER, [
+      { lei: '', category: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT', reasons: ['NO_LEI'] },
+      { lei: '0292001156F2T0UFG565', category: '', reasons: ['NO_LEI'] },
+    ]);
+    const file = await openGleifFileFromBytes('repex', chunkBytes(Buffer.from(xml), 64));
+    expect(await collect(file.records)).toEqual([]);
+  });
+
+  it('fails a file that opens with a record instead of its header', async () => {
+    const headerless = `<lei:LEIData xmlns:lei="x"><lei:LEIRecords><lei:LEIRecord><lei:LEI>213800132UA5BEF2LB10</lei:LEI><lei:Entity><lei:LegalName>No Header Ltd</lei:LegalName></lei:Entity></lei:LEIRecord></lei:LEIRecords></lei:LEIData>`;
+    await expect(
+      openGleifFileFromBytes('lei2', chunkBytes(Buffer.from(headerless), 64)),
+    ).rejects.toThrow(/header/i);
+  });
+
+  it('fails a delta cut short rather than ending as a shorter file', async () => {
+    const xml = rrFile(DELTA_HEADER, [
+      {
+        childLei: CHILD_LEI,
+        parentLei: PARENT_LEI,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+      },
+      {
+        childLei: PARENT_LEI,
+        parentLei: CHILD_LEI,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+      },
+    ]);
+    const cut = xml.slice(0, xml.indexOf('</rr:RelationshipRecord>') + 30);
+    const file = await openGleifFileFromBytes('rr', chunkBytes(Buffer.from(cut), 64));
+    await expect(collect(file.records)).rejects.toThrow(/truncated|ended before/i);
   });
 });
 
@@ -3230,5 +3402,96 @@ describe('the synthetic fixture uses the identifier labels the parsers emit', ()
     );
     const fixture = FIXTURE_DESIGNATIONS.find((d) => d.id === 'uk:FX-4004');
     expect(fixture?.payload.identifiers).toEqual(ship?.payload.identifiers);
+  });
+});
+
+// ─── GLEIF Level 1 record shape ────────────────────────────────────────────────
+
+describe('parseLeiLevel1 — record shape', () => {
+  it('normalizes a typed-other-name record to the stored shape', () => {
+    expect(parseLeiLevel1(parseXml(LEI_L1_FULLY_PREFIXED_XML))[0]).toEqual({
+      lei: '5493001KJTIIGC8Y1R12',
+      legalName: 'Fictional Trading Company LLC',
+      otherNames: ['Fictional Trading Co', 'FTC LLC'],
+      alternateNames: [
+        { name: 'Fictional Trading Co', type: 'PREVIOUS_LEGAL_NAME' },
+        { name: 'FTC LLC', type: 'TRADING_OR_OPERATING_NAME' },
+      ],
+      jurisdiction: 'US',
+      status: 'ISSUED',
+      legalAddress: '99 Commerce Way, Testopolis, US-NY, 10001, US',
+      headquartersAddress: '1 HQ Plaza, Testopolis, US',
+      registrationAuthorityId: 'RA000665',
+      registrationAuthorityEntityId: 'FTC-REG-1',
+      lastUpdate: '2026-01-15T10:00:00Z',
+    });
+  });
+
+  const TRANSLITERATED_L1_XML = `<lei:LEIData xmlns:lei="http://www.gleif.org/data/schema/leidata/2016">
+  <lei:LEIRecords>
+    <lei:LEIRecord>
+      <lei:LEI>2138002GH184KUKM1248</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="zh">豐瑞國際證券有限公司</lei:LegalName>
+        <lei:OtherEntityNames>
+          <lei:OtherEntityName xml:lang="en" type="ALTERNATIVE_LANGUAGE_LEGAL_NAME">Fengrui Securities Co Ltd</lei:OtherEntityName>
+          <lei:OtherEntityName xml:lang="zh" type="PREVIOUS_LEGAL_NAME">豐瑞證券有限公司</lei:OtherEntityName>
+        </lei:OtherEntityNames>
+        <lei:TransliteratedOtherEntityNames>
+          <lei:TransliteratedOtherEntityName xml:lang="zh-Latn" type="PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME">FENGRUI INTERNATIONAL SECURITIES LIMITED</lei:TransliteratedOtherEntityName>
+          <lei:TransliteratedOtherEntityName type="AUTO_ASCII_TRANSLITERATED_LEGAL_NAME">FENG RUI GUO JI ZHENG QUAN YOU XIAN GONG SI</lei:TransliteratedOtherEntityName>
+        </lei:TransliteratedOtherEntityNames>
+        <lei:LegalJurisdiction>HK</lei:LegalJurisdiction>
+        <lei:EntityStatus>ACTIVE</lei:EntityStatus>
+      </lei:Entity>
+      <lei:Registration><lei:RegistrationStatus>LAPSED</lei:RegistrationStatus></lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>213800TRANSONLY00042</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="ru">ООО "Ромашка"</lei:LegalName>
+        <lei:TransliteratedOtherEntityNames>
+          <lei:TransliteratedOtherEntityName xml:lang="ru-Latn" type="AUTO_ASCII_TRANSLITERATED_LEGAL_NAME">OOO "Romashka"</lei:TransliteratedOtherEntityName>
+        </lei:TransliteratedOtherEntityNames>
+        <lei:EntityStatus>ACTIVE</lei:EntityStatus>
+      </lei:Entity>
+    </lei:LEIRecord>
+  </lei:LEIRecords>
+</lei:LEIData>`;
+
+  it('keeps every other and transliterated name with its published type (#24)', () => {
+    const [record, translitOnly] = parseLeiLevel1(parseXml(TRANSLITERATED_L1_XML));
+    expect(record).toEqual({
+      lei: '2138002GH184KUKM1248',
+      legalName: '豐瑞國際證券有限公司',
+      otherNames: ['Fengrui Securities Co Ltd', '豐瑞證券有限公司'],
+      alternateNames: [
+        { name: 'Fengrui Securities Co Ltd', type: 'ALTERNATIVE_LANGUAGE_LEGAL_NAME' },
+        { name: '豐瑞證券有限公司', type: 'PREVIOUS_LEGAL_NAME' },
+        {
+          name: 'FENGRUI INTERNATIONAL SECURITIES LIMITED',
+          type: 'PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME',
+        },
+        {
+          name: 'FENG RUI GUO JI ZHENG QUAN YOU XIAN GONG SI',
+          type: 'AUTO_ASCII_TRANSLITERATED_LEGAL_NAME',
+        },
+      ],
+      jurisdiction: 'HK',
+      status: 'LAPSED',
+    });
+    // A transliteration alone still reaches the record; it is not an "other" name.
+    expect(translitOnly).toEqual({
+      lei: '213800TRANSONLY00042',
+      legalName: 'ООО "Ромашка"',
+      otherNames: [],
+      alternateNames: [{ name: 'OOO "Romashka"', type: 'AUTO_ASCII_TRANSLITERATED_LEGAL_NAME' }],
+    });
+  });
+
+  it('streams the same typed names as the DOM parse', async () => {
+    expect(
+      await collect(streamLeiLevel1FromBytes(chunkBytes(Buffer.from(TRANSLITERATED_L1_XML), 5))),
+    ).toEqual(parseLeiLevel1(parseXml(TRANSLITERATED_L1_XML)));
   });
 });

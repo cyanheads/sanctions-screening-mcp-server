@@ -1,9 +1,12 @@
 /**
  * @fileoverview `sanctions_trace_ownership` — the GLEIF Level 2 ownership graph
  * for an LEI: direct and ultimate parents and children, with relationship type,
- * traversed breadth-first to a bounded depth. Optionally screens every node
- * against the watchlists — beneficial-ownership screening that single-list tools
- * can't do, and the cross-source workflow that justifies one server over two.
+ * traversed breadth-first to a bounded depth. Each node whose parents the walk
+ * read also says what GLEIF publishes about its direct and ultimate parent — a
+ * relationship, a reporting exception with its reasons, or nothing — so "its
+ * parent is a natural person" never reads as "it has no parent". Optionally
+ * screens every node against the watchlists, the cross-source workflow that
+ * justifies one server over two.
  * @module mcp-server/tools/definitions/trace-ownership.tool
  */
 
@@ -16,6 +19,20 @@ import { SCREENING_CAVEAT } from './_shared.js';
 
 const LEI_RE = /^[A-Z0-9]{18}[0-9]{2}$/;
 
+const ParentLevelSchema = z.object({
+  status: z
+    .enum(['relationship', 'exception', 'none', 'unknown'])
+    .describe(
+      'relationship = a Level 2 relationship at this level is published (see edges); exception = the entity filed a GLEIF reporting exception instead of naming this parent; none = GLEIF publishes neither; unknown = no relationship is published and reporting exceptions are not loaded in the mirror, so whether one was filed is unknown.',
+    ),
+  exceptionReasons: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Every reason given in the reporting exception (e.g. NATURAL_PERSONS, NON_CONSOLIDATING, NO_KNOWN_PERSON). Present only when status is exception.',
+    ),
+});
+
 /**
  * Potential matches returned per node by the cross-reference screen. A graph of
  * ten nodes would otherwise carry ten full screening result sets, so the per-node
@@ -24,6 +41,26 @@ const LEI_RE = /^[A-Z0-9]{18}[0-9]{2}$/;
  * this is re-screened in full with `sanctions_screen_name` on its legal name.
  */
 const PER_NODE_SCREEN_LIMIT = 10;
+
+/** The Level 2 relationship type, and the reporting-exception category, of each parent level. */
+const PARENT_LEVELS = {
+  direct: {
+    relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+    exceptionCategory: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT',
+  },
+  ultimate: {
+    relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
+    exceptionCategory: 'ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT',
+  },
+} as const;
+
+type ParentLevel = keyof typeof PARENT_LEVELS;
+
+/** What GLEIF publishes about one parent level of a node. */
+interface ParentLevelStatus {
+  exceptionReasons?: string[] | undefined;
+  status: 'relationship' | 'exception' | 'none' | 'unknown';
+}
 
 interface GraphNode {
   /** BFS depth from the root (root = 0). */
@@ -52,10 +89,11 @@ const edgeKeyOf = (rel: {
 
 /**
  * Breadth-first traversal over the relationship table to `depth`, in the
- * requested direction(s). Returns nodes (deduped), edges, and whether the walk
- * was cut off. The traversal is bounded by `depth` and by the relationship table
- * itself (the mirror's corpus), so it terminates even on cyclic ownership
- * structures via the visited set.
+ * requested direction(s). Returns nodes (deduped), edges, whether the walk was
+ * cut off, and — when the walk reads parents — the parent relationship types of
+ * each node whose parents it read. The traversal is bounded by `depth` and by the
+ * relationship table itself (the mirror's corpus), so it terminates even on cyclic
+ * ownership structures via the visited set.
  *
  * `truncated` distinguishes a graph cut off by `depth` from one that simply ran
  * out of relationships. Frontier-emptiness alone cannot: a node discovered
@@ -71,10 +109,16 @@ async function traverse(
   rootLei: string,
   direction: 'parents' | 'children' | 'both',
   depth: number,
-): Promise<{ edges: GraphEdge[]; nodes: Map<string, GraphNode>; truncated: boolean }> {
+): Promise<{
+  edges: GraphEdge[];
+  nodes: Map<string, GraphNode>;
+  parentTypesByLei: Map<string, Set<string>>;
+  truncated: boolean;
+}> {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const seenEdges = new Set<string>();
+  const parentTypesByLei = new Map<string, Set<string>>();
   nodes.set(rootLei, { lei: rootLei, legalName: rootLei, depth: 0, role: 'root' });
 
   let frontier = [rootLei];
@@ -82,6 +126,12 @@ async function traverse(
     const next: string[] = [];
     for (const lei of frontier) {
       const rels = await svc.getRelationships(lei, direction);
+      if (direction !== 'children') {
+        parentTypesByLei.set(
+          lei,
+          new Set(rels.filter((rel) => rel.childLei === lei).map((rel) => rel.relationshipType)),
+        );
+      }
       for (const rel of rels) {
         const edgeKey = edgeKeyOf(rel);
         if (!seenEdges.has(edgeKey)) {
@@ -113,13 +163,58 @@ async function traverse(
       break;
     }
   }
-  return { nodes, edges, truncated };
+  return { nodes, edges, parentTypesByLei, truncated };
+}
+
+/**
+ * What GLEIF publishes about each parent level of every node whose parents the
+ * walk read: a relationship row of that level's type, else a reporting exception
+ * with its reasons, else nothing. With no recorded exception load, a level with no
+ * relationship row is `unknown` — never `none`, which would claim GLEIF publishes
+ * nothing. An exception never supplies a parent; it explains a missing one.
+ */
+async function parentStatuses(
+  svc: ScreeningService,
+  parentTypesByLei: Map<string, Set<string>>,
+  exceptionsLoaded: boolean,
+): Promise<Map<string, Record<ParentLevel, ParentLevelStatus>>> {
+  const exceptions = exceptionsLoaded
+    ? await svc.getReportingExceptions([...parentTypesByLei.keys()])
+    : new Map<string, { category: string; reasons: string[] }[]>();
+  const statuses = new Map<string, Record<ParentLevel, ParentLevelStatus>>();
+  for (const [lei, parentTypes] of parentTypesByLei) {
+    const level = (name: ParentLevel): ParentLevelStatus => {
+      const { relationshipType, exceptionCategory } = PARENT_LEVELS[name];
+      if (parentTypes.has(relationshipType)) return { status: 'relationship' };
+      if (!exceptionsLoaded) return { status: 'unknown' };
+      const exception = exceptions.get(lei)?.find((e) => e.category === exceptionCategory);
+      return exception
+        ? { status: 'exception', exceptionReasons: exception.reasons }
+        : { status: 'none' };
+    };
+    statuses.set(lei, { direct: level('direct'), ultimate: level('ultimate') });
+  }
+  return statuses;
+}
+
+/** How each parent-level status reads in the markdown. */
+const PARENT_STATUS_TEXT: Record<ParentLevelStatus['status'], string> = {
+  relationship: 'relationship published (see edges)',
+  exception: 'reporting exception',
+  none: 'none published',
+  unknown: 'unknown — reporting exceptions not loaded',
+};
+
+/** One parent level of a node, as the markdown renders it — the exception's reasons included. */
+function renderParentLevel(name: ParentLevel, level: ParentLevelStatus): string {
+  const reasons = level.exceptionReasons?.length ? ` (${level.exceptionReasons.join(', ')})` : '';
+  return `  - ${name} parent: ${PARENT_STATUS_TEXT[level.status]}${reasons}`;
 }
 
 export const traceOwnershipTool = tool('sanctions_trace_ownership', {
   title: 'sanctions-screening-mcp-server: trace ownership',
   description:
-    'Trace the GLEIF Level 2 corporate-ownership graph for an LEI: direct and ultimate parents and/or children, traversed breadth-first to a bounded depth, with relationship type for each edge. Set screenNodes to also screen every entity in the graph against all loaded watchlists — beneficial-ownership screening that resolves "is anyone in this ownership chain sanctioned." Each per-node screen is a screening AID: hits are candidates to verify, and an empty result for a node is not a clearance of that node. The response says what it could not do: complete/truncated/missingEntityLeis report whether the graph is the full known picture, screeningStatus reports whether the cross-reference actually ran, and each screened node reports whether its own hit list was capped. Requires a valid 20-character LEI (use sanctions_resolve_entity to obtain one).',
+    'Trace the GLEIF Level 2 corporate-ownership graph for an LEI: direct and ultimate parents and/or children, traversed breadth-first to a bounded depth, with relationship type for each edge. Set screenNodes to also screen every entity in the graph against all loaded watchlists — resolving "is anyone in this ownership chain sanctioned." Each per-node screen is a screening AID: hits are candidates to verify, and an empty result for a node is not a clearance of that node. Each node whose parents were walked carries parentStatus for its direct and ultimate parent: a published relationship, a reporting exception with the reasons the entity gave (such as NATURAL_PERSONS or NON_CONSOLIDATING), none, or unknown when reporting exceptions are not loaded. The response says what it could not do: complete/truncated/missingEntityLeis report whether the loaded relationship graph within the depth is fully shown, screeningStatus reports whether the cross-reference actually ran, and each screened node reports whether its own hit list was capped. Requires a valid 20-character LEI (use sanctions_resolve_entity to obtain one).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     lei: z
@@ -141,7 +236,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       .boolean()
       .default(false)
       .describe(
-        "When true, screen every node's legal name against all watchlists for beneficial-ownership screening.",
+        "When true, screen every node's legal name against all watchlists — the ownership-chain cross-reference.",
       ),
   }),
   output: z.object({
@@ -160,6 +255,17 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
             role: z
               .enum(['root', 'parent', 'child'])
               .describe('Position relative to the traversal.'),
+            parentStatus: z
+              .object({
+                direct: ParentLevelSchema.describe('What GLEIF publishes about the direct parent.'),
+                ultimate: ParentLevelSchema.describe(
+                  'What GLEIF publishes about the ultimate parent.',
+                ),
+              })
+              .optional()
+              .describe(
+                "What GLEIF publishes about this node's direct and ultimate accounting-consolidation parents. Present only on nodes whose parents the traversal read — every node short of the depth limit when direction is parents or both; absent on a children walk.",
+              ),
             sanctionsScreen: z
               .object({
                 totalAvailable: z
@@ -232,12 +338,17 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     complete: z
       .boolean()
       .describe(
-        'True only when this is the full known ownership picture: nothing was cut off by the requested depth AND every node resolved to a GLEIF Level 1 record. False means the graph below is a partial view — read truncated and missingEntityLeis for which.',
+        "True when the loaded Level 2 relationships within the requested depth are all shown (nothing was cut off by depth) AND every node resolved to a GLEIF Level 1 record. It does not say every parent is known — most entities publish no parent relationship; read each node's parentStatus for what GLEIF publishes instead. False means the graph below is a partial view — read truncated and missingEntityLeis for which.",
       ),
     truncated: z
       .boolean()
       .describe(
         'True when further ownership relationships exist beyond the requested depth — re-run with a higher depth to see them. False means the traversal reached the edge of the loaded relationship corpus.',
+      ),
+    reportingExceptionsLoaded: z
+      .boolean()
+      .describe(
+        "Whether GLEIF reporting exceptions are loaded in the mirror. When false, a node's parent level with no published relationship reads unknown rather than exception or none.",
       ),
     missingEntityLeis: z
       .array(z.string())
@@ -292,12 +403,14 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       });
     }
 
-    const { nodes, edges, truncated } = await traverse(
+    const { nodes, edges, parentTypesByLei, truncated } = await traverse(
       svc,
       input.lei,
       input.direction,
       input.depth,
     );
+    const reportingExceptionsLoaded = await svc.reportingExceptionsLoaded();
+    const statusByLei = await parentStatuses(svc, parentTypesByLei, reportingExceptionsLoaded);
 
     // Hydrate node names/jurisdictions in one batch. A node the Level 1 mirror
     // does not carry keeps the LEI as its `legalName`; that is recorded here by
@@ -354,6 +467,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       rootLei: input.lei,
       nodes: orderedNodes.map((node) => {
         const screen = screensByLei.get(node.lei);
+        const parentStatus = statusByLei.get(node.lei);
         return {
           lei: node.lei,
           legalName: node.legalName,
@@ -361,6 +475,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
           ...(node.status ? { status: node.status } : {}),
           depth: node.depth,
           role: node.role,
+          ...(parentStatus ? { parentStatus } : {}),
           ...(screen
             ? {
                 sanctionsScreen: {
@@ -386,6 +501,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       edges,
       complete: !truncated && missingEntityLeis.length === 0,
       truncated,
+      reportingExceptionsLoaded,
       missingEntityLeis,
       screeningStatus,
       screenedNodeCount,
@@ -400,8 +516,8 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
 
     lines.push(
       r.complete
-        ? '**Graph coverage:** complete — nothing was truncated at the requested depth, and every node resolved to a GLEIF Level 1 record.'
-        : '**Graph coverage:** incomplete — what follows is NOT the full known ownership picture.',
+        ? "**Graph coverage:** complete within the loaded relationship data — nothing was truncated at the requested depth, and every node resolved to a GLEIF Level 1 record. Each walked node's parent status says what GLEIF publishes about its direct and ultimate parents."
+        : '**Graph coverage:** incomplete — the relationship graph below is a partial view of what the mirror holds.',
     );
     if (r.truncated) {
       lines.push(
@@ -415,6 +531,12 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
           .join(
             ', ',
           )}. Those nodes show their LEI where a legal name would be, and any screen for them ran against that LEI.`,
+      );
+    }
+
+    if (!r.reportingExceptionsLoaded) {
+      lines.push(
+        '**Reporting exceptions:** not loaded — a parent level with no published relationship reads unknown, never "no parent". mirror:refresh loads them, or mirror:init on a mirror loaded before they existed.',
       );
     }
 
@@ -432,6 +554,10 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       lines.push(
         `- **${node.legalName}** \`${node.lei}\` — ${node.role}, depth ${node.depth}${meta ? ` (${meta})` : ''}`,
       );
+      if (node.parentStatus) {
+        lines.push(renderParentLevel('direct', node.parentStatus.direct));
+        lines.push(renderParentLevel('ultimate', node.parentStatus.ultimate));
+      }
       if (node.sanctionsHits && node.sanctionsHits.length > 0) {
         for (const h of node.sanctionsHits) {
           const scoreStr = h.score !== undefined ? ` · score ${h.score.toFixed(3)}` : '';

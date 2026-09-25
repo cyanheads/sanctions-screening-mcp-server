@@ -92,6 +92,20 @@ describe('screening tools (seeded)', () => {
     expect(result.matches[0]?.lei).toBe('5493001KJTIIGC8Y1R12');
   });
 
+  it('get_entity returns the record fields of the stored entity', async () => {
+    const result = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: '529900T8BM49AURSDO55' }),
+      ctxFor(getEntityTool.errors),
+    );
+    expect(result).toMatchObject({
+      lei: '529900T8BM49AURSDO55',
+      legalName: 'Testland Holdings PLC',
+      otherNames: ['Testland Holdings'],
+      jurisdiction: 'GB',
+      status: 'ISSUED',
+    });
+  });
+
   it('get_entity returns the GLEIF record plus a sanctions cross-reference', async () => {
     const input = getEntityTool.input.parse({ lei: '5493001KJTIIGC8Y1R12' });
     const result = await getEntityTool.handler(input, ctxFor(getEntityTool.errors));
@@ -215,6 +229,102 @@ describe('query-token coverage on both client surfaces (issue #15)', () => {
     expect(renderFormat(resolveEntityTool, result)).toContain(
       `covers ${approx!.queryTokenCoverage!.covered}/3 query tokens`,
     );
+  });
+
+  it('resolve_entity reports the matched name’s type on both surfaces (#24)', async () => {
+    const input = resolveEntityTool.input.parse({ name: 'Fictional Trading Co' });
+    const result = await resolveEntityTool.handler(input, ctxFor(resolveEntityTool.errors));
+    const match = result.matches.find((m) => m.lei === '5493001KJTIIGC8Y1R12');
+    expect(match).toMatchObject({
+      legalName: 'Fictional Trading Company LLC',
+      matchedName: 'Fictional Trading Co',
+      matchedNameType: 'PREVIOUS_LEGAL_NAME',
+      matchType: 'exact',
+    });
+    expect(renderFormat(resolveEntityTool, result)).toContain(
+      'Matched on:** "Fictional Trading Co" (PREVIOUS_LEGAL_NAME)',
+    );
+  });
+
+  it('get_entity keeps otherNames and adds the typed alternate names beside it (#24)', async () => {
+    const result = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: '5493001KJTIIGC8Y1R12' }),
+      ctxFor(getEntityTool.errors),
+    );
+    expect(result.otherNames).toEqual(['Fictional Trading Co']);
+    expect(result.alternateNames).toEqual([
+      { name: 'Fictional Trading Co', type: 'PREVIOUS_LEGAL_NAME' },
+    ]);
+    expect(renderFormat(getEntityTool, result)).toContain(
+      'Fictional Trading Co (PREVIOUS_LEGAL_NAME)',
+    );
+  });
+
+  it('resolve_entity accepts a subdivision code case-insensitively and upper-cases it (#36)', async () => {
+    await seeded.service.ingestLeiEntities([
+      {
+        lei: 'HWUPKR0MPOU8FGXBT394',
+        legalName: 'Apple Inc.',
+        otherNames: [],
+        jurisdiction: 'US-CA',
+        status: 'ISSUED',
+      },
+    ]);
+    const result = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Apple Inc.', jurisdiction: 'us-ca' }),
+      ctxFor(resolveEntityTool.errors),
+    );
+    expect(result.matches.map((m) => m.lei)).toEqual(['HWUPKR0MPOU8FGXBT394']);
+    const country = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Apple Inc.', jurisdiction: 'us' }),
+      ctxFor(resolveEntityTool.errors),
+    );
+    expect(country.matches[0]).toMatchObject({ lei: 'HWUPKR0MPOU8FGXBT394', matchType: 'exact' });
+  });
+
+  it.each(['USA', 'US-', 'US-ABCD', 'U', 'US_CA'])(
+    'resolve_entity rejects the malformed jurisdiction %j at the input schema (#36)',
+    (jurisdiction) => {
+      expect(() => resolveEntityTool.input.parse({ name: 'Apple', jurisdiction })).toThrow();
+    },
+  );
+
+  it('resolve_entity status lapsed returns LAPSED only; any reaches retired records (#23)', async () => {
+    const lapsed = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Qorvath Nominee Services', status: 'lapsed' }),
+      ctxFor(resolveEntityTool.errors),
+    );
+    expect(lapsed.matches.map((m) => [m.lei, m.status])).toEqual([
+      ['254900SPRNGTRUST0028', 'LAPSED'],
+    ]);
+    const any = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Qorvath Nominee Services', status: 'any' }),
+      ctxFor(resolveEntityTool.errors),
+    );
+    expect(new Set(any.matches.map((m) => m.status))).toEqual(new Set(['LAPSED', 'RETIRED']));
+  });
+
+  it('resolve_entity reaches the fixture entity published only under alternate names (#24)', async () => {
+    const result = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Zorneft Oil Company' }),
+      ctxFor(resolveEntityTool.errors),
+    );
+    expect(result.matches[0]).toMatchObject({
+      lei: '253400ZORNEFTPAO0042',
+      matchedName: 'Zorneft Oil Company',
+      matchedNameType: 'PREVIOUS_LEGAL_NAME',
+      matchType: 'exact',
+    });
+  });
+
+  it('describes the status and jurisdiction filters as they now apply (#23, #36)', () => {
+    const shape = resolveEntityTool.input.shape;
+    expect(shape.status.description).toMatch(/lapsed.*exactly.*LAPSED/i);
+    expect(shape.status.description).toMatch(/any/);
+    expect(shape.jurisdiction.description).toMatch(/subdivision/i);
+    expect(shape.jurisdiction.description).toMatch(/US-DE/);
+    expect(resolveEntityTool.description).toMatch(/subdivision/i);
+    expect(resolveEntityTool.description).toMatch(/transliterat/i);
   });
 
   it('resolve_entity omits coverage for an exact match on both surfaces', async () => {

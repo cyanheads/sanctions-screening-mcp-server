@@ -227,6 +227,7 @@ describe('sanctions_resolve_entity format()', () => {
           lei: '5493001KJTIIGC8Y1R12',
           legalName: 'Fictional Trading Company LLC',
           matchedName: 'Fictional Trading Co',
+          matchedNameType: 'PREVIOUS_LEGAL_NAME',
           matchType: 'approximate',
           score: 0.887_777,
           queryTokenCoverage: { covered: 3, total: 3 },
@@ -241,8 +242,24 @@ describe('sanctions_resolve_entity format()', () => {
     expect(text).toContain('score 0.888');
     expect(text).toContain('covers 3/3 query tokens');
     expect(text).toContain('`5493001KJTIIGC8Y1R12`');
-    expect(text).toContain('Matched on:** "Fictional Trading Co"');
+    expect(text).toContain('Matched on:** "Fictional Trading Co" (PREVIOUS_LEGAL_NAME)');
     expect(text).toContain('Jurisdiction: US-DE | Status: ISSUED');
+  });
+
+  it('labels a name stored without a type as unknown', () => {
+    const text = render(resolveEntityTool, {
+      matches: [
+        {
+          lei: '5493001KJTIIGC8Y1R12',
+          legalName: 'Fictional Trading Company LLC',
+          matchedName: 'FTC',
+          matchedNameType: 'UNKNOWN',
+          matchType: 'strong',
+        },
+      ],
+    });
+
+    expect(text).toContain('Matched on:** "FTC" (UNKNOWN)');
   });
 
   it('omits the metadata line entirely when neither jurisdiction nor status is known', () => {
@@ -252,6 +269,7 @@ describe('sanctions_resolve_entity format()', () => {
           lei: '5493001KJTIIGC8Y1R12',
           legalName: 'Bare Record Ltd',
           matchedName: 'Bare Record Ltd',
+          matchedNameType: 'LEGAL_NAME',
           matchType: 'exact',
         },
       ],
@@ -274,6 +292,7 @@ describe('sanctions_get_entity format()', () => {
     lei: '5493001KJTIIGC8Y1R12',
     legalName: 'Fictional Trading Company LLC',
     otherNames: [],
+    alternateNames: [],
     sanctionsHits: [],
     screeningStatus: 'screened',
     caveat: SCREENING_CAVEAT,
@@ -283,6 +302,11 @@ describe('sanctions_get_entity format()', () => {
     const text = render(getEntityTool, {
       ...base,
       otherNames: ['Fictional Trading Co', 'FTC'],
+      alternateNames: [
+        { name: 'Fictional Trading Co', type: 'PREVIOUS_LEGAL_NAME' },
+        { name: 'FTC', type: 'TRADING_OR_OPERATING_NAME' },
+        { name: 'FICTIONAL TRADING', type: 'PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME' },
+      ],
       jurisdiction: 'US-DE',
       status: 'ISSUED',
       legalAddress: '1 Market St, Wilmington, DE',
@@ -314,6 +338,9 @@ describe('sanctions_get_entity format()', () => {
 
     expect(text).toContain('# Fictional Trading Company LLC');
     expect(text).toContain('Other names:** Fictional Trading Co; FTC');
+    expect(text).toContain(
+      'Names by type:** Fictional Trading Co (PREVIOUS_LEGAL_NAME); FTC (TRADING_OR_OPERATING_NAME); FICTIONAL TRADING (PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME)',
+    );
     expect(text).toContain('Jurisdiction:** US-DE');
     expect(text).toContain('Registration status:** ISSUED');
     expect(text).toContain('Legal address:** 1 Market St, Wilmington, DE');
@@ -356,6 +383,7 @@ describe('sanctions_get_entity format()', () => {
     expect(text).toContain('Registration authority:** RA000602');
     expect(text).not.toContain('(entity');
     expect(text).not.toContain('Other names:');
+    expect(text).not.toContain('Names by type:');
     expect(text).not.toContain('Jurisdiction:');
     expect(text).toContain('No potential watchlist matches on the legal name (NOT a clearance).');
     // No `sanctionsScreen` at all: an unscreened payload discloses no coverage.
@@ -386,12 +414,17 @@ describe('sanctions_trace_ownership format()', () => {
       complete: true,
       truncated: false,
       missingEntityLeis: [],
+      reportingExceptionsLoaded: true,
       screeningStatus: 'screened',
       nodes: [
         {
           ...root,
           jurisdiction: 'US-DE',
           status: 'ISSUED',
+          parentStatus: {
+            direct: { status: 'relationship' },
+            ultimate: { status: 'exception', exceptionReasons: ['NATURAL_PERSONS', 'NON_PUBLIC'] },
+          },
           sanctionsHits: [
             {
               source: 'uk',
@@ -410,6 +443,7 @@ describe('sanctions_trace_ownership format()', () => {
           legalName: 'Parent Holdings PLC',
           depth: 1,
           role: 'parent',
+          parentStatus: { direct: { status: 'none' }, ultimate: { status: 'relationship' } },
           sanctionsHits: [],
           sanctionsScreen: { totalAvailable: 0, totalAvailableBasis: 'exact', hasMore: false },
         },
@@ -448,6 +482,12 @@ describe('sanctions_trace_ownership format()', () => {
     expect(text).toContain('IS_DIRECTLY_CONSOLIDATED_BY `5493009BRIT0PARENT12` (ACTIVE)');
     expect(text).toContain('IS_ULTIMATELY_CONSOLIDATED_BY `5493009ULTIMATE00099`');
     expect(text).not.toContain('IS_ULTIMATELY_CONSOLIDATED_BY `5493009ULTIMATE00099` (');
+    // Each walked node states what GLEIF publishes about its direct and ultimate parents.
+    expect(text).toContain('direct parent: relationship published (see edges)');
+    expect(text).toContain('ultimate parent: reporting exception (NATURAL_PERSONS, NON_PUBLIC)');
+    expect(text).toContain('direct parent: none published');
+    expect(text).toMatch(/complete within the loaded relationship data/i);
+    expect(text).not.toMatch(/reporting exceptions:\*\* not loaded/i);
   });
 
   it('renders an incomplete graph as truncated and names its unhydrated nodes', () => {
@@ -456,6 +496,7 @@ describe('sanctions_trace_ownership format()', () => {
       complete: false,
       truncated: true,
       missingEntityLeis: ['33333333333333333333'],
+      reportingExceptionsLoaded: false,
       screeningStatus: 'not_ready',
       nodes: [root],
       edges: [],
@@ -464,8 +505,9 @@ describe('sanctions_trace_ownership format()', () => {
       caveat: SCREENING_CAVEAT,
     });
 
-    expect(text).toMatch(/not the full known ownership picture/i);
+    expect(text).toMatch(/incomplete — the relationship graph below is a partial view/i);
     expect(text).toMatch(/truncated at the requested depth/i);
+    expect(text).toMatch(/reporting exceptions:\*\* not loaded/i);
     expect(text).toContain('33333333333333333333');
     expect(text).toMatch(/not run/i);
   });
@@ -476,6 +518,7 @@ describe('sanctions_trace_ownership format()', () => {
       complete: true,
       truncated: false,
       missingEntityLeis: [],
+      reportingExceptionsLoaded: true,
       screeningStatus: 'not_requested',
       nodes: [root],
       edges: [],
@@ -494,6 +537,8 @@ describe('sanctions_trace_ownership format()', () => {
     expect(text).not.toContain('potential match(es) (count basis');
     expect(text).toContain('depth 0');
     expect(text).not.toContain('depth 0 (');
+    // A node whose parents were not walked gets no parent-status line.
+    expect(text).not.toContain('parent:');
   });
 });
 
@@ -512,7 +557,18 @@ describe('sanctions_list_sources format()', () => {
       sanctionsAsOf: '2026-06-01T12:00:00.000Z',
       leiReady: true,
       leiAsOf: '2026-06-01T13:00:00.000Z',
-      sources: [source],
+      reportingExceptionsLoaded: true,
+      sources: [
+        source,
+        {
+          code: 'gleif',
+          label: 'GLEIF LEI (Level 1 entities + Level 2 ownership)',
+          recordCount: 3,
+          reportingExceptionCount: 6_378_146,
+          url: 'https://goldencopy.gleif.org',
+          license: 'CC0 1.0 Universal (public domain)',
+        },
+      ],
     });
 
     expect(text).toContain('**Sanctions mirror:** ready (as of 2026-06-01T12:00:00.000Z)');
@@ -520,12 +576,15 @@ describe('sanctions_list_sources format()', () => {
     expect(text).toContain('### OFAC Specially Designated Nationals (`ofac_sdn`)');
     expect(text).toContain('**Records:** 17004 | **License:** US Government work — public domain');
     expect(text).toContain(source.url);
+    expect(text).toContain('**Reporting exceptions:** 6378146');
+    expect(text).not.toMatch(/reporting exceptions:\*\* not loaded/i);
   });
 
   it('reports an unsynced mirror as NOT ready with no timestamp', () => {
     const text = render(listSourcesTool, {
       sanctionsReady: false,
       leiReady: false,
+      reportingExceptionsLoaded: false,
       sources: [{ ...source, recordCount: 0 }],
     });
 
@@ -533,6 +592,9 @@ describe('sanctions_list_sources format()', () => {
     expect(text).toContain('**GLEIF mirror:** NOT ready');
     expect(text).not.toContain('as of');
     expect(text).toContain('**Records:** 0');
+    // Unloaded exception data is stated as unloaded, never as a zero count.
+    expect(text).toMatch(/reporting exceptions:\*\* not loaded/i);
+    expect(text).not.toContain('**Reporting exceptions:** 0');
   });
 });
 

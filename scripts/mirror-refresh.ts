@@ -2,11 +2,17 @@
  * @fileoverview `mirror:refresh` — incremental out-of-band refresh. Re-harvests
  * the sanctions lists in full — streamed, so the ~120 MB OFAC SDN document is
  * never held whole — removing each list's designations its complete document no
- * longer publishes, and rebuilds the name and identifier indexes, then applies
- * the last day of GLEIF deltas, which are small enough for the buffered parse.
- * The HTTP server runs the sanctions half of this on a cron automatically; stdio
- * operators run this manually. Set `SANCTIONS_REFRESH_SKIP_GLEIF=1` to refresh only the sanctions
- * lists.
+ * longer publishes, and rebuilds the name and identifier indexes. Then it brings
+ * the GLEIF mirror current from its checkpoint: per dataset, the smallest delta
+ * window that reaches back to the last file applied, streamed in bounded batches,
+ * deletions included. Reporting exceptions with no recorded load get their golden
+ * copy. The HTTP server runs the same refresh on a cron, deltas only.
+ *
+ * Exits non-zero when a sanctions list failed, or when the GLEIF mirror cannot be
+ * caught up from deltas — no checkpoint recorded (every mirror written before
+ * checkpoints existed) or a gap longer than the one-month window — which needs
+ * `mirror:init`; nothing is applied to GLEIF then, and `leiAsOf` stays put. Set
+ * `SANCTIONS_REFRESH_SKIP_GLEIF=1` to refresh only the sanctions lists.
  *
  * Usage: `bun run mirror:refresh`
  * @module scripts/mirror-refresh
@@ -14,77 +20,37 @@
 
 import { withExtra } from '@cyanheads/mcp-ts-core/utils';
 import {
-  harvestLeiLevel1,
-  harvestLeiLevel2,
-  resolveGleifFileUrl,
-} from '@/services/screening/gleif-ingest.js';
-import { createRejections } from '@/services/screening/ingest-validation.js';
-import { longRunSignal, REFRESH_HOURS } from '@/services/screening/sanctions-refresh.js';
-import { bootstrap } from './_mirror-context.js';
+  longRunSignal,
+  REFRESH_HOURS,
+  refreshMirrors,
+} from '@/services/screening/sanctions-refresh.js';
+import { bootstrap, runScript } from './_mirror-context.js';
 
 async function main(): Promise<void> {
   const { service, log, ctx } = await bootstrap('mirror:refresh');
-  const signal = longRunSignal(REFRESH_HOURS);
-
-  log.info('mirror:refresh — re-harvesting sanctions lists', ctx);
-  const sanctions = await service.syncSanctions('refresh', signal);
-  log.info(
-    'mirror:refresh — sanctions refreshed, name and identifier indexes rebuilt',
-    withExtra(ctx, {
-      records: sanctions.recordsApplied,
-      removed: sanctions.tombstonesApplied,
-      total: sanctions.total,
-    }),
-  );
-
-  if (process.env.SANCTIONS_REFRESH_SKIP_GLEIF === '1') {
-    log.notice('mirror:refresh — SANCTIONS_REFRESH_SKIP_GLEIF set; skipping GLEIF deltas', ctx);
-    await service.close();
-    return;
-  }
-
-  log.info('mirror:refresh — applying GLEIF deltas (LastDay)', ctx);
-  const [l1Url, l2Url] = await Promise.all([
-    resolveGleifFileUrl('lei2-delta', signal, 'LastDay'),
-    resolveGleifFileUrl('rr-delta', signal, 'LastDay'),
-  ]);
-  const leiRejections = createRejections();
-  const entities = await harvestLeiLevel1(l1Url, signal, leiRejections);
-  await service.ingestLeiEntities(entities);
-  const relationships = await harvestLeiLevel2(l2Url, signal);
-  await service.ingestLeiRelationships(relationships);
-  log.info(
-    'mirror:refresh — GLEIF deltas applied',
-    withExtra(ctx, {
-      entities: entities.length,
-      relationships: relationships.length,
-      rejectedMissingIdentifier: leiRejections.missingIdentifier,
-      rejectedUnusableName: leiRejections.unusableName,
-    }),
-  );
-
-  // Advance GLEIF freshness so sanctions_list_sources reports the data just loaded.
-  // Guarded: a delta on a never-initialized mirror is not completion, so freshness
-  // advances only when the mirror is already ready — otherwise run mirror:init.
-  const freshness = await service.advanceLeiFreshnessIfReady();
-  if (freshness.advanced) {
+  try {
+    log.info('mirror:refresh — re-harvesting sanctions lists, then GLEIF', ctx);
+    const { sanctions, gleif } = await refreshMirrors(service, longRunSignal(REFRESH_HOURS), {
+      context: ctx,
+      loadMissingExceptions: true,
+    });
     log.info(
-      'mirror:refresh — GLEIF freshness advanced',
-      withExtra(ctx, { leiEntities: freshness.entityCount }),
+      'mirror:refresh — sanctions refreshed, name and identifier indexes rebuilt',
+      withExtra(ctx, {
+        records: sanctions.recordsApplied,
+        removed: sanctions.tombstonesApplied,
+        total: sanctions.total,
+      }),
     );
-  } else {
-    log.notice(
-      'mirror:refresh — GLEIF mirror not yet initialized; applied deltas but left freshness unset. Run mirror:init to complete the initial GLEIF load.',
-      withExtra(ctx, { leiEntities: freshness.entityCount }),
-    );
+    if (gleif && gleif.needsInit.length > 0) {
+      throw new Error(
+        `GLEIF ${gleif.needsInit.join(', ')} cannot be caught up from delta files — nothing was applied and leiAsOf is unchanged. Run mirror:init to reload the GLEIF golden copies.`,
+      );
+    }
+    log.info('mirror:refresh — complete', ctx);
+  } finally {
+    await service.close();
   }
-
-  log.info('mirror:refresh — complete', ctx);
-  await service.close();
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error('mirror:refresh failed:', err);
-  process.exit(1);
-});
+runScript('mirror:refresh', main);

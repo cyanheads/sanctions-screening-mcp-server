@@ -5,7 +5,9 @@
  * way 0.2.0 built one — schema version 1, the store's own tables plus the `name`
  * index and nothing else, rows written through the store's generic upsert — and
  * then opened by the current service, which must serve every existing tool from
- * it unchanged.
+ * it unchanged. The GLEIF mirror 0.3.0 wrote records no checkpoint and no
+ * reporting exceptions: the current service must degrade on it — parent status
+ * `unknown`, a refresh that asks for `mirror:init` — never break.
  * @module tests/integration/mirror-upgrade.test
  */
 
@@ -18,15 +20,20 @@ import {
   type SqliteHandle,
   sqliteMirrorStore,
 } from '@cyanheads/mcp-ts-core/mirror';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetServerConfig } from '@/config/server-config.js';
 import { designationResource } from '@/mcp-server/resources/definitions/designation.resource.js';
+import { entityResource } from '@/mcp-server/resources/definitions/entity.resource.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
+import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
+import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity.tool.js';
 import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
+import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 import { FIXTURE_DESIGNATIONS } from '@/services/screening/fixtures.js';
+import { loadGleifGoldenCopies, refreshGleif } from '@/services/screening/gleif-sync.js';
 import { IDENTIFIER_TABLE, REFERENCE_NUMBER_INDEX } from '@/services/screening/schema.js';
 import {
   buildScreeningService,
@@ -36,6 +43,13 @@ import {
 } from '@/services/screening/screening-service.js';
 import { doubleMetaphone, fold } from '@/services/screening/text-matching.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
+import {
+  type GleifStandIn,
+  leiFile,
+  repexFile,
+  rrFile,
+  startGleifStandIn,
+} from '../services/_gleif-publication.js';
 import { lookupDesignations, serveLookupCorpus } from '../services/_lookup-corpus.js';
 
 /** The designation store spec as 0.2.0 declared it: no `version`, no migrations. */
@@ -369,5 +383,294 @@ describe('a mirror created by the current service', () => {
         await service.close();
       }
     }
+  });
+});
+
+/** The GLEIF entity store as 0.3.0 declared it. */
+const V030_LEI_SPEC: Omit<SchemaSpec, 'path'> = {
+  table: 'lei_entity',
+  primaryKey: 'lei',
+  columns: {
+    lei: 'TEXT',
+    legal_name: 'TEXT',
+    normalized_name: 'TEXT',
+    other_names: 'TEXT',
+    jurisdiction: 'TEXT',
+    status: 'TEXT',
+    legal_address: 'TEXT',
+    headquarters_address: 'TEXT',
+    registration_authority_id: 'TEXT',
+    registration_authority_entity_id: 'TEXT',
+    last_update: 'TEXT',
+    payload: 'TEXT',
+  },
+  fts: ['normalized_name'],
+  indexes: [{ columns: ['jurisdiction'] }, { columns: ['status'] }],
+};
+
+const CHILD = '5493001KJTIIGC8Y1R12';
+const PARENT = '529900T8BM49AURSDO55';
+const LONE = '254900QORVATHNOM0017';
+
+/** Write a ready 0.3.0-shaped GLEIF mirror: entities, one relationship, no checkpoint. */
+async function writeV030Gleif(gleifPath: string): Promise<void> {
+  const store = sqliteMirrorStore({ path: gleifPath, ...V030_LEI_SPEC });
+  const entity = (
+    lei: string,
+    legalName: string,
+    extra: { jurisdiction?: string; otherNames?: string[]; status?: string } = {},
+  ) => {
+    const { jurisdiction, otherNames = [], status = 'ISSUED' } = extra;
+    return {
+      lei,
+      legal_name: legalName,
+      normalized_name: fold(legalName),
+      other_names: JSON.stringify(otherNames),
+      jurisdiction: jurisdiction ?? null,
+      status,
+      legal_address: null,
+      headquarters_address: null,
+      registration_authority_id: null,
+      registration_authority_entity_id: null,
+      last_update: null,
+      payload: JSON.stringify({
+        lei,
+        legalName,
+        otherNames,
+        ...(jurisdiction ? { jurisdiction } : {}),
+        status,
+      }),
+    };
+  };
+  await store.applyBatch(
+    [
+      entity(CHILD, 'Fictional Trading Company LLC', {
+        jurisdiction: 'US-DE',
+        otherNames: ['Qorlane Brands'],
+      }),
+      entity(PARENT, 'Testland Holdings PLC'),
+      entity(LONE, 'Spring Trust Nominees Ltd', { status: 'RETIRED' }),
+    ],
+    [],
+  );
+  const handle = await store.raw();
+  handle.exec(`
+    CREATE TABLE IF NOT EXISTS lei_relationship (
+      child_lei TEXT NOT NULL, parent_lei TEXT NOT NULL, relationship_type TEXT NOT NULL,
+      relationship_status TEXT, relationship_period TEXT,
+      PRIMARY KEY (child_lei, parent_lei, relationship_type));
+    CREATE INDEX IF NOT EXISTS idx_rel_child ON lei_relationship(child_lei);
+    CREATE INDEX IF NOT EXISTS idx_rel_parent ON lei_relationship(parent_lei);
+  `);
+  handle
+    .prepare(
+      'INSERT INTO lei_relationship (child_lei, parent_lei, relationship_type, relationship_status) VALUES (?, ?, ?, ?)',
+    )
+    .run(CHILD, PARENT, 'IS_ULTIMATELY_CONSOLIDATED_BY', 'ACTIVE');
+  await store.writeState({
+    status: 'complete',
+    completedAt: '2026-07-17T12:37:20.000Z',
+    total: 3,
+  });
+  await store.close();
+}
+
+describe('a 0.3.0 GLEIF mirror opened by the current service', () => {
+  beforeEach(async () => {
+    await getScreeningService().close();
+    resetScreeningService();
+    await writeV030Gleif(join(dir, 'sanctions.gleif.db'));
+    initScreeningService();
+  });
+
+  const trace = (lei: string) =>
+    traceOwnershipTool.handler(
+      traceOwnershipTool.input.parse({ lei, direction: 'parents', depth: 2 }),
+      ctxFor(traceOwnershipTool.errors),
+    );
+
+  it('reads parent status unknown where no relationship is published, and says why', async () => {
+    const lone = await trace(LONE);
+    expect(lone.reportingExceptionsLoaded).toBe(false);
+    expect(lone.nodes[0]?.parentStatus).toEqual({
+      direct: { status: 'unknown' },
+      ultimate: { status: 'unknown' },
+    });
+    expect(lone).toMatchObject({ complete: true, truncated: false, missingEntityLeis: [] });
+
+    const child = await trace(CHILD);
+    expect(child.nodes.map((node) => node.lei)).toEqual([CHILD, PARENT]);
+    expect(child.nodes[0]?.parentStatus).toEqual({
+      direct: { status: 'unknown' },
+      ultimate: { status: 'relationship' },
+    });
+  });
+
+  it('lists GLEIF with no exception count and the stored as-of', async () => {
+    const result = await listSourcesTool.handler(
+      listSourcesTool.input.parse({}),
+      createMockContext(),
+    );
+    expect(result).toMatchObject({
+      leiReady: true,
+      leiAsOf: '2026-07-17T12:37:20.000Z',
+      reportingExceptionsLoaded: false,
+    });
+    expect(result.sources.find((source) => source.code === 'gleif')).toMatchObject({
+      recordCount: 3,
+    });
+    expect(result.sources.find((source) => source.code === 'gleif')).not.toHaveProperty(
+      'reportingExceptionCount',
+    );
+  });
+
+  it('refreshes nothing and asks for mirror:init, leaving leiAsOf where it was', async () => {
+    const fetch = vi.fn(async () => new Response('unreachable', { status: 500 }));
+    vi.stubGlobal('fetch', fetch);
+
+    const outcome = await refreshGleif(getScreeningService(), new AbortController().signal, {
+      loadMissingExceptions: true,
+    });
+
+    expect(outcome.needsInit).toEqual(['lei2', 'rr']);
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await getScreeningService().leiReadiness()).completedAt).toBe(
+      '2026-07-17T12:37:20.000Z',
+    );
+  });
+
+  const resolveWith = async (input: Record<string, unknown>) => {
+    const ctx = ctxFor(resolveEntityTool.errors);
+    const result = await resolveEntityTool.handler(resolveEntityTool.input.parse(input), ctx);
+    return { result, notice: getEnrichment(ctx).notice };
+  };
+
+  it('resolves legal names as before, and says alternate names are not yet indexed (#24)', async () => {
+    const { result, notice } = await resolveWith({ name: 'Fictional Trading Company LLC' });
+    expect(result.matches[0]).toMatchObject({
+      lei: CHILD,
+      matchedName: 'Fictional Trading Company LLC',
+      matchedNameType: 'LEGAL_NAME',
+      matchType: 'exact',
+    });
+    expect(notice).toMatch(/alternate names/i);
+    expect(notice).toMatch(/not yet indexed/i);
+    expect(notice).toMatch(/mirror:init/);
+
+    // The notice reaches both response surfaces.
+    const wire = await runToolContract(resolveEntityTool, { name: 'Testland Holdings PLC' });
+    expect(wire.isError).toBeFalsy();
+    const text = wire.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect((wire.structuredContent as { notice?: string }).notice).toMatch(/not yet indexed/i);
+    expect(text).toMatch(/not yet indexed/i);
+    expect(text).toContain('(LEGAL_NAME)');
+  });
+
+  it('scores other names 0.3.0 stored for an entity its legal name pools, typed unknown', async () => {
+    const { result } = await resolveWith({ name: 'Fictional Qorlane Brands', matchMode: 'fuzzy' });
+    expect(result.matches.find((m) => m.lei === CHILD)).toMatchObject({
+      matchedName: 'Qorlane Brands',
+      matchedNameType: 'UNKNOWN',
+      matchType: 'approximate',
+      queryTokenCoverage: { covered: 2, total: 3 },
+    });
+  });
+
+  it('applies the #23 status and #36 jurisdiction predicates before the index exists', async () => {
+    const country = await resolveWith({ name: 'Fictional Trading Company', jurisdiction: 'us' });
+    expect(country.result.matches.map((m) => m.lei)).toEqual([CHILD]);
+    const subdivision = await resolveWith({
+      name: 'Fictional Trading Company',
+      jurisdiction: 'US-CA',
+    });
+    expect(subdivision.result.matches.map((m) => m.lei)).not.toContain(CHILD);
+    const lapsed = await resolveWith({ name: 'Spring Trust Nominees', status: 'lapsed' });
+    expect(lapsed.result.matches.map((m) => m.lei)).not.toContain(LONE);
+    const retired = await resolveWith({ name: 'Spring Trust Nominees', status: 'any' });
+    expect(retired.result.matches[0]).toMatchObject({ lei: LONE, status: 'RETIRED' });
+  });
+
+  it('serves a record 0.3.0 wrote in the current shape, its bare other names typed unknown', async () => {
+    const tool = await getEntityTool.handler(
+      getEntityTool.input.parse({ lei: CHILD }),
+      ctxFor(getEntityTool.errors),
+    );
+    expect(tool).toMatchObject({
+      otherNames: ['Qorlane Brands'],
+      alternateNames: [{ name: 'Qorlane Brands', type: 'UNKNOWN' }],
+    });
+    const params = entityResource.params?.parse({ lei: CHILD });
+    if (!params) throw new Error('the entity resource declares no params schema');
+    expect(await entityResource.handler(params, ctxFor(entityResource.errors))).toMatchObject({
+      otherNames: ['Qorlane Brands'],
+      alternateNames: [{ name: 'Qorlane Brands', type: 'UNKNOWN' }],
+    });
+  });
+
+  describe('once mirror:init loads the golden copies', () => {
+    let standIn: GleifStandIn;
+    const golden = (contentDate: string) => ({
+      lei2: {
+        full: leiFile({ contentDate }, [
+          {
+            lei: CHILD,
+            legalName: 'Fictional Trading Company LLC',
+            jurisdiction: 'US-DE',
+            otherNames: [{ name: 'Qorlane Brands', type: 'TRADING_OR_OPERATING_NAME' }],
+          },
+          { lei: PARENT, legalName: 'Testland Holdings PLC' },
+          { lei: LONE, legalName: 'Spring Trust Nominees Ltd', status: 'RETIRED' },
+        ]),
+        deltas: {},
+      },
+      rr: { full: rrFile({ contentDate }, []), deltas: {} },
+      repex: { full: repexFile({ contentDate }, []), deltas: {} },
+    });
+
+    beforeEach(async () => {
+      standIn = await startGleifStandIn();
+      process.env.GLEIF_GOLDEN_COPY_BASE_URL = standIn.base;
+      resetServerConfig();
+    });
+
+    afterEach(async () => {
+      await standIn.close();
+      delete process.env.GLEIF_GOLDEN_COPY_BASE_URL;
+      resetServerConfig();
+    });
+
+    it('does not count the index as built while a load is only part-way through', async () => {
+      const full = golden('2026-09-25T08:08:49Z').lei2.full;
+      standIn.serve(golden('2026-09-25T08:08:49Z'), {
+        '/files/lei2-full.xml': full.slice(0, full.indexOf('</lei:LEIRecord>') + 16),
+      });
+      await expect(
+        loadGleifGoldenCopies(getScreeningService(), new AbortController().signal),
+      ).rejects.toThrow();
+      const { result, notice } = await resolveWith({ name: 'Qorlane Brands' });
+      expect(notice).toMatch(/not yet indexed/i);
+      expect(result.matches.map((m) => m.lei)).not.toContain(CHILD);
+    });
+
+    it('builds the index, after which alternate names resolve and the notice is gone', async () => {
+      standIn.serve(golden('2026-09-25T08:08:49Z'));
+      await loadGleifGoldenCopies(getScreeningService(), new AbortController().signal);
+
+      const { result, notice } = await resolveWith({ name: 'Qorlane Brands' });
+      expect(result.matches[0]).toMatchObject({
+        lei: CHILD,
+        legalName: 'Fictional Trading Company LLC',
+        matchedName: 'Qorlane Brands',
+        matchedNameType: 'TRADING_OR_OPERATING_NAME',
+        matchType: 'exact',
+      });
+      expect(notice).toBeUndefined();
+
+      // The index survives the process: a second service reads the recorded build.
+      await getScreeningService().close();
+      resetScreeningService();
+      initScreeningService();
+      expect((await resolveWith({ name: 'Qorlane Brands' })).notice).toBeUndefined();
+    });
   });
 });

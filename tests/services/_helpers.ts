@@ -13,6 +13,7 @@ import {
   FIXTURE_DESIGNATIONS,
   FIXTURE_LEI_ENTITIES,
   FIXTURE_LEI_RELATIONSHIPS,
+  FIXTURE_REPORTING_EXCEPTIONS,
 } from '@/services/screening/fixtures.js';
 import {
   buildScreeningService,
@@ -43,6 +44,7 @@ export async function seededService(): Promise<SeededService> {
     designations: FIXTURE_DESIGNATIONS,
     leiEntities: FIXTURE_LEI_ENTITIES,
     leiRelationships: FIXTURE_LEI_RELATIONSHIPS,
+    reportingExceptions: FIXTURE_REPORTING_EXCEPTIONS,
   });
 
   return {
@@ -95,6 +97,7 @@ export async function seededGlobalService(): Promise<SeededService> {
     designations: FIXTURE_DESIGNATIONS,
     leiEntities: FIXTURE_LEI_ENTITIES,
     leiRelationships: FIXTURE_LEI_RELATIONSHIPS,
+    reportingExceptions: FIXTURE_REPORTING_EXCEPTIONS,
   });
 
   return {

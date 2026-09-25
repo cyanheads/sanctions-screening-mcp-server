@@ -154,6 +154,39 @@ describe('empty result versus unavailable screening', () => {
     expect(getEnrichment(ctx).notice).toMatch(/not proof.*no LEI/i);
   });
 
+  it('never suggests a fuzzy retry after the fuzzy pass both empty results come from (#36)', async () => {
+    global = await seededGlobalService();
+    const resolveCtx = ctxFor(resolveEntityTool.errors);
+    const resolved = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Zzqxwv Qqpzm Xkwqj', jurisdiction: 'US' }),
+      resolveCtx,
+    );
+    expect(getEnrichment(resolveCtx)).toMatchObject({ matchModeUsed: 'fuzzy', totalCount: 0 });
+    expect(resolved.matches).toHaveLength(0);
+    expect(getEnrichment(resolveCtx).notice).toMatch(/not proof.*no LEI/i);
+    expect(getEnrichment(resolveCtx).notice).not.toMatch(/matchMode/);
+    expect(getEnrichment(resolveCtx).notice).toMatch(/drop the jurisdiction filter/);
+    expect(getEnrichment(resolveCtx).notice).toMatch(/status:"any"/);
+
+    // Only the filters actually applied are offered as ways to broaden.
+    const unfilteredCtx = ctxFor(resolveEntityTool.errors);
+    await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Zzqxwv Qqpzm Xkwqj', status: 'any' }),
+      unfilteredCtx,
+    );
+    expect(getEnrichment(unfilteredCtx).notice).toMatch(/not proof.*no LEI/i);
+    expect(getEnrichment(unfilteredCtx).notice).not.toMatch(/jurisdiction|status:"any"/);
+
+    const screenCtx = ctxFor(screenNameTool.errors);
+    await screenNameTool.handler(
+      screenNameTool.input.parse({ name: 'Zzqxwv Qqpzm Xkwqj' }),
+      screenCtx,
+    );
+    expect(getEnrichment(screenCtx)).toMatchObject({ matchModeUsed: 'fuzzy', totalCount: 0 });
+    expect(getEnrichment(screenCtx).notice).toMatch(/not a clearance/i);
+    expect(getEnrichment(screenCtx).notice).not.toMatch(/matchMode/);
+  });
+
   it('carries search enrichment onto both response surfaces', async () => {
     global = await seededGlobalService();
     // `format()` only ever sees the tool's `output`, so enrichment reaches

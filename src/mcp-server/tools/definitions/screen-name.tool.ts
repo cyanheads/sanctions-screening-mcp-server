@@ -237,11 +237,13 @@ export const screenNameTool = tool('sanctions_screen_name', {
     ctx.enrich.total(result.hits.length);
     // An empty page has two very different causes; conflating them would either
     // hide an out-of-range offset or read a paging artifact as "nothing is listed".
+    // An empty result always follows a fuzzy pass (an empty strict pass falls
+    // back), so the notice never suggests one.
     if (result.totalAvailable === 0) {
       ctx.enrich.notice(
         `No potential match for "${input.name}" across the selected lists (mode: ${result.modeUsed}). ` +
           'This is NOT a clearance — the entity may be listed under a name variant the mirror does not index, ' +
-          'or under a transliteration. Try matchMode:"fuzzy", a broader name, or verify directly against the official source.',
+          'or under a transliteration. Try a broader name, or verify directly against the official source.',
       );
     } else if (result.hits.length === 0) {
       ctx.enrich.notice(

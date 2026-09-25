@@ -709,7 +709,7 @@ describe('sources + readiness', () => {
   });
 });
 
-describe('ingestLeiRelationships — batch semantics (issue #6)', () => {
+describe('ingestLeiRelationships — per-record apply (issues #6, #49)', () => {
   const CHILD = '5493001KJTIIGC8Y1R12';
   const relA = {
     childLei: CHILD,
@@ -721,30 +721,53 @@ describe('ingestLeiRelationships — batch semantics (issue #6)', () => {
     parentLei: 'PARENTBBBBBBBBBBBBB1',
     relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
   };
+  const parents = async () =>
+    (await svc.getRelationships(CHILD, 'parents'))
+      .map((r) => `${r.relationshipType}->${r.parentLei}`)
+      .sort();
 
-  it('init insert-only path keeps a child whose relationships span a batch boundary', async () => {
+  it('keeps a child whose relationships span a batch boundary', async () => {
     // The streaming golden-copy hazard: one child's relationships arrive in two
-    // separate batches. clearLeiRelationships() wipes once up front, then each
-    // batch is insert-only — so batch 2 must NOT delete batch 1's rows.
-    await svc.clearLeiRelationships();
-    await svc.ingestLeiRelationships([relA], { replaceByChild: false });
-    await svc.ingestLeiRelationships([relB], { replaceByChild: false });
-    const rels = await svc.getRelationships(CHILD, 'parents');
-    expect(rels).toHaveLength(2);
-    expect(new Set(rels.map((r) => r.parentLei))).toEqual(
-      new Set([relA.parentLei, relB.parentLei]),
-    );
-  });
-
-  it('delta replace-by-child (default) restates a child per call', async () => {
-    // The delta path keeps replace-by-child semantics: a later call re-stating the
-    // same child replaces its rows (correct only when a child's full set is one call).
+    // separate batches, so batch 2 must not delete batch 1's rows.
     await svc.clearLeiRelationships();
     await svc.ingestLeiRelationships([relA]);
     await svc.ingestLeiRelationships([relB]);
-    const rels = await svc.getRelationships(CHILD, 'parents');
-    expect(rels).toHaveLength(1);
-    expect(rels[0]?.parentLei).toBe(relB.parentLei);
+    expect(await parents()).toEqual([
+      `IS_DIRECTLY_CONSOLIDATED_BY->${relA.parentLei}`,
+      `IS_ULTIMATELY_CONSOLIDATED_BY->${relB.parentLei}`,
+    ]);
+  });
+
+  it("keeps a child's rows a delta does not restate", async () => {
+    // A delta carries only changed relationships: restating relA says nothing about relB.
+    await svc.clearLeiRelationships();
+    await svc.ingestLeiRelationships([relA, relB]);
+    await svc.ingestLeiRelationships([{ ...relA, relationshipStatus: 'INACTIVE' }]);
+    const rows = await svc.getRelationships(CHILD, 'parents');
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.parentLei === relA.parentLei)?.relationshipStatus).toBe('INACTIVE');
+  });
+
+  it('removes the row a change marks deleted, and only that row', async () => {
+    await svc.clearLeiRelationships();
+    await svc.ingestLeiRelationships([relA, relB]);
+    await svc.ingestLeiRelationships([{ ...relA, deleted: true }]);
+    expect(await parents()).toEqual([`IS_ULTIMATELY_CONSOLIDATED_BY->${relB.parentLei}`]);
+    // Deleting a row that is not stored is a no-op, so a re-applied delta converges.
+    await svc.ingestLeiRelationships([{ ...relA, deleted: true }]);
+    expect(await parents()).toEqual([`IS_ULTIMATELY_CONSOLIDATED_BY->${relB.parentLei}`]);
+  });
+
+  it("leaves each key in its last record's state, in document order within one batch", async () => {
+    await svc.clearLeiRelationships();
+    await svc.ingestLeiRelationships([
+      relA,
+      { ...relA, deleted: true },
+      relA,
+      relB,
+      { ...relB, deleted: true },
+    ]);
+    expect(await parents()).toEqual([`IS_DIRECTLY_CONSOLIDATED_BY->${relA.parentLei}`]);
   });
 
   it('clearLeiRelationships wipes the table', async () => {
@@ -754,47 +777,78 @@ describe('ingestLeiRelationships — batch semantics (issue #6)', () => {
   });
 });
 
-describe('advanceLeiFreshnessIfReady — GLEIF delta freshness (issue #5)', () => {
-  it('advances completedAt + total to the LIVE entity count on a ready mirror', async () => {
-    const before = await svc.leiReadiness();
-    expect(before.ready).toBe(true);
-    expect(before.total).toBe(2); // seeded L1 entity count
-    expect(before.completedAt).toBeDefined();
+describe('reporting exceptions — per-record apply and batched read (issue #26)', () => {
+  const LEI = '0292001156F2T0UFG565';
+  const OTHER = '097900BHKT0000085647';
+  const DIRECT = 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT';
+  const ULTIMATE = 'ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT';
 
-    // Simulate a delta apply: one new LEI entity ingested (batch size 1).
-    await svc.ingestLeiEntities([
-      { lei: '5493001KJTIIGC8Y1R99', legalName: 'Delta Added Co', otherNames: [] },
+  it('upserts by (LEI, category), deletes on the marker, and keeps the last record', async () => {
+    await svc.clearReportingExceptions();
+    await svc.ingestReportingExceptions([
+      { lei: LEI, category: DIRECT, reasons: ['NON_PUBLIC'] },
+      { lei: LEI, category: DIRECT, reasons: ['NATURAL_PERSONS'] },
+      { lei: LEI, category: ULTIMATE, reasons: ['NATURAL_PERSONS', 'NO_KNOWN_PERSON'] },
+      { lei: OTHER, category: DIRECT, reasons: ['NO_LEI'] },
+      { lei: OTHER, category: DIRECT, reasons: ['NO_LEI'], deleted: true },
     ]);
-
-    const result = await svc.advanceLeiFreshnessIfReady();
-    expect(result.advanced).toBe(true);
-    // total is the live mirror count (3), NEVER the delta batch size (1).
-    expect(result.entityCount).toBe(3);
-
-    const after = await svc.leiReadiness();
-    expect(after.ready).toBe(true);
-    expect(after.total).toBe(3);
-    expect(after.completedAt).toBeDefined();
-    expect(after.completedAt! >= before.completedAt!).toBe(true);
+    const byLei = await svc.getReportingExceptions([LEI, OTHER, '5493001KJTIIGC8Y1R12']);
+    expect(byLei.get(LEI)).toEqual([
+      { category: DIRECT, reasons: ['NATURAL_PERSONS'] },
+      { category: ULTIMATE, reasons: ['NATURAL_PERSONS', 'NO_KNOWN_PERSON'] },
+    ]);
+    expect(byLei.has(OTHER)).toBe(false);
+    expect(byLei.has('5493001KJTIIGC8Y1R12')).toBe(false);
+    expect((await svc.leiReadiness()).exceptionCount).toBe(2);
   });
 
-  it('does NOT flip a never-initialized mirror to ready (delta on empty is not completion)', async () => {
+  it('reports the exception count of the committed state, re-counted after each commit', async () => {
+    const before = (await svc.leiReadiness()).exceptionCount;
+    await svc.ingestReportingExceptions([
+      { lei: OTHER, category: DIRECT, reasons: ['NO_LEI'] },
+      { lei: OTHER, category: ULTIMATE, reasons: ['NO_LEI'] },
+    ]);
+    // Rows a load or refresh is still applying are not counted until it commits.
+    expect((await svc.leiReadiness()).exceptionCount).toBe(before);
+    await svc.markLeiReady(3, { repex: '2026-09-25T10:00:00Z' });
+    expect((await svc.leiReadiness()).exceptionCount).toBe(before + 2);
+  });
+
+  it('counts as loaded only once a load is recorded, never because rows exist', async () => {
     const fresh = await freshService();
     try {
-      const svc2 = fresh.service;
-      expect(await svc2.leiReady()).toBe(false);
-
-      // A delta lands rows on a mirror that never completed an init.
-      await svc2.ingestLeiEntities([
-        { lei: '5493001KJTIIGC8Y1R12', legalName: 'Orphan Delta Co', otherNames: [] },
+      await fresh.service.ingestReportingExceptions([
+        { lei: LEI, category: DIRECT, reasons: ['NON_PUBLIC'] },
       ]);
+      expect(await fresh.service.reportingExceptionsLoaded()).toBe(false);
+      await fresh.service.markLeiReady(0, { repex: '2026-09-25T09:01:50Z' });
+      expect(await fresh.service.reportingExceptionsLoaded()).toBe(true);
+    } finally {
+      await fresh.cleanup();
+    }
+  });
+});
 
-      const result = await svc2.advanceLeiFreshnessIfReady();
-      expect(result.advanced).toBe(false);
-      expect(result.entityCount).toBe(1); // reports the live count but does not mark ready
+describe('markLeiReady — the durable GLEIF checkpoint (issue #49)', () => {
+  it('records the per-dataset checkpoint it is given, with the live entity count', async () => {
+    await svc.markLeiReady(99, { lei2: '2026-09-25T08:08:49Z', rr: '2026-09-25T09:17:31Z' });
+    expect(await svc.gleifCheckpoint()).toEqual({
+      lei2: '2026-09-25T08:08:49Z',
+      rr: '2026-09-25T09:17:31Z',
+    });
+    expect((await svc.leiReadiness()).total).toBe(99);
+  });
 
-      expect(await svc2.leiReady()).toBe(false); // still not ready — run mirror:init
-      expect((await svc2.leiReadiness()).completedAt).toBeUndefined(); // freshness left unset
+  it('keeps the stored checkpoint when given none', async () => {
+    await svc.markLeiReady(1, { lei2: '2026-09-25T08:08:49Z' });
+    await svc.markLeiReady(2);
+    expect(await svc.gleifCheckpoint()).toEqual({ lei2: '2026-09-25T08:08:49Z' });
+  });
+
+  it('reads no checkpoint from a mirror whose sync state carries none', async () => {
+    const fresh = await freshService();
+    try {
+      expect(await fresh.service.gleifCheckpoint()).toEqual({});
     } finally {
       await fresh.cleanup();
     }
@@ -859,6 +913,32 @@ async function likePatterns(handle: SqliteHandle, run: () => Promise<unknown>): 
   return patterns;
 }
 
+/**
+ * Every FTS prefix term the LEI blocking lookups bind during `run` — the blocking
+ * prefixes as the index receives them (`"fic"*`), read at the statement boundary.
+ */
+async function indexPrefixes(handle: SqliteHandle, run: () => Promise<unknown>): Promise<string[]> {
+  const original = handle.prepare.bind(handle);
+  const prefixes: string[] = [];
+  handle.prepare = ((sql: string) => {
+    const statement = original(sql);
+    if (!/\bMATCH \?/.test(sql)) return statement;
+    return {
+      ...statement,
+      all: (...params: Parameters<typeof statement.all>) => {
+        for (const m of String(params[0]).matchAll(/"([^"]+)"\*/g)) prefixes.push(m[1] ?? '');
+        return statement.all(...params);
+      },
+    };
+  }) as typeof handle.prepare;
+  try {
+    await run();
+  } finally {
+    handle.prepare = original;
+  }
+  return prefixes;
+}
+
 /** One designation whose only name is `name`. */
 function namedDesignation(entryId: string, name: string): NormalizedDesignation {
   return {
@@ -883,15 +963,15 @@ describe('fuzzy blocking prefixes — BMP tokens', () => {
     expect(patterns).toEqual(['%nik%', '%al%', '%mad%', '%mor%']);
   });
 
-  it('blocks the LEI path the same way', async () => {
+  it('blocks the LEI path on the same prefixes, through the name index', async () => {
     const handle = await svc.leiEntities.raw();
-    const patterns = await likePatterns(handle, () =>
+    const run = () =>
       svc.resolveEntity(
         { query: 'Fictionall Tradng Co X', matchMode: 'fuzzy', limit: 10, status: 'any' },
         ctx,
-      ),
-    );
-    expect(patterns).toEqual(['%fic%', '%tra%', '%co%']);
+      );
+    expect(await indexPrefixes(handle, run)).toEqual(['fic', 'tra', 'co']);
+    expect(await likePatterns(handle, run)).toEqual([]);
   });
 });
 
@@ -934,7 +1014,7 @@ describe('fuzzy blocking prefixes — supplementary-plane letters (issue #31)', 
 
     const handle = await service.leiEntities.raw();
     let leis: string[] = [];
-    const patterns = await likePatterns(handle, async () => {
+    const prefixes = await indexPrefixes(handle, async () => {
       const res = await service.resolveEntity(
         { query: QUERY, matchMode: 'fuzzy', limit: 10, status: 'any' },
         ctx,
@@ -942,8 +1022,8 @@ describe('fuzzy blocking prefixes — supplementary-plane letters (issue #31)', 
       leis = res.matches.map((m) => m.lei);
     });
 
-    expect(patterns).toEqual(['%𠀀𠀁𠀂%']);
-    expect(patterns.every((p) => p.isWellFormed())).toBe(true);
+    expect(prefixes).toEqual(['𠀀𠀁𠀂']);
+    expect(prefixes.every((p) => p.isWellFormed())).toBe(true);
     expect(leis).toEqual(['5493001KJTIIGC8Y1R12']);
   });
 

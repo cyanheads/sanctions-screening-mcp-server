@@ -21,7 +21,7 @@ export const sourcesResource = resource('sanctions://sources', {
   name: 'sanctions-screening-mcp-server: sources',
   title: 'sanctions-screening-mcp-server: sources',
   description:
-    "List the sanctions watchlists and GLEIF datasets currently loaded in the local mirror, each with its record count and the mirror's as-of timestamp — a read-only URI mirror of sanctions_list_sources.",
+    "List the sanctions watchlists and GLEIF datasets currently loaded in the local mirror, each with its record count and the mirror's as-of timestamp, plus whether GLEIF reporting exceptions are loaded and how many — a read-only URI mirror of sanctions_list_sources.",
   mimeType: 'application/json',
   // Never cached: mirror readiness and the as-of timestamps ARE the payload, so
   // a cached copy would report a stale mirror state as current.
@@ -45,6 +45,7 @@ export const sourcesResource = resource('sanctions://sources', {
       sanctionsAsOf: sanctions.completedAt,
       leiReady: lei.ready,
       leiAsOf: lei.completedAt,
+      reportingExceptionsLoaded: lei.exceptionsLoaded,
       sources: [
         ...counts.map((s) => ({
           code: s.code,
@@ -58,6 +59,7 @@ export const sourcesResource = resource('sanctions://sources', {
           label: GLEIF_SOURCE_LABEL,
           recordCount: lei.entityCount,
           relationshipCount: lei.relationshipCount,
+          ...(lei.exceptionsLoaded ? { reportingExceptionCount: lei.exceptionCount } : {}),
           url: gleifSourceUrl(),
           license: GLEIF_LICENSE,
         },

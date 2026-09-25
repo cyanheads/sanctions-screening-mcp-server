@@ -122,11 +122,42 @@ export interface NormalizedDesignation {
   sourceEntryId: string;
 }
 
+/** The type the name index gives an entity's legal name. */
+export const LEGAL_NAME_TYPE = 'LEGAL_NAME';
+
+/**
+ * The type of a name stored without one — a mirror written before names were
+ * typed kept other names as bare strings. Never read as a trading name.
+ */
+export const UNKNOWN_NAME_TYPE = 'UNKNOWN';
+
+/**
+ * A name a GLEIF record publishes beside its legal name, with the `type` GLEIF
+ * gives it: `PREVIOUS_LEGAL_NAME`, `TRADING_OR_OPERATING_NAME`, or
+ * `ALTERNATIVE_LANGUAGE_LEGAL_NAME` for an `OtherEntityName`;
+ * `PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME` or
+ * `AUTO_ASCII_TRANSLITERATED_LEGAL_NAME` for a `TransliteratedOtherEntityName`;
+ * {@link UNKNOWN_NAME_TYPE} when none was stored. Kept open: GLEIF adds codes.
+ */
+export interface LeiAlternateName {
+  name: string;
+  type: string;
+}
+
 /** A GLEIF Level 1 entity record (who-is-who). */
 export interface NormalizedLeiEntity {
+  /**
+   * Every other and transliterated name with its type, in document order — other
+   * names first. Absent on a record with none, and on a record stored before
+   * names were typed; the read path then derives it from {@link otherNames}.
+   */
+  alternateNames?: LeiAlternateName[];
   /** Single-line headquarters address. */
   headquartersAddress?: string;
-  /** ISO 3166-1 alpha-2 jurisdiction, when published. */
+  /**
+   * Legal jurisdiction as published: an ISO 3166-1 alpha-2 country (`US`) or an
+   * ISO 3166-2 subdivision (`US-DE`).
+   */
   jurisdiction?: string;
   /** ISO 8601 last-update timestamp from the LEI record. */
   lastUpdate?: string;
@@ -134,15 +165,22 @@ export interface NormalizedLeiEntity {
   legalAddress?: string;
   legalName: string;
   lei: string;
-  /** Trading / other names published in the LEI record. */
+  /** The `OtherEntityName` values (trading, previous, alternative-language legal names). */
   otherNames: string[];
   /** The entity's ID at its registration authority. */
   registrationAuthorityEntityId?: string;
   /** Registration authority identifier (RA code). */
   registrationAuthorityId?: string;
-  /** Registration status (e.g. ISSUED, LAPSED). */
+  /** `RegistrationStatus` (ISSUED, LAPSED, RETIRED, …); absent when the record states none. */
   status?: string;
 }
+
+/**
+ * A stored entity as the read path returns it, in one shape whichever release
+ * stored it: `alternateNames` always present, derived from bare `otherNames` as
+ * {@link UNKNOWN_NAME_TYPE} for a record stored before names were typed.
+ */
+export type LeiEntityRecord = NormalizedLeiEntity & { alternateNames: LeiAlternateName[] };
 
 /** A GLEIF Level 2 relationship record (who-owns-whom). */
 export interface NormalizedLeiRelationship {
@@ -155,6 +193,47 @@ export interface NormalizedLeiRelationship {
   /** e.g. IS_DIRECTLY_CONSOLIDATED_BY, IS_ULTIMATELY_CONSOLIDATED_BY. */
   relationshipType: string;
 }
+
+/**
+ * One GLEIF Level 2 record as a file publishes it: the relationship's current
+ * state, or — `deleted` — its removal. A delta carries only changed relationships,
+ * so each record is applied on its own (child, parent, type) key.
+ */
+export interface LeiRelationshipChange extends NormalizedLeiRelationship {
+  /** The record carried `<Extension><gleif:Deletion>`: GLEIF removed it. */
+  deleted?: true;
+}
+
+/**
+ * A GLEIF reporting exception: the entity's own statement of why it reports no
+ * parent at one level — `DIRECT_ACCOUNTING_CONSOLIDATION_PARENT` or
+ * `ULTIMATE_ACCOUNTING_CONSOLIDATION_PARENT` — with every reason it gave
+ * (`NATURAL_PERSONS`, `NON_CONSOLIDATING`, `NO_KNOWN_PERSON`, …). An exception
+ * explains an unreported parent; it never names one.
+ */
+export interface NormalizedReportingException {
+  category: string;
+  lei: string;
+  /** The published reasons, in document order. Kept open: GLEIF adds codes. */
+  reasons: string[];
+}
+
+/** One reporting-exception record as a file publishes it, or — `deleted` — its removal. */
+export interface ReportingExceptionChange extends NormalizedReportingException {
+  /** The record carried `<Extension><gleif:Deletion>`: GLEIF removed it. */
+  deleted?: true;
+}
+
+/** The three GLEIF datasets the mirror holds, by their Golden Copy API names. */
+export type GleifDataset = 'lei2' | 'rr' | 'repex';
+
+/**
+ * The GLEIF mirror's durable checkpoint: per dataset, the header `ContentDate` of
+ * the last file applied to it (golden copy or delta). A dataset absent here has no
+ * recorded load — for Level 1 and Level 2 that means `mirror:init`; for the
+ * reporting exceptions, that its data is not loaded.
+ */
+export type GleifCheckpoint = Partial<Record<GleifDataset, string>>;
 
 /** Match classification, in descending confidence. */
 export type MatchType = 'exact' | 'strong' | 'approximate';
@@ -219,8 +298,10 @@ export interface LeiMatch {
   jurisdiction?: string;
   legalName: string;
   lei: string;
-  /** The name (legal or other) that matched the query. */
+  /** The name (legal, other, or transliterated) that matched the query. */
   matchedName: string;
+  /** {@link LEGAL_NAME_TYPE}, a {@link LeiAlternateName} type, or {@link UNKNOWN_NAME_TYPE}. */
+  matchedNameType: string;
   matchType: MatchType;
   /**
    * Query-token coverage of {@link LeiMatch.matchedName} for `approximate`

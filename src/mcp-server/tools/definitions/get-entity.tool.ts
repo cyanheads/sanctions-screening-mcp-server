@@ -43,7 +43,27 @@ export const getEntityTool = tool('sanctions_get_entity', {
   output: z.object({
     lei: z.string().describe('The 20-character GLEIF Legal Entity Identifier.'),
     legalName: z.string().describe('Registered legal name.'),
-    otherNames: z.array(z.string()).describe('Other / trading names published in the LEI record.'),
+    otherNames: z
+      .array(z.string())
+      .describe(
+        'Other names published in the LEI record (trading, previous, and alternative-language legal names), as plain strings.',
+      ),
+    alternateNames: z
+      .array(
+        z
+          .object({
+            name: z.string().describe('The name as published.'),
+            type: z
+              .string()
+              .describe(
+                "GLEIF name type: PREVIOUS_LEGAL_NAME (a former legal name, not the current one), TRADING_OR_OPERATING_NAME, ALTERNATIVE_LANGUAGE_LEGAL_NAME, PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME, AUTO_ASCII_TRANSLITERATED_LEGAL_NAME, or UNKNOWN for a name the mirror stored without GLEIF's type.",
+              ),
+          })
+          .describe('One name GLEIF publishes beside the legal name.'),
+      )
+      .describe(
+        'Every other and transliterated name with its type, in the order published — the typed view of otherNames plus the ASCII transliterations of a legal name in another script.',
+      ),
     jurisdiction: z.string().optional().describe('Legal jurisdiction (ISO code), when published.'),
     status: z.string().optional().describe('Registration status (e.g. ISSUED, LAPSED).'),
     legalAddress: z.string().optional().describe('Single-line legal address, when published.'),
@@ -182,6 +202,7 @@ export const getEntityTool = tool('sanctions_get_entity', {
       lei: entity.lei,
       legalName: entity.legalName,
       otherNames: entity.otherNames,
+      alternateNames: entity.alternateNames,
       ...(entity.jurisdiction ? { jurisdiction: entity.jurisdiction } : {}),
       ...(entity.status ? { status: entity.status } : {}),
       ...(entity.legalAddress ? { legalAddress: entity.legalAddress } : {}),
@@ -221,6 +242,11 @@ export const getEntityTool = tool('sanctions_get_entity', {
   format: (r) => {
     const lines = [`# ${r.legalName}`, '', `**LEI:** \`${r.lei}\``];
     if (r.otherNames.length > 0) lines.push(`**Other names:** ${r.otherNames.join('; ')}`);
+    if (r.alternateNames.length > 0) {
+      lines.push(
+        `**Names by type:** ${r.alternateNames.map((n) => `${n.name} (${n.type})`).join('; ')}`,
+      );
+    }
     if (r.jurisdiction) lines.push(`**Jurisdiction:** ${r.jurisdiction}`);
     if (r.status) lines.push(`**Registration status:** ${r.status}`);
     if (r.legalAddress) lines.push(`**Legal address:** ${r.legalAddress}`);
