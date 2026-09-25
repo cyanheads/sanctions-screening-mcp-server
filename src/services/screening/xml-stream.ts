@@ -67,12 +67,12 @@ export async function* decodeUtf8Stream(
 }
 
 /**
- * Whitespace, a comment, or a processing instruction — what XML allows around the
+ * Whitespace, a comment, or a processing instruction — what XML allows before the
  * root element. A comment or instruction body can never contain its own
  * terminator, so each one ends at the first terminator and a run of them splits
  * only one way. A lazy `[\s\S]*?` body could also stretch across its neighbours,
- * and a run that fails to match (a prolog still arriving, an epilog cut short)
- * would then retry every split: 20 comment/instruction pairs took seconds.
+ * and a run that fails to match (a prolog still arriving) would then retry every
+ * split: 20 comment/instruction pairs took seconds.
  */
 const MISC = String.raw`\s|<!--(?:(?!-->)[\s\S])*-->|<\?(?:(?!\?>)[\s\S])*\?>`;
 
@@ -95,19 +95,201 @@ const ROOT_START_TAG = new RegExp(
  */
 const MAX_ROOT_SEARCH = 65_536;
 
-/**
- * An end tag with nothing after it but what XML allows after the root element,
- * running to the end of the text. Captures the tag's qualified name, which the
- * caller compares to the root's. The leftmost match is the document's last real
- * end tag: any `</…>` after it sits inside a trailing comment or instruction.
- */
-const TRAILING_END_TAG = new RegExp(String.raw`</([A-Za-z_][\w.:-]*)\s*>(?:${MISC})*$`);
+/** A section whose content is never markup, named by its terminator. */
+type Section = '-->' | '?>' | ']]>';
+
+/** XML whitespace: space, tab, line feed, carriage return. */
+function isXmlSpace(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
+/** How many leading characters of `terminator` the text ends with (a proper prefix only). */
+function terminatorPrefixAtEnd(text: string, terminator: Section): number {
+  for (let length = terminator.length - 1; length > 0; length -= 1) {
+    if (text.endsWith(terminator.slice(0, length))) return length;
+  }
+  return 0;
+}
 
 /**
- * Characters of the stream's end kept for the root-close check — room for the
- * closing tag plus trailing whitespace and comments.
+ * The forward scan behind {@link requireCompleteDocument}'s root-close check. It
+ * reads the text after the root start tag once, chunk by chunk, and decides at the
+ * end whether the root element closed with nothing but misc after it.
+ *
+ * Its state is a handful of scalars, so it retains no document text between
+ * chunks: where it is (text, the characters after a `<`, the whitespace inside the
+ * root end tag, or a comment / processing instruction / CDATA section), how much
+ * of a marker or terminator split across a chunk boundary it has matched, and
+ * whether the last root end tag outside a section has been followed only by
+ * whitespace, comments, and processing instructions. Each step either reads one
+ * character or jumps to the next `<` or terminator with `indexOf`, so the scan is
+ * linear in the text, and no pattern runs over it.
+ *
+ * Depth is not tracked: a nested element of the root's own name closes, the scan
+ * reads that close as the root's, and the document's real close, published after
+ * it, supersedes it. What decides a document is its last root end tag.
  */
-const COMPLETION_TAIL = 4096;
+class RootCloseScan {
+  /** The characters after `<` that open each tracked construct, the root end tag last. */
+  private readonly markers: readonly [comment: string, cdata: string, pi: string, end: string];
+  /** Where the scan is. */
+  private mode: 'text' | 'markup' | 'end-tag' | 'section' = 'text';
+  /** In `markup`: the characters after the `<` matched so far. */
+  private matched = 0;
+  /** In `markup`: one bit per entry of {@link markers} still matching. */
+  private candidates = 0;
+  /** In `section`: the terminator that ends it. */
+  private terminator: Section = '-->';
+  /** In `section`: how much of the terminator the text read so far ends with. */
+  private terminatorMatched = 0;
+  /** The last root end tag outside a section has been followed only by misc. */
+  private closed: boolean;
+
+  /**
+   * @param rootName The root element's qualified name.
+   * @param selfClosing The root start tag closed itself, so the root is already
+   *   closed and only misc may follow it.
+   */
+  constructor(rootName: string, selfClosing: boolean) {
+    this.markers = ['!--', '![CDATA[', '?', `/${rootName}`];
+    this.closed = selfClosing;
+  }
+
+  /** Read the next piece of the document. */
+  push(text: string): void {
+    let at = 0;
+    while (at < text.length) {
+      switch (this.mode) {
+        case 'text':
+          at = this.scanText(text, at);
+          break;
+        case 'markup':
+          at = this.scanMarkup(text, at);
+          break;
+        case 'end-tag':
+          at = this.scanEndTag(text, at);
+          break;
+        case 'section':
+          at = this.scanSection(text, at);
+          break;
+      }
+    }
+  }
+
+  /** True when the text read so far ends a complete document. */
+  complete(): boolean {
+    return this.mode === 'text' && this.closed;
+  }
+
+  /** Outside markup: after a root close only whitespace keeps it live. Moves to the next `<`. */
+  private scanText(text: string, from: number): number {
+    let at = from;
+    if (this.closed) {
+      while (at < text.length && isXmlSpace(text.charCodeAt(at))) at += 1;
+      if (at === text.length) return at;
+      if (text[at] !== '<') this.closed = false; // text after the root close
+    }
+    const open = text.indexOf('<', at);
+    if (open === -1) return text.length;
+    this.mode = 'markup';
+    this.matched = 0;
+    this.candidates = 0b1111;
+    return open + 1;
+  }
+
+  /**
+   * After a `<`: narrow the tracked markers by one character. A character no
+   * marker continues with starts an element, another end tag, or a declaration —
+   * none of them misc, so it ends a live root close — and is read again as text.
+   */
+  private scanMarkup(text: string, at: number): number {
+    const char = text[at];
+    let candidates = 0;
+    let completed = -1;
+    this.markers.forEach((marker, index) => {
+      if ((this.candidates & (1 << index)) === 0 || marker[this.matched] !== char) return;
+      candidates |= 1 << index;
+      if (marker.length === this.matched + 1) completed = index;
+    });
+    if (candidates === 0) {
+      this.closed = false;
+      this.mode = 'text';
+      return at;
+    }
+    this.matched += 1;
+    this.candidates = candidates;
+    switch (completed) {
+      case 0:
+        this.enterSection('-->');
+        break;
+      case 1:
+        this.closed = false; // CDATA is character data, not misc
+        this.enterSection(']]>');
+        break;
+      case 2:
+        this.enterSection('?>');
+        break;
+      case 3:
+        this.mode = 'end-tag';
+        break;
+    }
+    return at + 1;
+  }
+
+  /**
+   * After `</root`: whitespace, then `>`, closes the root. Any other character —
+   * a longer name, or a token inside the tag — makes it some other tag, and is
+   * read again as text.
+   */
+  private scanEndTag(text: string, at: number): number {
+    if (isXmlSpace(text.charCodeAt(at))) return at + 1;
+    this.mode = 'text';
+    this.closed = text[at] === '>';
+    return this.closed ? at + 1 : at;
+  }
+
+  private enterSection(terminator: Section): void {
+    this.mode = 'section';
+    this.terminator = terminator;
+    this.terminatorMatched = 0;
+  }
+
+  /**
+   * Inside a comment, processing instruction, or CDATA section: move past its
+   * terminator. A terminator split across a chunk boundary is completed from the
+   * matched count — the characters carried are the terminator's own prefix, not
+   * document text.
+   */
+  private scanSection(text: string, from: number): number {
+    const terminator = this.terminator;
+    const lookahead = terminator.length - 1;
+    if (this.terminatorMatched > 0) {
+      const carried = this.terminatorMatched;
+      const joined = terminator.slice(0, carried) + text.slice(from, from + lookahead);
+      const end = joined.indexOf(terminator);
+      if (end !== -1) {
+        this.mode = 'text';
+        return from + end + terminator.length - carried;
+      }
+      if (text.length - from < lookahead) {
+        // The piece ended inside the lookahead: carry what the joined text ends with.
+        this.terminatorMatched = terminatorPrefixAtEnd(joined, terminator);
+        return text.length;
+      }
+      this.terminatorMatched = 0;
+    }
+    const end = text.indexOf(terminator, from);
+    if (end !== -1) {
+      this.mode = 'text';
+      return end + terminator.length;
+    }
+    this.terminatorMatched = terminatorPrefixAtEnd(
+      text.slice(Math.max(from, text.length - lookahead)),
+      terminator,
+    );
+    return text.length;
+  }
+}
 
 /**
  * Pass a decoded document through unchanged, then fail if it ended before its
@@ -118,9 +300,12 @@ const COMPLETION_TAIL = 4096;
  * a truncated document is indistinguishable from a complete one that published
  * fewer records.
  *
- * The root is learned from the prolog; a self-closing root is a complete, empty
- * document. Trailing whitespace, comments, and processing instructions after the
- * root close are allowed, as XML permits.
+ * The root is learned from the prolog, and the rest of the document passes
+ * through a {@link RootCloseScan}. A document is complete when its last root end
+ * tag outside a comment, processing instruction, or CDATA section is followed by
+ * nothing but whitespace, comments, and processing instructions, of any length,
+ * and the stream does not end inside one of them. A self-closing root is a
+ * complete, empty document on the same terms.
  *
  * @param textChunks Decoded document text, in arrival order.
  * @param label Names the document in the error (the source code).
@@ -132,14 +317,17 @@ export async function* requireCompleteDocument(
   label: string,
 ): AsyncGenerator<string> {
   let head = '';
-  let root: { name: string; selfClosing: boolean } | undefined;
-  let tail = '';
+  let root: { name: string; scan: RootCloseScan } | undefined;
   for await (const chunk of textChunks) {
-    if (!root) {
+    if (root) {
+      root.scan.push(chunk);
+    } else {
       head += chunk;
       const match = ROOT_START_TAG.exec(head);
       if (match) {
-        root = { name: match[1] as string, selfClosing: match[2] === '/' };
+        const name = match[1] as string;
+        root = { name, scan: new RootCloseScan(name, match[2] === '/') };
+        root.scan.push(head.slice(match[0].length));
         head = '';
       } else if (head.length > MAX_ROOT_SEARCH) {
         throw serviceUnavailable(
@@ -147,14 +335,12 @@ export async function* requireCompleteDocument(
         );
       }
     }
-    tail = (tail + chunk).slice(-COMPLETION_TAIL);
     yield chunk;
   }
   if (!root) {
     throw serviceUnavailable(`${label} ended before its XML root element opened.`);
   }
-  if (root.selfClosing) return;
-  if (TRAILING_END_TAG.exec(tail)?.[1] !== root.name) {
+  if (!root.scan.complete()) {
     throw serviceUnavailable(
       `${label} document ended before its closing </${root.name}> tag — the transfer was truncated.`,
     );
