@@ -333,8 +333,10 @@ const WHOLE_STRING_MIN_LENGTH_RATIO = 0.5;
  * The most name rows the strict LEI scan reads, and the most the exact-name
  * lookup reads. One common word matches far more GLEIF names than a request can
  * read (`limited` alone is in 409,879 of 4.0M), so the scan stops here and its
- * count is a floor; exact names are read first, through their own index (see
- * {@link ScreeningService.runLeiStrict}), so the bound never drops one. The
+ * count is a floor. On a mirror whose scripts built `lei_name_normalized_idx`,
+ * exact names are read first, through that index (see
+ * {@link ScreeningService.runLeiStrict}), so the bound drops no exact name; on
+ * one without it, the bound can drop exact names as well as strong ones. The
  * strict designation scan has no bound: the most common sanctions token, `al`,
  * is in 6,940 of 102,467 alias rows.
  */
