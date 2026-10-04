@@ -78,9 +78,7 @@ export const designationResource = resource('sanctions://designation/{source}/{e
     // Readiness first, mirroring sanctions_get_designation: without this gate an
     // unsynced corpus reports a valid entry as absent rather than as unavailable.
     if (!(await svc.sanctionsReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.', {
-        ...ctx.recoveryFor('mirror_not_ready'),
-      });
+      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.');
     }
     const entryId = decodeVariable(params.entryId);
     const lookup = entryId
@@ -90,14 +88,13 @@ export const designationResource = resource('sanctions://designation/{source}/{e
       throw ctx.fail(
         'reference_ambiguous',
         `Reference number "${entryId?.trim()}" is published by ${lookup.sourceEntryIds.length} ${params.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
-        { sourceEntryIds: lookup.sourceEntryIds, ...ctx.recoveryFor('reference_ambiguous') },
+        { sourceEntryIds: lookup.sourceEntryIds },
       );
     }
     if (lookup.kind === 'not_found') {
       throw ctx.fail(
         'designation_not_found',
         `No ${params.source} designation with entry ID or reference number "${entryId ?? params.entryId}".`,
-        { ...ctx.recoveryFor('designation_not_found') },
       );
     }
     const d = lookup.designation;
@@ -116,6 +113,8 @@ export const designationResource = resource('sanctions://designation/{source}/{e
       addresses: d.payload.addresses,
       datesOfBirth: d.payload.datesOfBirth,
       nationalities: d.payload.nationalities,
+      // A record stored before the group existed carries none.
+      features: d.payload.features ?? [],
       remarks: d.payload.remarks,
       caveat: SCREENING_CAVEAT,
     };

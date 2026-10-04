@@ -2,8 +2,13 @@
  * @fileoverview `mirror:verify` — readiness + freshness report for both mirrors.
  * Prints per-source record counts, the sanctions/GLEIF readiness flags, the GLEIF
  * Level 1 / Level 2 / reporting-exception counts and per-dataset checkpoint,
- * whether GLEIF's other and transliterated names are indexed for resolution, and
- * the last-completed timestamps. Read-only; safe to run anytime.
+ * whether GLEIF's other and transliterated names are indexed for resolution,
+ * whether the exact-name index strict resolution reads first is built, and the
+ * last-completed timestamps. Safe to run anytime, and it loads nothing, but it
+ * opens both mirrors as the server does: a mirror an earlier release wrote is
+ * upgraded in place on that first open (the sanctions name and identifier
+ * indexes rebuilt, the GLEIF store migration applied). Point it at a copy to
+ * inspect such a mirror unchanged.
  *
  * Usage: `bun run mirror:verify`
  * @module scripts/mirror-verify
@@ -41,6 +46,7 @@ async function main(): Promise<void> {
       relationships: lei.relationshipCount,
       reportingExceptions: lei.exceptionsLoaded ? lei.exceptionCount : 'not loaded',
       alternateNamesIndexed: await service.leiNamesIndexed(),
+      exactNamesIndexed: await service.leiExactNamesIndexed(),
       checkpoint: await service.gleifCheckpoint(),
       completedAt: lei.completedAt ?? 'never',
       status: lei.status,

@@ -9,9 +9,16 @@
 import type { SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { FUZZY_POOL_BUDGET } from '@/services/screening/candidate-pool.js';
 import { parseOfac } from '@/services/screening/sanctions-ingest.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
-import { type NormalizedDesignation, SOURCE_CODES } from '@/services/screening/types.js';
+import { doubleMetaphone } from '@/services/screening/text-matching.js';
+import {
+  type NormalizedDesignation,
+  type NormalizedLeiEntity,
+  SOURCE_CODES,
+  type SourceCode,
+} from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 import { freshService, type SeededService, seededService } from './_helpers.js';
 
@@ -201,10 +208,14 @@ describe('screenName — minScore floor enforced uniformly (issue #1)', () => {
   const PHONETIC_QUERY = 'Katharina Petrov';
 
   it('excludes a phonetic-only hit whose score is below an explicit high minScore', async () => {
-    const res = await svc.screenName(
-      { ...screenDefaults, query: PHONETIC_QUERY, matchMode: 'fuzzy', minScore: 0.99 },
-      ctx,
+    const { result: res, ...trace } = await traceNameIndex(await svc.designations.raw(), () =>
+      svc.screenName(
+        { ...screenDefaults, query: PHONETIC_QUERY, matchMode: 'fuzzy', minScore: 0.99 },
+        ctx,
+      ),
     );
+    // The phonetic arm pooled the candidate, so the floor — not blocking — withholds it.
+    expect(phoneticallyPooled(trace, 'un:FX-7007')).toBe(true);
     expect(res.hits.find((h) => h.sourceEntryId === 'FX-7007')).toBeUndefined();
     // No returned hit may sit below the requested floor — the bypass is gone.
     for (const hit of res.hits) {
@@ -218,11 +229,32 @@ describe('screenName — minScore floor enforced uniformly (issue #1)', () => {
     // the intended fix, not a recall loss: a genuine variant that scores ABOVE the
     // floor still surfaces (covered by the transliteration test above, which lands
     // at 1.0 via shared exact tokens).
-    const res = await svc.screenName(
-      { ...screenDefaults, query: PHONETIC_QUERY, matchMode: 'fuzzy' },
-      ctx,
+    const { result: res, ...trace } = await traceNameIndex(await svc.designations.raw(), () =>
+      svc.screenName({ ...screenDefaults, query: PHONETIC_QUERY, matchMode: 'fuzzy' }, ctx),
     );
+    expect(phoneticallyPooled(trace, 'un:FX-7007')).toBe(true);
     expect(res.hits.find((h) => h.sourceEntryId === 'FX-7007')).toBeUndefined();
+  });
+
+  it('floors a strict screen’s fuzzy passes too: the completion of a list strict missed, and the fallback', async () => {
+    await svc.ingestDesignations([
+      listed('un', 'MS-EXACT', 'Zorbek Kalandar'),
+      listed('eu', 'MS-NEAR', 'Zorbek Kalandarov'),
+    ]);
+    const strict = async (query: string, minScore?: number) =>
+      (
+        await svc.screenName(
+          { ...screenDefaults, query, ...(minScore === undefined ? {} : { minScore }) },
+          ctx,
+        )
+      ).hits.map((hit) => hit.designationId);
+
+    // `kalandarov` covers `kalandar` at 0.96: over the default floor, under 0.99.
+    expect(await strict('Zorbek Kalandar')).toEqual(['un:MS-EXACT', 'eu:MS-NEAR']);
+    expect(await strict('Zorbek Kalandar', 0.99)).toEqual(['un:MS-EXACT']);
+    // Strict finds nothing; every token pair of the fallback scores under 0.99.
+    expect(await strict('Zorbex Kalandarr')).toContain('un:MS-EXACT');
+    expect(await strict('Zorbex Kalandarr', 0.99)).toEqual([]);
   });
 });
 
@@ -484,8 +516,12 @@ describe('screenName — offset pagination and overflow disclosure (issue #9)', 
     await svc.ingestDesignations(pageDesignations);
   });
 
+  // The one list the six are on: a list strict found nothing on would be fuzzy-completed (#59).
   const screenPage = (offset: number, limit: number) =>
-    svc.screenName({ ...screenDefaults, query: 'Overflow Candidate', limit, offset }, ctx);
+    svc.screenName(
+      { ...screenDefaults, query: 'Overflow Candidate', sources: ['un'], limit, offset },
+      ctx,
+    );
 
   it('reports the pre-slice total as exact and returns only the requested page', async () => {
     const res = await screenPage(0, 2);
@@ -533,29 +569,71 @@ describe('screenName — offset pagination and overflow disclosure (issue #9)', 
     expect(res.totalAvailableBasis).toBe('lower_bound');
   });
 
-  it('reports a lower bound once the raw-row scan cap binds', async () => {
-    // The strict FTS query caps raw (pre-dedup) alias rows at 5000; above it the
-    // deduplicated designation count is a floor, not a total, and must say so.
+  it('counts every strict match exactly and pages to the last one, past 5,000 alias rows', async () => {
+    // A strict pass once read at most 5,000 alias rows in no set order, so a token
+    // this common left designations that no offset reached.
+    const count = 5100;
     await svc.ingestDesignations(
-      Array.from({ length: 5000 }, (_, index) => ({
-        id: `un:CAP-${index}`,
-        source: 'un' as const,
-        sourceEntryId: `CAP-${index}`,
-        entityType: 'organization' as const,
-        primaryName: `Capped Candidate ${index}`,
-        payload: {
-          aliases: [],
-          identifiers: [],
-          addresses: [],
-          datesOfBirth: [],
-          nationalities: [],
-        },
-      })),
+      Array.from({ length: count }, (_, index) =>
+        listed('un', `CAP-${index}`, `Capped Candidate ${index}`, 'organization'),
+      ),
     );
-    const res = await svc.screenName({ ...screenDefaults, query: 'Capped', limit: 5 }, ctx);
-    expect(res.hits).toHaveLength(5);
-    expect(res.totalAvailableBasis).toBe('lower_bound');
-    expect(res.totalAvailable).toBeGreaterThanOrEqual(res.hits.length);
+    const walked: string[] = [];
+    for (let offset = 0; offset < count; offset += 1000) {
+      const res = await svc.screenName(
+        { ...screenDefaults, query: 'Capped', sources: ['un'], limit: 1000, offset },
+        ctx,
+      );
+      expect(res).toMatchObject({
+        modeUsed: 'strict',
+        totalAvailable: count,
+        totalAvailableBasis: 'exact',
+        poolBounded: false,
+      });
+      walked.push(...res.hits.map((hit) => hit.designationId));
+    }
+    expect(walked).toEqual(Array.from({ length: count }, (_, index) => `un:CAP-${index}`));
+  });
+
+  it('pages every candidate a fuzzy pass admits, past the fifty it once kept', async () => {
+    await svc.ingestDesignations(
+      Array.from({ length: 80 }, (_, i) =>
+        listed('un', `ZEL-${i}`, `Zelvanora Zx${i}`, 'organization'),
+      ),
+    );
+    const screen = (offset: number, limit: number) =>
+      svc.screenName(
+        { ...screenDefaults, query: 'Zelvanorra', matchMode: 'fuzzy', limit, offset },
+        ctx,
+      );
+    const whole = await screen(0, 100);
+    expect(whole).toMatchObject({ totalAvailable: 80, totalAvailableBasis: 'lower_bound' });
+    expect(new Set(whole.hits.map((hit) => hit.designationId))).toEqual(
+      new Set(Array.from({ length: 80 }, (_, i) => `un:ZEL-${i}`)),
+    );
+
+    const walked: string[] = [];
+    for (let offset = 0; offset < whole.totalAvailable; offset += 7) {
+      walked.push(...(await screen(offset, 7)).hits.map((hit) => hit.designationId));
+    }
+    expect(walked).toEqual(whole.hits.map((hit) => hit.designationId));
+  });
+
+  it('says when the candidate budget left a block out, and only then', async () => {
+    // `vla` and the phonetic key of `Vladimir` each reach 2,002 names, past the budget.
+    await svc.ingestDesignations([
+      ...Array.from({ length: FUZZY_POOL_BUDGET + 1 }, (_, i) =>
+        listed('ofac_sdn', `VLA-${i}`, `Vladimir Zx${i}`),
+      ),
+      listed('uk', 'PET-UK', 'Vladimir Petrenkov'),
+    ]);
+    const fuzzy = (query: string) =>
+      svc.screenName({ ...screenDefaults, query, matchMode: 'fuzzy' }, ctx);
+
+    const bounded = await fuzzy('Vladimir Petrenkox');
+    expect(bounded.poolBounded).toBe(true);
+    expect(bounded.hits.map((hit) => hit.designationId)).toContain('uk:PET-UK');
+    expect((await fuzzy('Petrenkox')).poolBounded).toBe(false);
   });
 });
 
@@ -605,6 +683,45 @@ describe('resolveEntity — offset pagination and overflow disclosure (issue #9)
     );
     expect(res.modeUsed).toBe('fuzzy');
     expect(res.totalAvailableBasis).toBe('lower_bound');
+  });
+
+  it('pages every LEI a fuzzy pass admits, past the fifty it once kept', async () => {
+    await svc.ingestLeiEntities(
+      Array.from({ length: 80 }, (_, i) => registered(`ZELVANORA${i}`, `Zelvanora Zx${i}`)),
+    );
+    const fuzzy = (offset: number, limit: number) =>
+      svc.resolveEntity(
+        { query: 'Zelvanorra', matchMode: 'fuzzy', status: 'issued', limit, offset },
+        ctx,
+      );
+    const whole = await fuzzy(0, 100);
+    expect(whole).toMatchObject({ totalAvailable: 80, totalAvailableBasis: 'lower_bound' });
+    expect(new Set(whole.matches.map((match) => match.lei))).toEqual(
+      new Set(Array.from({ length: 80 }, (_, i) => testLei(`ZELVANORA${i}`))),
+    );
+
+    const walked: string[] = [];
+    for (let offset = 0; offset < whole.totalAvailable; offset += 7) {
+      walked.push(...(await fuzzy(offset, 7)).matches.map((match) => match.lei));
+    }
+    expect(walked).toEqual(whole.matches.map((match) => match.lei));
+  });
+
+  it('says when the candidate budget left a block of names out, and only then', async () => {
+    await svc.ingestLeiEntities([
+      ...Array.from({ length: FUZZY_POOL_BUDGET + 1 }, (_, i) =>
+        registered(`KESBOUND${i}`, `Kestrel Zx${i}`),
+      ),
+      registered('KESTRELBANK', 'Kestrel Bank'),
+    ]);
+    const fuzzy = (query: string) =>
+      svc.resolveEntity({ query, matchMode: 'fuzzy', status: 'any', limit: 10 }, ctx);
+
+    // `kes` holds 2,002 names, past the budget; `ban` pools the target on its own.
+    const bounded = await fuzzy('Kestrel Banko');
+    expect(bounded.poolBounded).toBe(true);
+    expect(bounded.matches.map((match) => match.lei)).toContain(testLei('KESTRELBANK'));
+    expect((await fuzzy('Banko')).poolBounded).toBe(false);
   });
 });
 
@@ -914,8 +1031,9 @@ async function likePatterns(handle: SqliteHandle, run: () => Promise<unknown>): 
 }
 
 /**
- * Every FTS prefix term the LEI blocking lookups bind during `run` — the blocking
- * prefixes as the index receives them (`"fic"*`), read at the statement boundary.
+ * Every FTS prefix term the fuzzy blocking lookups bind during `run` — the
+ * blocking prefixes as the index receives them (`"fic"*`), read at the statement
+ * boundary.
  */
 async function indexPrefixes(handle: SqliteHandle, run: () => Promise<unknown>): Promise<string[]> {
   const original = handle.prepare.bind(handle);
@@ -939,38 +1057,119 @@ async function indexPrefixes(handle: SqliteHandle, run: () => Promise<unknown>):
   return prefixes;
 }
 
+/** What a screen read from the designation `name` index. */
+interface NameIndexTrace {
+  /** Each MATCH lookup: the expression it bound and the name rowids it returned. */
+  lookups: { expression: string; rowids: number[] }[];
+  /** The name rows the fuzzy pass scored — its candidate pool — rowid → designation id. */
+  pooled: Map<number, string>;
+  /** Every statement that read the name index, with the parameters it ran with. */
+  statements: { params: unknown[]; sql: string }[];
+}
+
+/**
+ * Trace what `run` reads from the name index, at the statement boundary. A row
+ * read with its `rowid` and `normalized` columns is one the fuzzy pass scores;
+ * the strict pass reads no `rowid`, so its rows never count as pooled.
+ */
+async function traceNameIndex<T>(
+  handle: SqliteHandle,
+  run: () => Promise<T>,
+): Promise<NameIndexTrace & { result: T }> {
+  const original = handle.prepare.bind(handle);
+  const trace: NameIndexTrace = { lookups: [], pooled: new Map(), statements: [] };
+  handle.prepare = ((sql: string) => {
+    const statement = original(sql);
+    if (!/\b(FROM|JOIN) name(_fts|_blocking_fts)?\b/.test(sql)) return statement;
+    return {
+      ...statement,
+      all: (...params: Parameters<typeof statement.all>) => {
+        const rows = statement.all(...params) as Record<string, unknown>[];
+        trace.statements.push({ sql, params });
+        if (/\bMATCH \?/.test(sql)) {
+          trace.lookups.push({
+            expression: String(params[0]),
+            rowids: rows.map((row) => Number(row.rowid)),
+          });
+        }
+        for (const row of rows) {
+          if ('rowid' in row && 'normalized' in row) {
+            trace.pooled.set(Number(row.rowid), String(row.designation_id));
+          }
+        }
+        return rows;
+      },
+    };
+  }) as typeof handle.prepare;
+  try {
+    return { ...trace, result: await run() };
+  } finally {
+    handle.prepare = original;
+  }
+}
+
+/** True when a phonetic lookup returned one of the designation's name rows and the pass scored it. */
+function phoneticallyPooled(trace: NameIndexTrace, designationId: string): boolean {
+  const rows = [...trace.pooled].filter(([, id]) => id === designationId).map(([rowid]) => rowid);
+  return trace.lookups.some(
+    ({ expression, rowids }) =>
+      expression.includes('phonetic :') && rowids.some((rowid) => rows.includes(rowid)),
+  );
+}
+
+/** The plan steps that read a table row by row rather than through an index. */
+function tableScans(handle: SqliteHandle, statements: NameIndexTrace['statements']): string[] {
+  return statements.flatMap(({ sql, params }) =>
+    handle
+      .prepare<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`)
+      .all(...(params as never[]))
+      .map((step) => step.detail)
+      .filter((detail) => detail.startsWith('SCAN ') && !detail.includes('VIRTUAL TABLE')),
+  );
+}
+
 /** One designation whose only name is `name`. */
 function namedDesignation(entryId: string, name: string): NormalizedDesignation {
+  return listed('un', entryId, name);
+}
+
+/** One designation on `source` whose only name is `name`. */
+function listed(
+  source: NormalizedDesignation['source'],
+  entryId: string,
+  name: string,
+  entityType: NormalizedDesignation['entityType'] = 'person',
+): NormalizedDesignation {
   return {
-    id: `un:${entryId}`,
-    source: 'un',
+    id: `${source}:${entryId}`,
+    source,
     sourceEntryId: entryId,
-    entityType: 'person',
+    entityType,
     primaryName: name,
     payload: { aliases: [], identifiers: [], addresses: [], datesOfBirth: [], nationalities: [] },
   };
 }
 
 describe('fuzzy blocking prefixes — BMP tokens', () => {
-  it('blocks the designation path on each token’s leading three characters, dropping one-letter tokens', async () => {
+  it('blocks the designation path on each token’s leading three characters, dropping one-letter tokens, through the name index', async () => {
     const handle = await svc.designations.raw();
-    const patterns = await likePatterns(handle, () =>
+    const run = () =>
       svc.screenName(
-        { ...screenDefaults, matchMode: 'fuzzy', query: 'Nikolas al Maduro X Moros' },
+        { ...screenDefaults, matchMode: 'fuzzy', query: 'Nikolas Ib Maduro X Moros' },
         ctx,
-      ),
-    );
-    expect(patterns).toEqual(['%nik%', '%al%', '%mad%', '%mor%']);
+      );
+    expect(await indexPrefixes(handle, run)).toEqual(['nik', 'ib', 'mad', 'mor']);
+    expect(await likePatterns(handle, run)).toEqual([]);
   });
 
   it('blocks the LEI path on the same prefixes, through the name index', async () => {
     const handle = await svc.leiEntities.raw();
     const run = () =>
       svc.resolveEntity(
-        { query: 'Fictionall Tradng Co X', matchMode: 'fuzzy', limit: 10, status: 'any' },
+        { query: 'Fictionall Tradng Xu X', matchMode: 'fuzzy', limit: 10, status: 'any' },
         ctx,
       );
-    expect(await indexPrefixes(handle, run)).toEqual(['fic', 'tra', 'co']);
+    expect(await indexPrefixes(handle, run)).toEqual(['fic', 'tra', 'xu']);
     expect(await likePatterns(handle, run)).toEqual([]);
   });
 });
@@ -991,18 +1190,14 @@ describe('fuzzy blocking prefixes — supplementary-plane letters (issue #31)', 
     await service.ingestDesignations([namedDesignation('ASTRAL-1', STORED)]);
 
     const handle = await service.designations.raw();
-    let hits: string[] = [];
-    const patterns = await likePatterns(handle, async () => {
-      const res = await service.screenName(
-        { ...screenDefaults, matchMode: 'fuzzy', query: QUERY },
-        ctx,
-      );
-      hits = res.hits.map((h) => h.designationId);
-    });
+    const run = () =>
+      service.screenName({ ...screenDefaults, matchMode: 'fuzzy', query: QUERY }, ctx);
+    const prefixes = await indexPrefixes(handle, run);
 
-    expect(patterns).toEqual(['%𠀀𠀁𠀂%']);
-    expect(patterns.every((p) => p.isWellFormed())).toBe(true);
-    expect(hits).toEqual(['un:ASTRAL-1']);
+    expect(prefixes).toEqual(['𠀀𠀁𠀂']);
+    expect(prefixes.every((p) => p.isWellFormed())).toBe(true);
+    expect(await likePatterns(handle, run)).toEqual([]);
+    expect((await run()).hits.map((h) => h.designationId)).toEqual(['un:ASTRAL-1']);
   });
 
   it('pools and admits an LEI entity on its supplementary-plane prefix', async () => {
@@ -1033,13 +1228,13 @@ describe('fuzzy blocking prefixes — supplementary-plane letters (issue #31)', 
     await service.ingestDesignations([namedDesignation('ASTRAL-2', 'ab𠀀xyz')]);
 
     const handle = await service.designations.raw();
-    const patterns = await likePatterns(handle, () =>
+    const prefixes = await indexPrefixes(handle, () =>
       service.screenName({ ...screenDefaults, matchMode: 'fuzzy', query: '𠀀 ab𠀀x' }, ctx),
     );
 
     // `𠀀` is one code point (two code units) — too short to block on, like any
     // one-letter token; `ab𠀀x` blocks on its first three code points, whole.
-    expect(patterns).toEqual(['%ab𠀀%']);
+    expect(prefixes).toEqual(['ab𠀀']);
   });
 
   it('admits a supplementary-plane candidate exactly when its BMP twin is admitted', async () => {
@@ -1064,5 +1259,819 @@ describe('fuzzy blocking prefixes — supplementary-plane letters (issue #31)', 
     expect(bmp.hits.map((h) => h.designationId)).toEqual(['un:BMP-TWIN']);
     expect(sup.hits.map((h) => h.designationId)).toEqual(['un:ASTRAL-TWIN']);
     expect(sup.hits[0]?.score).toBe(bmp.hits[0]?.score);
+  });
+});
+
+// ─── Fuzzy blocking through the name index (issues #50, #54, #68) ─────────────
+
+/** A designation with a Han alias whose leading characters a query can omit. */
+const LIMBACH: NormalizedDesignation = {
+  id: 'eu:171379',
+  source: 'eu',
+  sourceEntryId: '171379',
+  entityType: 'organization',
+  primaryName: 'Xiamen Limbach Aviation Engine Co., Ltd',
+  payload: {
+    aliases: [{ name: '厦门林巴贺航空发动机股份有限公司', nameType: 'aka' }],
+    identifiers: [],
+    addresses: [],
+    datesOfBirth: [],
+    nationalities: [],
+  },
+};
+
+describe('fuzzy blocking — index lookups (issue #50)', () => {
+  it.each([
+    {},
+    { entityType: 'person' as const },
+    { sources: ['uk' as const] },
+    { sources: ['uk' as const, 'eu' as const], entityType: 'person' as const },
+  ])('plans every name-index read on an index, filters %j', async (filters) => {
+    const handle = await svc.designations.raw();
+    const trace = await traceNameIndex(handle, () =>
+      svc.screenName(
+        { ...screenDefaults, ...filters, query: 'Vladimir Poutine', matchMode: 'fuzzy' },
+        ctx,
+      ),
+    );
+    expect(trace.statements.length).toBeGreaterThan(1);
+    expect(tableScans(handle, trace.statements)).toEqual([]);
+  });
+
+  it('reads only index lookups for a 64-word query whose words match nothing', async () => {
+    const words = Array.from(
+      { length: 64 },
+      (_, i) => `q${'bcdfghjk'[i % 8]}${'lmnpqrst'[Math.floor(i / 8)]}zzv`,
+    );
+    const handle = await svc.designations.raw();
+    const trace = await traceNameIndex(handle, () =>
+      svc.screenName({ ...screenDefaults, query: words.join(' '), matchMode: 'fuzzy' }, ctx),
+    );
+    expect(trace.result.hits).toEqual([]);
+    expect(trace.statements.filter(({ sql }) => /\bLIKE\b/.test(sql))).toEqual([]);
+    expect(tableScans(handle, trace.statements)).toEqual([]);
+  });
+
+  it('pools a Han name queried without its leading characters, which no token prefix reaches', async () => {
+    await svc.ingestDesignations([LIMBACH]);
+    const res = await svc.screenName(
+      { ...screenDefaults, query: '林巴贺航空发动机股份有限公司', matchMode: 'fuzzy' },
+      ctx,
+    );
+    expect(res.hits[0]).toMatchObject({
+      designationId: 'eu:171379',
+      matchedName: '厦门林巴贺航空发动机股份有限公司',
+      matchType: 'approximate',
+    });
+    const handle = await svc.designations.raw();
+    const tokenPrefixRows = handle
+      .prepare<{ n: number }>('SELECT COUNT(*) AS n FROM name_fts WHERE name_fts MATCH ?')
+      .get('normalized : "林巴贺"*')?.n;
+    expect(tokenPrefixRows).toBe(0);
+  });
+
+  it.each([
+    ['a mid-token run of a Han name', '林巴贺航空发动机股份有限公司'],
+    ['the phonetic keys of a name', 'k0rn ptrf'],
+  ])('never widens a strict hit to %s', async (_, query) => {
+    await svc.ingestDesignations([LIMBACH]);
+    const res = await svc.screenName({ ...screenDefaults, query, autoFallback: false }, ctx);
+    expect(res.hits).toEqual([]);
+  });
+});
+
+describe('fuzzy candidate pool — whole blocks under one budget (issue #54)', () => {
+  const PUTIN = listed('uk', 'PUTIN-1', 'Vladimir Vladimirovich PUTIN');
+  /** `count` OFAC persons whose names open with `stem`. */
+  const namesakes = (count: number, stem: string): NormalizedDesignation[] =>
+    Array.from({ length: count }, (_, i) => listed('ofac_sdn', `NS-${i}`, `${stem} Zx${i}`));
+  const screenPutin = (service: ScreeningService, filters: { entityType?: 'person' } = {}) =>
+    service.screenName(
+      { ...screenDefaults, ...filters, query: 'Vladimir Poutine', matchMode: 'fuzzy', limit: 100 },
+      ctx,
+    );
+
+  it('pools a later-listed match that shares its prefix with more rows than one lookup used to keep', async () => {
+    await svc.ingestDesignations([...namesakes(250, 'Vladimir'), PUTIN]);
+    const res = await screenPutin(svc, { entityType: 'person' });
+    const rank = res.hits.findIndex((h) => h.designationId === 'uk:PUTIN-1');
+    expect(rank).toBeGreaterThanOrEqual(0);
+    expect(rank).toBeLessThan(5);
+  });
+
+  it.each([{}, { entityType: 'person' as const }])(
+    'returns identical hits whichever order the lists were ingested in, filters %j',
+    async (filters) => {
+      const corpus = [...namesakes(250, 'Vladimir'), PUTIN];
+      const screens: Awaited<ReturnType<typeof screenPutin>>[] = [];
+      for (const order of [corpus, [...corpus].reverse()]) {
+        const fresh = await freshService();
+        try {
+          await fresh.service.ingestDesignations(order);
+          screens.push(await screenPutin(fresh.service, filters));
+        } finally {
+          await fresh.cleanup();
+        }
+      }
+      expect(screens[1]).toEqual(screens[0]);
+      expect(screens[0]?.hits.some((h) => h.designationId === 'uk:PUTIN-1')).toBe(true);
+    },
+  );
+
+  it('never pools more than the budget, at the 64-word bound', async () => {
+    const words = Array.from(
+      { length: 64 },
+      (_, i) => `${'bdfgklmp'[i % 8]}a${'bdfgklmp'[Math.floor(i / 8)]}ondo`,
+    );
+    await svc.ingestDesignations(
+      words.flatMap((word, w) =>
+        Array.from({ length: 40 }, (_, j) => listed('un', `BUDGET-${w}-${j}`, `${word} Zx${j}`)),
+      ),
+    );
+    const trace = await traceNameIndex(await svc.designations.raw(), () =>
+      svc.screenName({ ...screenDefaults, query: words.join(' '), matchMode: 'fuzzy' }, ctx),
+    );
+    expect(trace.pooled.size).toBeGreaterThan(0);
+    expect(trace.pooled.size).toBeLessThanOrEqual(FUZZY_POOL_BUDGET);
+  });
+
+  it.each([{ sources: ['uk' as const] }, { entityType: 'vessel' as const }])(
+    'measures blocks under the request filters, pooling a match only they make fit: %j',
+    async (filters) => {
+      // Unfiltered, every block of the query holds 2,101 rows — past the budget.
+      await svc.ingestDesignations([
+        ...Array.from({ length: 2100 }, (_, i) =>
+          listed('ofac_sdn', `PET-${i}`, `Vladimir Petrenko${i}`),
+        ),
+        listed('uk', 'PET-UK', 'Vladimir Petrenkov', 'vessel'),
+      ]);
+      const res = await svc.screenName(
+        { ...screenDefaults, ...filters, query: 'Vladimir Petrenkox', matchMode: 'fuzzy' },
+        ctx,
+      );
+      expect(res.hits.map((h) => h.designationId)).toContain('uk:PET-UK');
+    },
+  );
+});
+
+describe('fuzzy candidate pool — one budget per list (issues #54, #59)', () => {
+  /**
+   * Every blocking key of `Shihab Mohammed` (`shi`, `moh`, and both words'
+   * phonetic keys) reaches 1,200 OFAC names and 901 EU names, each pair of keys
+   * the same names: each list fits the budget alone, the two together do not.
+   * None holds `mohammed`, so strict finds them nowhere; `un:EXACT` is the one
+   * strict hit, for the completion case.
+   */
+  const crowd = (source: SourceCode, count: number, stem: string): NormalizedDesignation[] =>
+    Array.from({ length: count }, (_, i) =>
+      listed(source, `CROWD-${i}`, `Shihab Mohammad ${stem}${i}`),
+    );
+
+  beforeEach(async () => {
+    await svc.ingestDesignations([
+      ...crowd('ofac_sdn', 1200, 'Zx'),
+      ...crowd('eu', 900, 'Qx'),
+      listed('eu', 'TARGET', 'Mohammad Shihab'),
+      listed('un', 'EXACT', 'Shihab Mohammed'),
+    ]);
+  });
+
+  const screen = (matchMode: 'fuzzy' | 'strict', sources: SourceCode[]) =>
+    svc.screenName(
+      { ...screenDefaults, query: 'Shihab Mohammed', matchMode, sources, limit: 5000 },
+      ctx,
+    );
+  const hitsOn = (res: Awaited<ReturnType<typeof screen>>, source: SourceCode) =>
+    res.hits.filter((hit) => hit.source === source).map((hit) => hit.designationId);
+
+  it.each([
+    ['fuzzy mode', 'fuzzy', [], 'fuzzy'],
+    ['the fallback when strict finds nothing', 'strict', [], 'fuzzy'],
+    ['the completion of the lists strict found nothing on', 'strict', ['un'], 'strict'],
+  ] as const)(
+    'gives each list the candidates it has when screened without the other: %s',
+    async (_, matchMode, others, modeUsed) => {
+      const joined = await screen(matchMode, ['ofac_sdn', 'eu', ...others]);
+      for (const source of ['ofac_sdn', 'eu'] as const) {
+        const alone = await screen(matchMode, [source, ...others]);
+        expect(hitsOn(joined, source), source).toEqual(hitsOn(alone, source));
+      }
+      expect(hitsOn(joined, 'eu')).toContain('eu:TARGET');
+      expect(hitsOn(joined, 'eu')).toHaveLength(901);
+      expect(hitsOn(joined, 'ofac_sdn')).toHaveLength(1200);
+      expect(joined).toMatchObject({
+        modeUsed,
+        fuzzySources: ['ofac_sdn', 'eu'],
+        poolBounded: false,
+      });
+    },
+  );
+
+  it('never pools more than the budget from one list, at the 64-word bound', async () => {
+    const words = Array.from(
+      { length: 64 },
+      (_, i) => `${'bdfgklmp'[i % 8]}a${'bdfgklmp'[Math.floor(i / 8)]}ondo`,
+    );
+    const lists = ['eu', 'un'] as const;
+    await svc.ingestDesignations(
+      lists.flatMap((source) =>
+        words.flatMap((word, w) =>
+          Array.from({ length: 40 }, (_, j) =>
+            listed(source, `BUDGET-${w}-${j}`, `${word} Zx${j}`),
+          ),
+        ),
+      ),
+    );
+    const trace = await traceNameIndex(await svc.designations.raw(), () =>
+      svc.screenName({ ...screenDefaults, query: words.join(' '), matchMode: 'fuzzy' }, ctx),
+    );
+    const pooled = [...trace.pooled.values()];
+    for (const source of lists) {
+      const fromList = pooled.filter((id) => id.startsWith(`${source}:`)).length;
+      expect(fromList, source).toBeGreaterThan(0);
+      expect(fromList, source).toBeLessThanOrEqual(FUZZY_POOL_BUDGET);
+    }
+    expect(pooled.length).toBeGreaterThan(FUZZY_POOL_BUDGET);
+    expect(trace.result.poolBounded).toBe(true);
+  });
+});
+
+describe('fuzzy phonetic arm — per-word keys (issue #68)', () => {
+  it('pools a multi-word name whose only word in common with the query is a phonetic variant', async () => {
+    await svc.ingestDesignations([listed('un', 'PH-1', 'MOHAMMED Zarqawi Faisal')]);
+    const trace = await traceNameIndex(await svc.designations.raw(), () =>
+      svc.screenName({ ...screenDefaults, query: 'Muhammad Qorbx', matchMode: 'fuzzy' }, ctx),
+    );
+    expect(phoneticallyPooled(trace, 'un:PH-1')).toBe(true);
+  });
+
+  it('looks each query word’s key up through the name index', async () => {
+    const handle = await svc.designations.raw();
+    const trace = await traceNameIndex(handle, () =>
+      svc.screenName(
+        { ...screenDefaults, query: 'Muhammad Qorbx', matchMode: 'fuzzy', entityType: 'person' },
+        ctx,
+      ),
+    );
+    const phonetic = trace.statements.filter(({ params }) =>
+      String(params[0]).includes('phonetic :'),
+    );
+    expect(phonetic.map(({ params }) => params[0])).toEqual([
+      '(phonetic : "MHMT")',
+      '(phonetic : "KRPKS")',
+    ]);
+    expect(tableScans(handle, phonetic)).toEqual([]);
+  });
+});
+
+// ─── LEI fuzzy pool (issue #51) ────────────────────────────────────────────────
+
+/**
+ * A well-formed test LEI: the tag padded to 18 characters with `X`, then two
+ * digits. A digit pad would make `CROWD1` and `CROWD10` one LEI.
+ */
+const testLei = (tag: string): string => `${tag.padEnd(18, 'X')}42`;
+
+/** One ISSUED entity whose only name is its legal name. */
+function registered(tag: string, legalName: string, jurisdiction = 'US'): NormalizedLeiEntity {
+  return { lei: testLei(tag), legalName, otherNames: [], jurisdiction, status: 'ISSUED' };
+}
+
+/**
+ * The LEIs `run` pooled for scoring — the list the fuzzy pass reads every name
+ * of, read at the statement boundary — or none when it pooled none.
+ */
+async function pooledLeis(handle: SqliteHandle, run: () => Promise<unknown>): Promise<string[]> {
+  const original = handle.prepare.bind(handle);
+  let pooled: string[] = [];
+  handle.prepare = ((sql: string) => {
+    const statement = original(sql);
+    if (!/\bn\.lei IN \(SELECT value FROM json_each\(\?\)\)/.test(sql)) return statement;
+    return {
+      ...statement,
+      all: (...params: Parameters<typeof statement.all>) => {
+        pooled = JSON.parse(String(params[0])) as string[];
+        return statement.all(...params);
+      },
+    };
+  }) as typeof handle.prepare;
+  try {
+    await run();
+  } finally {
+    handle.prepare = original;
+  }
+  return pooled;
+}
+
+describe('LEI fuzzy candidate pool — whole blocks under one budget (issue #51)', () => {
+  const TARGET = registered('KESTRELOSTWIND', 'Kestrel Bank Ostwind', 'DE');
+  /**
+   * `count` entities per word, each sharing only that word with the target —
+   * so `kes` and `ost` each hold one name more than the budget, and only the
+   * target holds both.
+   */
+  const crowd = (count: number): NormalizedLeiEntity[] => [
+    ...Array.from({ length: count }, (_, i) => registered(`KESCROWD${i}`, `Kestrel Zx${i}`)),
+    ...Array.from({ length: count }, (_, i) => registered(`OSTCROWD${i}`, `Zy${i} Ostwind`)),
+  ];
+  const resolveTypo = (service: ScreeningService, extra: { jurisdiction?: string } = {}) =>
+    service.resolveEntity(
+      { query: 'Kestrel Bnak Ostwind', matchMode: 'fuzzy', status: 'any', limit: 100, ...extra },
+      ctx,
+    );
+
+  it('pools a target only a pair of its words reaches, each word shared with more names than the budget', async () => {
+    await svc.ingestLeiEntities([...crowd(FUZZY_POOL_BUDGET), TARGET]);
+    const res = await resolveTypo(svc);
+    expect(res.matches.map((m) => m.lei)).toContain(TARGET.lei);
+    expect(res.matches.find((m) => m.lei === TARGET.lei)).toMatchObject({
+      score: 1,
+      queryTokenCoverage: { covered: 3, total: 3 },
+    });
+  });
+
+  it('returns identical matches whichever order the entities were written in', async () => {
+    const corpus = [...crowd(FUZZY_POOL_BUDGET), TARGET];
+    const results: Awaited<ReturnType<typeof resolveTypo>>[] = [];
+    for (const order of [corpus, [...corpus].reverse()]) {
+      const fresh = await freshService();
+      try {
+        await fresh.service.ingestLeiEntities(order);
+        results.push(await resolveTypo(fresh.service));
+      } finally {
+        await fresh.cleanup();
+      }
+    }
+    expect(results[1]).toEqual(results[0]);
+    expect(results[0]?.matches.map((m) => m.lei)).toContain(TARGET.lei);
+  });
+
+  it('measures a block inside the jurisdiction, pooling a match only it makes fit', async () => {
+    // Unfiltered, `kes` holds 2,101 names; under DE it holds the target alone.
+    await svc.ingestLeiEntities([
+      ...Array.from({ length: 2100 }, (_, i) => registered(`KESONLY${i}`, `Kestrel Zx${i}`)),
+      TARGET,
+    ]);
+    const res = await svc.resolveEntity(
+      { query: 'Kestrel Bnak', jurisdiction: 'DE', matchMode: 'fuzzy', status: 'any', limit: 100 },
+      ctx,
+    );
+    expect(res.matches.map((m) => m.lei)).toEqual([TARGET.lei]);
+  });
+
+  it('never pools more LEIs than the budget, at the 64-word bound', async () => {
+    const words = Array.from(
+      { length: 64 },
+      (_, i) => `${'bdfgklmp'[i % 8]}a${'bdfgklmp'[Math.floor(i / 8)]}ondo`,
+    );
+    await svc.ingestLeiEntities(
+      words.flatMap((word, w) =>
+        Array.from({ length: 40 }, (_, j) => registered(`BUDGET${w}X${j}`, `${word} Zx${j}`)),
+      ),
+    );
+    const pooled = await pooledLeis(await svc.leiEntities.raw(), () =>
+      svc.resolveEntity(
+        { query: words.join(' '), matchMode: 'fuzzy', status: 'any', limit: 100 },
+        ctx,
+      ),
+    );
+    expect(pooled.length).toBeGreaterThan(0);
+    expect(pooled.length).toBeLessThanOrEqual(FUZZY_POOL_BUDGET);
+    expect(new Set(pooled).size).toBe(pooled.length);
+  });
+});
+
+// ─── Fuzzy stoplist (issue #55) ────────────────────────────────────────────────
+
+/** One designation on `source` named `primaryName`, with its aliases. */
+function withAliases(
+  source: NormalizedDesignation['source'],
+  entryId: string,
+  primaryName: string,
+  aliases: string[],
+  entityType: NormalizedDesignation['entityType'] = 'organization',
+): NormalizedDesignation {
+  const designation = listed(source, entryId, primaryName, entityType);
+  designation.payload.aliases = aliases.map((name) => ({ name, nameType: 'aka' as const }));
+  return designation;
+}
+
+describe('fuzzy stoplist — legal forms, articles, and codes carry no admission (issue #55)', () => {
+  const SOVCOMFLOT = [
+    withAliases('eu', 'SCF-EU', 'JSC Sovcomflot', ['PAO Sovcomflot']),
+    withAliases('ofac_sdn', 'SCF-OFAC', 'Joint Stock Company Sovcomflot', ['PAO Sovcomflot']),
+    listed('uk', 'SCF-UK', 'Sovcomflot', 'organization'),
+  ];
+  /** Organizations that share only a legal form, an article, or a code with the probes. */
+  const LOOKALIKES = [
+    listed('ofac_sdn', 'LTD-1', 'Arctic Shipping Ltd', 'organization'),
+    listed('ofac_sdn', 'LTD-2', 'Baltic Ltd', 'organization'),
+    listed('ofac_sdn', 'LTD-3', 'Delta (UK) Ltd', 'organization'),
+    listed('eu', 'OIL-1', 'Gulf Oil Company', 'organization'),
+    listed('eu', 'OIL-2', 'Caspian Oil', 'organization'),
+    listed('eu', 'CO-1', 'Northern Trading Company', 'organization'),
+  ];
+  const screen = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, query, limit: 100, ...extra }, ctx);
+  const ids = (hits: { designationId: string }[]) => hits.map((h) => h.designationId);
+
+  beforeEach(async () => {
+    await svc.ingestDesignations([...SOVCOMFLOT, ...LOOKALIKES]);
+  });
+
+  it('admits every match of a name’s one distinctive word, however many legal forms and codes wrap it', async () => {
+    const res = await screen('SOVCOMFLOT (UK) LTD');
+    expect(res.modeUsed).toBe('fuzzy');
+    expect(ids(res.hits).sort()).toEqual(['eu:SCF-EU', 'ofac_sdn:SCF-OFAC', 'uk:SCF-UK']);
+  });
+
+  it('admits no candidate that shares only a legal form with the query', async () => {
+    const res = await screen('Sovcomflot Ltd', { matchMode: 'fuzzy', sources: ['ofac_sdn'] });
+    expect(ids(res.hits)).toEqual(['ofac_sdn:SCF-OFAC']);
+  });
+
+  it('admits no candidate that covers only `oil` or `company` of `Rosneft Oil Company`', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'ROSNEFT', 'Rosneft Oil Company PJSC', 'organization'),
+    ]);
+    const res = await screen('Rosneft Oil Company', { matchMode: 'fuzzy' });
+    expect(ids(res.hits)).toEqual(['eu:ROSNEFT']);
+  });
+
+  it('keeps counting every query token in the surfaced coverage', async () => {
+    const res = await screen('SOVCOMFLOT (UK) LTD');
+    const hit = res.hits.find((h) => h.designationId === 'eu:SCF-EU');
+    expect(hit).toMatchObject({ matchType: 'approximate', score: 1 });
+    expect(hit?.queryTokenCoverage).toEqual({ covered: 1, total: 3 });
+    expect(res.normalizedQuery).toBe('sovcomflot uk ltd');
+  });
+
+  it.each([
+    ['Pae Won Uk', ['Kim Chang Uk', 'Pae Song Il']],
+    ['Augusto Mario Co', ['Mario Trading Co', 'Augusto Holdings Co']],
+    ['Iyad Ag Ghali', ['Ag Saleh Trading', 'Iyad Al Rashid']],
+  ])('keeps a listed name with a stoplisted syllable first: %s', async (name, decoys) => {
+    await svc.ingestDesignations([
+      listed('un', 'SYLLABLE', name),
+      ...decoys.map((decoy, i) => listed('un', `DECOY-${i}`, decoy)),
+    ]);
+    for (const matchMode of ['strict', 'fuzzy'] as const) {
+      const res = await screen(name, { matchMode });
+      expect(res.hits[0]?.designationId, matchMode).toBe('un:SYLLABLE');
+    }
+  });
+
+  it('gates a query made only of stoplist tokens as it always has', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'LLC-FULL', 'Alpha Limited Liability Company', 'organization'),
+      listed('eu', 'LLC-PART', 'Beta Limited', 'organization'),
+    ]);
+    const res = await screen('Limited Liability Company', { matchMode: 'fuzzy' });
+    expect(ids(res.hits)).toContain('eu:LLC-FULL');
+    // One token of three: under half, as before the stoplist.
+    expect(ids(res.hits)).not.toContain('eu:LLC-PART');
+  });
+
+  it('applies the same gate to LEI resolution', async () => {
+    await svc.ingestLeiEntities([
+      registered('SOVCOMFLOTPAO', 'Sovcomflot PAO'),
+      registered('ARCTICSHIP', 'Arctic Shipping Ltd'),
+      registered('BALTICLTD', 'Baltic Ltd'),
+    ]);
+    const res = await svc.resolveEntity(
+      { query: 'Sovcomflot Ltd', matchMode: 'fuzzy', status: 'any', limit: 100 },
+      ctx,
+    );
+    expect(res.matches.map((m) => m.lei)).toEqual([testLei('SOVCOMFLOTPAO')]);
+    expect(res.matches[0]?.queryTokenCoverage).toEqual({ covered: 1, total: 2 });
+  });
+});
+
+describe('fuzzy stoplist — blocking (issue #55)', () => {
+  it('blocks the designation path on no stoplisted word', async () => {
+    const handle = await svc.designations.raw();
+    const prefixes = await indexPrefixes(handle, () =>
+      svc.screenName(
+        { ...screenDefaults, matchMode: 'fuzzy', query: 'Nikolas al Maduro X Moros' },
+        ctx,
+      ),
+    );
+    expect(prefixes).toEqual(['nik', 'mad', 'mor']);
+  });
+
+  it('keys no phonetic lookup on a stoplisted word', async () => {
+    const trace = await traceNameIndex(await svc.designations.raw(), () =>
+      svc.screenName({ ...screenDefaults, query: 'Sovcomflot Ltd', matchMode: 'fuzzy' }, ctx),
+    );
+    const phonetic = trace.lookups
+      .map(({ expression }) => expression)
+      .filter((expression) => expression.includes('phonetic :'));
+    expect(phonetic).toEqual([`(phonetic : "${doubleMetaphone('sovcomflot')}")`]);
+  });
+
+  it('blocks a query made only of stoplist tokens on all of them', async () => {
+    const handle = await svc.designations.raw();
+    const prefixes = await indexPrefixes(handle, () =>
+      svc.screenName(
+        { ...screenDefaults, matchMode: 'fuzzy', query: 'Limited Liability Company' },
+        ctx,
+      ),
+    );
+    expect(prefixes).toEqual(['lim', 'lia', 'com']);
+  });
+
+  it('blocks the LEI path on no stoplisted word', async () => {
+    const handle = await svc.leiEntities.raw();
+    const prefixes = await indexPrefixes(handle, () =>
+      svc.resolveEntity(
+        { query: 'Fictionall Tradng Co X', matchMode: 'fuzzy', limit: 10, status: 'any' },
+        ctx,
+      ),
+    );
+    expect(prefixes).toEqual(['fic', 'tra']);
+  });
+
+  it('still narrows a block past the budget by a stoplisted word, through a pair', async () => {
+    // `fle` holds 2,002 names; only the target also carries `gmbh`.
+    await svc.ingestLeiEntities([
+      ...Array.from({ length: FUZZY_POOL_BUDGET + 1 }, (_, i) =>
+        registered(`FLEXCROWD${i}`, `Flexa Zx${i}`),
+      ),
+      registered('FLEXOPUSGMBH', 'Flexopus GmbH', 'DE'),
+    ]);
+    const handle = await svc.leiEntities.raw();
+    let leis: string[] = [];
+    const prefixes = await indexPrefixes(handle, async () => {
+      const res = await svc.resolveEntity(
+        { query: 'Fleoxpus GmbH', matchMode: 'fuzzy', status: 'any', limit: 100 },
+        ctx,
+      );
+      leis = res.matches.map((m) => m.lei);
+    });
+    expect(leis).toEqual([testLei('FLEXOPUSGMBH')]);
+    // One block lookup for `fle`, then the pair; `gmb` is never looked up alone.
+    expect(prefixes).toEqual(['fle', 'fle', 'gmb']);
+  });
+});
+
+describe('OFAC SDN + Consolidated grouping (issue #61)', () => {
+  /**
+   * One OFAC party as both OFAC files publish it: one entry ID on each list. The
+   * two records carry their own designation dates, as each file dates the party
+   * from its own lists.
+   */
+  const ofacPair = (
+    entryId: string,
+    name: string,
+    copies: {
+      consolidated?: Partial<NormalizedDesignation>;
+      sdn?: Partial<NormalizedDesignation>;
+    } = {},
+  ): NormalizedDesignation[] => [
+    { ...listed('ofac_sdn', entryId, name, 'organization'), ...copies.sdn },
+    { ...listed('ofac_consolidated', entryId, name, 'organization'), ...copies.consolidated },
+  ];
+  const withIdentifier = (value: string): Partial<NormalizedDesignation> => ({
+    payload: {
+      aliases: [],
+      identifiers: [{ type: 'Tax ID No.', value, country: 'Russia' }],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+    },
+  });
+
+  beforeEach(async () => {
+    await svc.ingestDesignations([
+      ...ofacPair('GRP-17', 'Grouped Petroleum Holding', {
+        sdn: {
+          designationDate: '2025-10-22',
+          program: 'RUSSIA-EO14024',
+          ...withIdentifier('7706999990'),
+        },
+        consolidated: {
+          designationDate: '2014-07-16',
+          program: 'RUSSIA-EO14024',
+          ...withIdentifier('7706999990'),
+        },
+      }),
+      ...ofacPair('GRP-18', 'Grouped Petroleum Trading'),
+      listed('ofac_consolidated', 'GRP-19', 'Grouped Petroleum Services', 'organization'),
+      // The same name on another regime's list is another hit, never grouped.
+      listed('eu', 'GRP-17', 'Grouped Petroleum Holding', 'organization'),
+    ]);
+  });
+
+  const screen = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, query, ...extra }, ctx);
+  const ids = (hits: readonly { designationId: string }[]) => hits.map((hit) => hit.designationId);
+
+  it('returns the Consolidated copy alone when only ofac_consolidated is selected (characterization)', async () => {
+    const res = await screen('Grouped Petroleum Holding', { sources: ['ofac_consolidated'] });
+    expect(ids(res.hits)).toEqual(['ofac_consolidated:GRP-17']);
+    expect(res.hits[0]?.designationDate).toBe('2014-07-16');
+  });
+
+  it('names the one selected list in sources when only one OFAC list is selected', async () => {
+    const res = await screen('Grouped Petroleum Holding', { sources: ['ofac_consolidated'] });
+    expect(res.hits.map((hit) => [hit.source, hit.sources])).toEqual([
+      ['ofac_consolidated', ['ofac_consolidated']],
+    ]);
+  });
+
+  it('groups an entry both OFAC lists publish into one hit, counted once, naming both lists', async () => {
+    const res = await screen('Grouped Petroleum');
+    expect(res.hits.map((hit) => [hit.designationId, hit.sources])).toEqual([
+      ['ofac_sdn:GRP-17', ['ofac_sdn', 'ofac_consolidated']],
+      ['ofac_sdn:GRP-18', ['ofac_sdn', 'ofac_consolidated']],
+      ['ofac_consolidated:GRP-19', ['ofac_consolidated']],
+      ['eu:GRP-17', ['eu']],
+    ]);
+    expect(res.totalAvailable).toBe(4);
+  });
+
+  it('carries the SDN copy on a tie — its source, entry ID, program, and designation date', async () => {
+    const [hit] = (await screen('Grouped Petroleum Holding')).hits;
+    expect(hit).toMatchObject({
+      source: 'ofac_sdn',
+      sourceEntryId: 'GRP-17',
+      matchType: 'exact',
+      program: 'RUSSIA-EO14024',
+      designationDate: '2025-10-22',
+      sources: ['ofac_sdn', 'ofac_consolidated'],
+    });
+  });
+
+  it('groups copies whose fields differ to the better-ranked copy, at its rank', async () => {
+    await svc.ingestDesignations(
+      ofacPair('GRP-20', 'Divergent Copy Holding', {
+        sdn: { primaryName: 'Divergent Copy Holding Group', designationDate: '2022-02-24' },
+        consolidated: { designationDate: '2014-09-12' },
+      }),
+    );
+    // The SDN copy's only name holds every token (strong); the Consolidated copy's equals the query (exact).
+    const res = await screen('Divergent Copy Holding');
+    expect(res.hits).toHaveLength(1);
+    expect(res.hits[0]).toMatchObject({
+      designationId: 'ofac_consolidated:GRP-20',
+      source: 'ofac_consolidated',
+      matchType: 'exact',
+      matchedName: 'Divergent Copy Holding',
+      designationDate: '2014-09-12',
+      sources: ['ofac_sdn', 'ofac_consolidated'],
+    });
+  });
+
+  it('pages grouped hits disjointly, never splitting a pair across pages', async () => {
+    const whole = await screen('Grouped Petroleum');
+    const walked: string[] = [];
+    for (let offset = 0; offset < whole.totalAvailable + 1; offset += 1) {
+      const page = await screen('Grouped Petroleum', { limit: 1, offset });
+      expect(page.totalAvailable).toBe(4);
+      walked.push(...ids(page.hits));
+    }
+    expect(walked).toEqual(ids(whole.hits));
+  });
+
+  it('groups the copies a fuzzy pass admits', async () => {
+    const res = await screen('Grouped Petrolium Holding', { matchMode: 'fuzzy' });
+    const ofac = res.hits.filter((hit) => hit.sourceEntryId === 'GRP-17' && hit.source !== 'eu');
+    expect(ofac.map((hit) => [hit.designationId, hit.sources])).toEqual([
+      ['ofac_sdn:GRP-17', ['ofac_sdn', 'ofac_consolidated']],
+    ]);
+  });
+
+  it('looks an identifier both copies publish up as one hit naming both lists', async () => {
+    const lookUp = (sources: SourceCode[]) =>
+      svc.screenIdentifier({ value: '7706999990', type: 'any', sources });
+    expect((await lookUp([...SOURCE_CODES])).map((hit) => [hit.source, hit.sources])).toEqual([
+      ['ofac_sdn', ['ofac_sdn', 'ofac_consolidated']],
+    ]);
+    expect((await lookUp(['ofac_consolidated'])).map((hit) => [hit.source, hit.sources])).toEqual([
+      ['ofac_consolidated', ['ofac_consolidated']],
+    ]);
+  });
+});
+
+describe('per-list strict→fuzzy completion (issue #59)', () => {
+  beforeEach(async () => {
+    await svc.ingestDesignations([
+      // Strict for "Vladimir Poutine": every query token present.
+      listed('eu', 'POU-1', 'Vladimir Vladimirovich POUTINE'),
+      // A spelling variant on two other lists: both query tokens covered (poutine ~ putin).
+      listed('ofac_sdn', 'PUT-1', 'Putin Vladimir Vladimirovich'),
+      listed('uk', 'PUT-UK', 'Vladimir Vladimirovich PUTIN'),
+      // Shares one query token only: a full fuzzy pass admits it, a completion never does.
+      listed('ofac_sdn', 'ZHI-1', 'Vladimir Zhirinovsky'),
+    ]);
+  });
+
+  const screen = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, query, ...extra }, ctx);
+  const ids = (hits: readonly { designationId: string }[]) => hits.map((hit) => hit.designationId);
+  const fuzzyLookups = async (run: () => Promise<unknown>) =>
+    indexPrefixes(await svc.designations.raw(), run);
+
+  it('runs no fuzzy pass when every selected list has a strict hit (characterization)', async () => {
+    let res: Awaited<ReturnType<typeof screen>> | undefined;
+    const prefixes = await fuzzyLookups(async () => {
+      res = await screen('Vladimir Vladimirovich', { sources: ['eu', 'uk'] });
+    });
+    expect(prefixes).toEqual([]);
+    expect(res).toMatchObject({ modeUsed: 'strict', totalAvailableBasis: 'exact' });
+    expect(ids(res?.hits ?? [])).toEqual(['eu:POU-1', 'uk:PUT-UK']);
+    expect(res?.fuzzySources).toBeUndefined();
+  });
+
+  it('runs no completion for a screen with autoFallback off (characterization)', async () => {
+    const res = await screen('Vladimir Poutine', { autoFallback: false });
+    expect(ids(res.hits)).toEqual(['eu:POU-1']);
+    expect(res).toMatchObject({ modeUsed: 'strict', totalAvailableBasis: 'exact' });
+    expect(res.fuzzySources).toBeUndefined();
+  });
+
+  it('completes the strict-empty lists with candidates covering every query token, after the strict hits', async () => {
+    const res = await screen('Vladimir Poutine');
+    expect(ids(res.hits)).toEqual(['eu:POU-1', 'ofac_sdn:PUT-1', 'uk:PUT-UK']);
+    expect(res.hits.map((hit) => hit.matchType)).toEqual(['strong', 'approximate', 'approximate']);
+    for (const hit of res.hits.slice(1)) {
+      expect(hit.queryTokenCoverage).toEqual({ covered: 2, total: 2 });
+    }
+    expect(res).toMatchObject({
+      modeUsed: 'strict',
+      fuzzySources: ['ofac_sdn', 'ofac_consolidated', 'uk', 'un'],
+      totalAvailable: 3,
+      totalAvailableBasis: 'lower_bound',
+      fuzzyFallbackTriggered: false,
+    });
+  });
+
+  it('never removes a full-coverage candidate when another list joins the selection', async () => {
+    const alone = await screen('Vladimir Poutine', { sources: ['ofac_sdn'] });
+    expect(ids(alone.hits)).toContain('ofac_sdn:PUT-1');
+    const joined = await screen('Vladimir Poutine', { sources: ['ofac_sdn', 'eu'] });
+    expect(ids(joined.hits)).toEqual(['eu:POU-1', 'ofac_sdn:PUT-1']);
+    expect(joined.fuzzySources).toEqual(['ofac_sdn']);
+  });
+
+  it('requires every distinctive query word of a completion candidate, never a stoplisted one', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'STP-1', 'Zelvan Rostok Marinsk LLC', 'organization'),
+      // Covers every word but the stoplisted LLC.
+      listed('ofac_sdn', 'STP-2', 'Zelvann Rostock Marinska', 'organization'),
+      // Covers two of three distinctive words: the fuzzy gate's half, not the completion's whole.
+      listed('ofac_sdn', 'STP-3', 'Zelvann Rostock Shipping', 'organization'),
+    ]);
+    const completed = await screen('Zelvan Rostok Marinsk LLC');
+    expect(ids(completed.hits)).toEqual(['eu:STP-1', 'ofac_sdn:STP-2']);
+    const fuzzy = await screen('Zelvan Rostok Marinsk LLC', { matchMode: 'fuzzy' });
+    expect(ids(fuzzy.hits)).toContain('ofac_sdn:STP-3');
+  });
+
+  it('requires every token of a query made only of stoplisted words', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'LLC-1', 'Limited Liability Company', 'organization'),
+      listed('ofac_sdn', 'LLC-2', 'Limitid Liability Compani', 'organization'),
+      listed('ofac_sdn', 'LLC-3', 'Limited Liability Partnership', 'organization'),
+    ]);
+    const completed = await screen('Limited Liability Company');
+    expect(ids(completed.hits)).toEqual(['eu:LLC-1', 'ofac_sdn:LLC-2']);
+    const fuzzy = await screen('Limited Liability Company', { matchMode: 'fuzzy' });
+    expect(ids(fuzzy.hits)).toContain('ofac_sdn:LLC-3');
+  });
+
+  it('falls back to a full fuzzy pass over every selected list when no list hits strict', async () => {
+    const res = await screen('Vladimir Poutin');
+    expect(ids(res.hits)).toEqual(
+      expect.arrayContaining(['eu:POU-1', 'ofac_sdn:PUT-1', 'uk:PUT-UK', 'ofac_sdn:ZHI-1']),
+    );
+    expect(res).toMatchObject({
+      modeUsed: 'fuzzy',
+      fuzzyFallbackTriggered: true,
+      fuzzySources: [...SOURCE_CODES],
+      totalAvailableBasis: 'lower_bound',
+    });
+  });
+
+  it('names every selected list as fuzzy-searched in explicit fuzzy mode', async () => {
+    const res = await screen('Vladimir Poutine', { matchMode: 'fuzzy', sources: ['uk', 'eu'] });
+    expect(res).toMatchObject({ modeUsed: 'fuzzy', fuzzySources: ['eu', 'uk'] });
+    expect(ids(res.hits)).toEqual(['eu:POU-1', 'uk:PUT-UK']);
+  });
+
+  it('counts a grouped OFAC hit as a strict hit on both OFAC lists', async () => {
+    await svc.ingestDesignations([
+      listed('ofac_sdn', 'GRP-59', 'Vladimir Poutine Holding', 'organization'),
+      listed('ofac_consolidated', 'GRP-59', 'Vladimir Poutine Holding', 'organization'),
+    ]);
+    const res = await screen('Vladimir Poutine');
+    expect(res.fuzzySources).toEqual(['uk', 'un']);
+    expect(ids(res.hits)).toEqual(['ofac_sdn:GRP-59', 'eu:POU-1', 'uk:PUT-UK']);
   });
 });

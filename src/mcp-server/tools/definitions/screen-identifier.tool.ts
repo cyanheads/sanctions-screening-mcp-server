@@ -14,7 +14,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { identifierProbes } from '@/services/screening/identifier-matching.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
-import { SCREENING_CAVEAT } from './_shared.js';
+import { alsoListedText, HitSourcesSchema, SCREENING_CAVEAT } from './_shared.js';
 
 const SOURCE_ENUM = z.enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un']);
 
@@ -32,11 +32,14 @@ const MatchedIdentifierSchema = z
 
 const HitSchema = z
   .object({
-    source: SOURCE_ENUM.describe('Which watchlist this candidate is on — its provenance.'),
+    source: SOURCE_ENUM.describe(
+      "The watchlist whose record this hit's fields come from — its provenance. For an OFAC party both OFAC lists publish, ofac_sdn; sources names every list.",
+    ),
     sourceLabel: z.string().describe('Human-readable name of the source list.'),
     sourceEntryId: z
       .string()
       .describe("The list's own entry ID — pass to sanctions_get_designation for the full record."),
+    sources: HitSourcesSchema,
     primaryName: z.string().describe('Primary published name of the designated entity.'),
     entityType: z
       .enum(['person', 'organization', 'vessel', 'aircraft', 'unknown'])
@@ -56,7 +59,7 @@ const HitSchema = z
 export const screenIdentifierTool = tool('sanctions_screen_identifier', {
   title: 'sanctions-screening-mcp-server: screen identifier',
   description:
-    'Look up an identifier — a vessel IMO number, a SWIFT/BIC code, a digital-currency wallet address, a passport or national ID number, or any other identifier a list publishes — against all loaded sanctions watchlists at once: OFAC SDN + Consolidated, EU, UK, and UN. Exact match after normalization, with no fuzzy or partial matching and no score: spacing, letter case, and the separators - . / are ignored, an IMO number matches with or without its IMO prefix, a SWIFT/BIC code compares on its first eight characters so a branch code matches its institution, and a wallet address folds case only where its encoding is case-insensitive (hex, bech32, cashaddr — never base58). Returns every designation that publishes a matching identifier, one per designation, with the identifiers that matched as published; sanctions_get_designation pulls the full record. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared" — an identifier a list prints only in free-text remarks, or bundled with other numbers in one field, does not match.',
+    'Look up an identifier — a vessel IMO number, a SWIFT/BIC code, a digital-currency wallet address, a passport or national ID number, or any other identifier a list publishes — against all loaded sanctions watchlists at once: OFAC SDN + Consolidated, EU, UK, and UN. Exact match after normalization, with no fuzzy or partial matching and no score: spacing, letter case, and the separators - . / are ignored, an IMO number matches with or without its IMO prefix, a SWIFT/BIC code compares on its first eight characters so a branch code matches its institution, and a wallet address folds case only where its encoding is case-insensitive (hex, bech32, cashaddr — never base58). Returns every designation that publishes a matching identifier, one per designation — an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists — with the identifiers that matched as published; sanctions_get_designation pulls the full record. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared" — an identifier a list prints only in free-text remarks, or bundled with other numbers in one field, does not match.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     value: z
@@ -80,7 +83,7 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
     hits: z
       .array(HitSchema)
       .describe(
-        'Designations that publish a matching identifier, one per designation, ordered by source list then entry ID. Not paged — the most widely shared published identifiers map to about a dozen designations.',
+        'Designations that publish a matching identifier, one per designation (an OFAC party on both OFAC lists once), ordered by source list then entry ID. Not paged — the most widely shared published identifiers map to about a dozen designations.',
       ),
     caveat: z
       .string()
@@ -120,14 +123,11 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
       throw ctx.fail(
         'identifier_not_searchable',
         `"${input.value}" has nothing left to compare once whitespace and separators are removed${input.type === 'any' ? '' : ` (type: ${input.type})`}.`,
-        { ...ctx.recoveryFor('identifier_not_searchable') },
       );
     }
     const svc = getScreeningService();
     if (!(await svc.sanctionsReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.', {
-        ...ctx.recoveryFor('mirror_not_ready'),
-      });
+      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.');
     }
 
     const sources = input.sources && input.sources.length > 0 ? input.sources : [...SOURCE_CODES];
@@ -147,6 +147,7 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
         source: h.source,
         sourceLabel: SOURCE_LABELS[h.source],
         sourceEntryId: h.sourceEntryId,
+        sources: h.sources,
         primaryName: h.primaryName,
         entityType: h.entityType,
         ...(h.program ? { program: h.program } : {}),
@@ -165,9 +166,10 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
         `**${result.hits.length} designation(s) publish a matching identifier** — candidates to verify, not determinations:\n`,
       );
       for (const h of result.hits) {
+        const also = alsoListedText(h.source, h.sources);
         lines.push(`### ${h.primaryName}`);
         lines.push(
-          `**List:** ${h.sourceLabel} (\`${h.source}\`) | **Entry ID:** ${h.sourceEntryId} | **Type:** ${h.entityType}`,
+          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${h.sourceEntryId} | **Type:** ${h.entityType}`,
         );
         if (h.program) lines.push(`**Program:** ${h.program}`);
         lines.push('**Matched identifiers:**');

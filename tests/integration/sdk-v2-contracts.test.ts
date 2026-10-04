@@ -3,16 +3,22 @@
  * every tool driven through its public contract boundary (input parse → handler
  * → output parse → format → enrichment → error envelope), the strict root-input
  * rejection that now names an undeclared argument instead of stripping it, the
- * advertised 2020-12 input schemas, and the resource cache hints.
+ * advertised 2020-12 input schemas, the resource cache hints, and a failed
+ * `resources/read` carrying its declared recovery to the client.
  * @module tests/integration/sdk-v2-contracts.test
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { toolContractSuite } from '@cyanheads/mcp-ts-core/testing/vitest';
+import { createWorkerHandler } from '@cyanheads/mcp-ts-core/worker';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { allResourceDefinitions } from '@/mcp-server/resources/definitions/index.js';
+import {
+  allResourceDefinitions,
+  designationResource,
+  entityResource,
+} from '@/mcp-server/resources/definitions/index.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
@@ -27,8 +33,10 @@ import { type SeededService, seededGlobalService } from '../services/_helpers.js
 const SUBSIDIARY_LEI = '5493001KJTIIGC8Y1R12';
 /** Its ultimate parent, carrying no watchlist entry of its own. */
 const PARENT_LEI = '529900T8BM49AURSDO55';
-/** Well-formed but absent from the mirror. */
-const UNKNOWN_LEI = '00000000000000000000';
+/** Well-formed, valid check digits, and absent from the mirror. */
+const UNKNOWN_LEI = '529900UNKNOWNLEI0009';
+/** Well-formed, absent from the mirror, and failing its check digits — a typo of Apple Inc.'s LEI. */
+const MISTYPED_LEI = 'HWUPKR0MPOU8FGXBT395';
 
 let seeded: SeededService | undefined;
 
@@ -196,6 +204,25 @@ toolContractSuite(getEntityTool, {
     {
       name: 'returns the GLEIF record plus its sanctions cross-reference',
       input: { lei: SUBSIDIARY_LEI },
+      assert: (result) => {
+        const structured = result.structuredContent as {
+          sanctionsHits: { matchedOn: { input: string; value: string }[] }[];
+          sanctionsScreen: { screenedInputs: { input: string; value: string }[] };
+        };
+        // Every hit names what produced it; the screen names what ran beyond
+        // the always-screened legal name and LEI.
+        expect(structured.sanctionsHits[0]?.matchedOn).toContainEqual({
+          input: 'legal_name',
+          value: 'Fictional Trading Company LLC',
+        });
+        expect(structured.sanctionsScreen.screenedInputs.map((input) => input.input)).toEqual([
+          'other_name',
+          'registration_number',
+        ]);
+        expect(renderContent(result.content)).toContain(
+          `Screened: legal_name "Fictional Trading Company LLC"; lei ${SUBSIDIARY_LEI}`,
+        );
+      },
     },
   ],
   errors: [
@@ -204,6 +231,12 @@ toolContractSuite(getEntityTool, {
       input: { lei: UNKNOWN_LEI },
       code: JsonRpcErrorCode.NotFound,
       reason: 'lei_not_found',
+    },
+    {
+      name: 'returns the checksum envelope for an absent LEI whose check digits fail',
+      input: { lei: MISTYPED_LEI },
+      code: JsonRpcErrorCode.InvalidParams,
+      reason: 'invalid_lei_checksum',
     },
   ],
 });
@@ -254,6 +287,12 @@ toolContractSuite(traceOwnershipTool, {
       input: { lei: UNKNOWN_LEI },
       code: JsonRpcErrorCode.NotFound,
       reason: 'lei_not_found',
+    },
+    {
+      name: 'returns the checksum envelope for an absent root LEI whose check digits fail',
+      input: { lei: MISTYPED_LEI },
+      code: JsonRpcErrorCode.InvalidParams,
+      reason: 'invalid_lei_checksum',
     },
   ],
 });
@@ -335,4 +374,87 @@ describe('resource cache hints', () => {
     // Mirror readiness and the as-of timestamps ARE this resource's payload.
     expect(hintFor('sanctions://sources')).toEqual({ ttlMs: 0 });
   });
+});
+
+describe('resource recovery on the wire', () => {
+  /*
+   * The framework's HTTP app, in process: `createWorkerHandler` composes the
+   * same `createHttpApp` the HTTP transport serves, so a `resources/read` posted
+   * to its `fetch` runs the SDK's dispatch, the framework's resource handler
+   * factory — where a declared reason's recovery is filled in — and the JSON-RPC
+   * serialization a client receives, without binding a port. Calling a
+   * definition's `handler` directly skips all three.
+   */
+  const app = createWorkerHandler({
+    name: 'sanctions-screening-mcp-server',
+    title: 'sanctions-screening-mcp-server',
+    sessionMode: 'stateless',
+    resources: allResourceDefinitions,
+  });
+  /** Process env the handler writes on its first request. */
+  const written = ['IS_SERVERLESS', 'MCP_LOG_LEVEL', 'MCP_TRANSPORT_TYPE'] as const;
+  const before = Object.fromEntries(written.map((key) => [key, process.env[key]]));
+
+  afterAll(() => {
+    for (const key of written) {
+      if (before[key] === undefined) delete process.env[key];
+      else process.env[key] = before[key];
+    }
+  });
+
+  /** The JSON-RPC message a client receives for `resources/read` of `uri`. */
+  async function readOverWire(
+    uri: string,
+  ): Promise<{ error?: { code: number; data?: unknown; message: string } }> {
+    const response = await app.fetch(
+      new Request('http://127.0.0.1/mcp', {
+        method: 'POST',
+        headers: {
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+          'mcp-protocol-version': '2025-11-25',
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri } }),
+      }),
+      { LOG_LEVEL: 'emerg' },
+      { waitUntil: () => {}, passThroughOnException: () => {} },
+    );
+    expect(response.status).toBe(200);
+    // The answer arrives as one server-sent event.
+    const event = (await response.text()).split('\n').find((line) => line.startsWith('data: '));
+    return JSON.parse(event?.slice('data: '.length) ?? 'null');
+  }
+
+  const declaredRecovery = (errors: readonly ErrorContract[] | undefined, reason: string) =>
+    errors?.find((entry) => entry.reason === reason)?.recovery;
+
+  it.each([
+    {
+      uri: `sanctions://entity/${MISTYPED_LEI}`,
+      errors: entityResource.errors,
+      reason: 'invalid_lei_checksum',
+      code: JsonRpcErrorCode.InvalidParams,
+      named: MISTYPED_LEI,
+    },
+    {
+      uri: 'sanctions://designation/ofac_sdn/NO-SUCH-ENTRY',
+      errors: designationResource.errors,
+      reason: 'designation_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      named: 'NO-SUCH-ENTRY',
+    },
+  ])(
+    'delivers the declared $reason recovery for $uri',
+    async ({ uri, errors, reason, code, named }) => {
+      const recovery = declaredRecovery(errors, reason);
+      expect(recovery).toEqual(expect.any(String));
+
+      const { error } = await readOverWire(uri);
+      expect(error).toMatchObject({
+        code,
+        message: expect.stringContaining(named),
+        data: { reason, recovery: { hint: recovery }, requestId: expect.any(String) },
+      });
+    },
+  );
 });

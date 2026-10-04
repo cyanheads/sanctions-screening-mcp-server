@@ -15,30 +15,34 @@
  * EXISTS`, so `ensureAuxSchema` is safe to run on every open. A new column on a
  * primary table is different: the store's generic upsert writes every declared
  * column, so a mirror written before the column existed must gain it before its
- * first write — that is what the designation spec's migration does.
+ * first write — that is what the designation spec's migration does. So is an
+ * index a spec stops declaring: the declarative DDL only creates, so a mirror
+ * that has the index keeps it until a migration drops it — the GLEIF spec's.
  * @module services/screening/schema
  */
 
-import type {
-  SchemaSpec,
-  SqliteHandle,
-  SqliteMirrorStoreSpec,
-} from '@cyanheads/mcp-ts-core/mirror';
+import type { SqliteHandle, SqliteMirrorStoreSpec } from '@cyanheads/mcp-ts-core/mirror';
 
 /** Primary table name for the sanctions designation mirror. */
 export const DESIGNATION_TABLE = 'designation';
-/** Case-insensitive `(source, reference_number)` lookup index, created by the v2 migration. */
+/** Case-insensitive `(source, reference_number)` lookup index, created by the designation spec's v2 migration. */
 export const REFERENCE_NUMBER_INDEX = 'designation_source_reference_number_idx';
 /** Per-name/alias matching index, projected from `designation.payload`. */
 export const NAME_TABLE = 'name';
-/** FTS5 contentless-external index over `name.normalized`. */
+/** FTS5 external-content index over `name.normalized` — the shape every release's strict match reads. */
 export const NAME_FTS_TABLE = 'name_fts';
+/** FTS5 external-content index over `name`'s fold tokens, suffix terms, and phonetic keys, for fuzzy blocking. */
+export const NAME_BLOCKING_FTS_TABLE = 'name_blocking_fts';
+/** One row: the sync-state stamp of the designation data the name index was last built from. */
+export const NAME_INDEX_STAMP_TABLE = 'name_index_stamp';
 /** Per-identifier exact-lookup index, projected from `designation.payload.identifiers`. */
 export const IDENTIFIER_TABLE = 'designation_identifier';
 /** One row: the sync-state stamp of the designation data the identifier index was built from. */
 export const IDENTIFIER_STAMP_TABLE = 'designation_identifier_stamp';
 /** Primary table name for the GLEIF Level 1 mirror. */
 export const LEI_ENTITY_TABLE = 'lei_entity';
+/** The `lei_entity.status` index releases through 0.4.0 declared; the GLEIF spec's v2 migration drops it. */
+export const LEI_STATUS_INDEX = 'lei_entity_status_idx';
 /** GLEIF Level 2 ownership relationships. */
 export const LEI_RELATIONSHIP_TABLE = 'lei_relationship';
 /** GLEIF reporting exceptions, one row per (LEI, category). */
@@ -49,6 +53,8 @@ export const LEI_NAME_TABLE = 'lei_name';
 export const LEI_NAME_FTS_TABLE = 'lei_name_fts';
 /** One row: the GLEIF sync-state `completedAt` the name index was last known complete under. */
 export const LEI_NAME_STAMP_TABLE = 'lei_name_stamp';
+/** B-tree on `lei_name(normalized)` that strict resolution reads exact names through; built by the mirror scripts. */
+export const LEI_NAME_NORMALIZED_INDEX = 'lei_name_normalized_idx';
 
 /**
  * `sqliteMirrorStore` spec for the sanctions designation mirror. Columns mirror
@@ -107,9 +113,14 @@ export const designationStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
  * `sqliteMirrorStore` spec for the GLEIF Level 1 entity mirror. The legal-name
  * FTS on `normalized_name` serves resolution until a mirror's `lei_name` index is
  * built (see {@link ensureLeiAuxSchema}), and keeps an earlier release working
- * after a rollback. The auxiliary tables are created by {@link ensureLeiAuxSchema}.
+ * after a rollback; so does the `jurisdiction` index, which that path's fuzzy
+ * pass reads. The auxiliary tables are created by {@link ensureLeiAuxSchema}.
+ *
+ * `status` has no index. Releases through 0.4.0 declared one that no resolution
+ * query reads — the status predicate filters the joined entity row — while every
+ * entity upsert maintained it; v2 drops it.
  */
-export const leiStoreSpec: SchemaSpec = {
+export const leiStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
   table: LEI_ENTITY_TABLE,
   primaryKey: 'lei',
   columns: {
@@ -127,17 +138,40 @@ export const leiStoreSpec: SchemaSpec = {
     payload: 'TEXT',
   },
   fts: ['normalized_name'],
-  indexes: [{ columns: ['jurisdiction'] }, { columns: ['status'] }],
+  indexes: [{ columns: ['jurisdiction'] }],
+  version: 2,
+  migrations: [
+    {
+      // Dropping the index from `indexes` leaves it on every mirror that has it,
+      // since the declarative DDL only creates. The store runs pending migrations
+      // on a fresh database too, where the index never existed.
+      version: 2,
+      up(handle) {
+        handle.exec(`DROP INDEX IF EXISTS ${LEI_STATUS_INDEX}`);
+      },
+    },
+  ],
 };
 
 /**
  * Create the designation mirror's auxiliary objects: the per-alias `name` index
- * (one row per published name/alias, carrying a Double-Metaphone `phonetic` key
- * for transliteration-class fuzzy hits) plus a contentless FTS over
- * `name.normalized` kept in lockstep by triggers, and the per-identifier
- * `designation_identifier` index (one row per published identifier, keyed by its
- * category's normalized form, with the label and value as published) with the
- * one-row stamp of the sync run it was built from. Idempotent.
+ * (one row per published name/alias) with two FTS indexes over it, kept in
+ * lockstep by triggers, and the one-row stamp of the sync run it was built
+ * from; and the per-identifier `designation_identifier` index (one row per
+ * published identifier, keyed by its category's normalized form, with the label
+ * and value as published) with its own stamp. Idempotent.
+ *
+ * `name_fts` indexes `normalized` (the name's fold tokens) alone, in the shape
+ * and under the trigger names every earlier release created: an earlier
+ * release's strict query matches every column of `name_fts`, so after a
+ * rollback it must find there exactly what it wrote itself.
+ * `name_blocking_fts` serves fuzzy blocking: `normalized`, `suffix_terms`
+ * (every proper suffix of a token in a script written without word separators,
+ * so a prefix lookup reaches such a name mid-token), and `phonetic` (the
+ * Double-Metaphone key of each all-Latin word, so a lookup by one word's key
+ * reaches every name with a word of that key). Its triggers stay in the file, so
+ * an earlier release's writes reach it too; `suffix_terms` defaults to empty, so
+ * that release, which writes names without it, still can.
  */
 export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
   handle.exec(`
@@ -146,10 +180,10 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
       name           TEXT NOT NULL,
       normalized     TEXT NOT NULL,
       phonetic       TEXT NOT NULL,
-      name_type      TEXT NOT NULL
+      name_type      TEXT NOT NULL,
+      suffix_terms   TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_name_designation ON ${NAME_TABLE}(designation_id);
-    CREATE INDEX IF NOT EXISTS idx_name_phonetic ON ${NAME_TABLE}(phonetic);
     CREATE INDEX IF NOT EXISTS idx_name_normalized ON ${NAME_TABLE}(normalized);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS ${NAME_FTS_TABLE}
@@ -160,9 +194,27 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
       INSERT INTO ${NAME_FTS_TABLE}(rowid, normalized) VALUES (new.rowid, new.normalized);
     END;
     CREATE TRIGGER IF NOT EXISTS ${NAME_TABLE}_ad AFTER DELETE ON ${NAME_TABLE} BEGIN
-      INSERT INTO ${NAME_FTS_TABLE}(${NAME_FTS_TABLE}, rowid, normalized)
-        VALUES ('delete', old.rowid, old.normalized);
+      INSERT INTO ${NAME_FTS_TABLE}(${NAME_FTS_TABLE}, rowid, normalized) VALUES ('delete', old.rowid, old.normalized);
     END;
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS ${NAME_BLOCKING_FTS_TABLE}
+      USING fts5(normalized, suffix_terms, phonetic,
+                 content='${NAME_TABLE}', content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2');
+
+    CREATE TRIGGER IF NOT EXISTS ${NAME_TABLE}_blocking_ai AFTER INSERT ON ${NAME_TABLE} BEGIN
+      INSERT INTO ${NAME_BLOCKING_FTS_TABLE}(rowid, normalized, suffix_terms, phonetic)
+        VALUES (new.rowid, new.normalized, new.suffix_terms, new.phonetic);
+    END;
+    CREATE TRIGGER IF NOT EXISTS ${NAME_TABLE}_blocking_ad AFTER DELETE ON ${NAME_TABLE} BEGIN
+      INSERT INTO ${NAME_BLOCKING_FTS_TABLE}(${NAME_BLOCKING_FTS_TABLE}, rowid, normalized, suffix_terms, phonetic)
+        VALUES ('delete', old.rowid, old.normalized, old.suffix_terms, old.phonetic);
+    END;
+
+    CREATE TABLE IF NOT EXISTS ${NAME_INDEX_STAMP_TABLE} (
+      id    INTEGER PRIMARY KEY CHECK (id = 1),
+      stamp TEXT NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS ${IDENTIFIER_TABLE} (
       designation_id TEXT NOT NULL,
@@ -180,6 +232,18 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
       stamp TEXT NOT NULL
     );
   `);
+}
+
+/**
+ * Drop the name index, both its FTS indexes, and their triggers, for
+ * {@link ensureDesignationAuxSchema} to recreate. `CREATE … IF NOT EXISTS` never
+ * alters an existing table, so a name index in another shape — one an earlier
+ * release wrote, without `suffix_terms` — is rebuilt from scratch.
+ */
+export function dropNameIndex(handle: SqliteHandle): void {
+  handle.exec(
+    `DROP TABLE IF EXISTS ${NAME_BLOCKING_FTS_TABLE}; DROP TABLE IF EXISTS ${NAME_FTS_TABLE}; DROP TABLE IF EXISTS ${NAME_TABLE};`,
+  );
 }
 
 /**
@@ -253,4 +317,27 @@ export function ensureLeiAuxSchema(handle: SqliteHandle): void {
       stamp TEXT NOT NULL
     );
   `);
+}
+
+/**
+ * Build the B-tree strict resolution reads exact names through, in one pass over
+ * `lei_name`. Idempotent. Never part of {@link ensureLeiAuxSchema}: that runs on
+ * the first open, which can be a request, and on full GLEIF this is a
+ * 4,000,000-row build. The mirror scripts run it; once built, SQLite keeps it
+ * current on every write, whichever release makes the write.
+ */
+export function createLeiNameNormalizedIndex(handle: SqliteHandle): void {
+  handle.exec(
+    `CREATE INDEX IF NOT EXISTS ${LEI_NAME_NORMALIZED_INDEX} ON ${LEI_NAME_TABLE}(normalized)`,
+  );
+}
+
+/** True when {@link LEI_NAME_NORMALIZED_INDEX} exists. */
+export function hasLeiNameNormalizedIndex(handle: SqliteHandle): boolean {
+  // bun:sqlite answers no row with `null`, better-sqlite3 with `undefined`.
+  return Boolean(
+    handle
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`)
+      .get(LEI_NAME_NORMALIZED_INDEX),
+  );
 }

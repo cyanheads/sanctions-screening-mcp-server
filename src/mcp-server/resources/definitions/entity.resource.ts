@@ -7,6 +7,7 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { leiChecksumValid } from '@/services/screening/lei-checksum.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 
 export const entityResource = resource('sanctions://entity/{lei}', {
@@ -28,9 +29,16 @@ export const entityResource = resource('sanctions://entity/{lei}', {
     {
       reason: 'lei_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No GLEIF entity exists for the given LEI in the mirror.',
+      when: 'No GLEIF entity in the mirror carries the LEI, and its check digits are valid.',
       recovery:
         'Resolve the entity name with sanctions_resolve_entity to obtain a valid LEI first.',
+    },
+    {
+      reason: 'invalid_lei_checksum',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'No GLEIF entity in the mirror carries the LEI, and its ISO 17442 check digits fail.',
+      recovery:
+        'Re-check the LEI for a mistyped or transposed character, or resolve the entity name with sanctions_resolve_entity to obtain a valid LEI.',
     },
     {
       reason: 'mirror_not_ready',
@@ -46,15 +54,16 @@ export const entityResource = resource('sanctions://entity/{lei}', {
     // Readiness first, mirroring sanctions_get_entity, and gated on the GLEIF
     // mirror alone — the two mirrors sync independently.
     if (!(await svc.leiReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.', {
-        ...ctx.recoveryFor('mirror_not_ready'),
-      });
+      throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.');
     }
     const entity = await svc.getLeiEntity(params.lei);
     if (!entity) {
-      throw ctx.fail('lei_not_found', `No GLEIF entity with LEI "${params.lei}".`, {
-        ...ctx.recoveryFor('lei_not_found'),
-      });
+      throw leiChecksumValid(params.lei)
+        ? ctx.fail('lei_not_found', `No GLEIF entity with LEI "${params.lei}".`)
+        : ctx.fail(
+            'invalid_lei_checksum',
+            `LEI "${params.lei}" fails its ISO 17442 check digits, and no GLEIF entity carries it.`,
+          );
     }
     return entity;
   },

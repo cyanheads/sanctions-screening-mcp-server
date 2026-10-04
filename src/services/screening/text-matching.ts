@@ -157,9 +157,11 @@ function jaroOf(a: CodePoints, b: CodePoints): number {
  * screening deals in. `prefixScale` defaults to the standard 0.1.
  */
 export function jaroWinkler(a: string, b: string, prefixScale = 0.1): number {
-  if (a === b) return 1;
-  const x = codePoints(a);
-  const y = codePoints(b);
+  return a === b ? 1 : jaroWinklerOf(codePoints(a), codePoints(b), prefixScale);
+}
+
+/** {@link jaroWinkler} over two code-point sequences already known to differ. */
+function jaroWinklerOf(x: CodePoints, y: CodePoints, prefixScale = 0.1): number {
   const j = jaroOf(x, y);
   if (j === 0) return 0;
   let prefix = 0;
@@ -212,6 +214,71 @@ export function tokenCoverage(
   return covered;
 }
 
+/** A query token prepared once for scoring against every candidate of a fuzzy pass. */
+export interface ScoringToken {
+  /** The token as {@link jaroWinkler} indexes it, split once. */
+  readonly codePoints: CodePoints;
+  /** Whether it is one of {@link splitOnStoplist}'s distinctive tokens. */
+  readonly distinctive: boolean;
+  readonly text: string;
+}
+
+/** A fuzzy query's tokens prepared for {@link scoreTokenPairs}, in query order. */
+export function scoringQuery(queryTokens: readonly string[]): ScoringToken[] {
+  // splitOnStoplist's rule: a query made only of stoplisted tokens counts every one as distinctive.
+  const allDistinctive = queryTokens.every(isStoplistToken);
+  return queryTokens.map((text) => ({
+    text,
+    codePoints: codePoints(text),
+    distinctive: allDistinctive || !isStoplistToken(text),
+  }));
+}
+
+/** One candidate's token-pair measurements against a query — see {@link scoreTokenPairs}. */
+export interface TokenPairScores {
+  /** {@link bestTokenScore} of the query and candidate tokens. */
+  best: number;
+  /** {@link tokenCoverage} of every query token at the threshold. */
+  covered: number;
+  /** {@link tokenCoverage} of the distinctive query tokens alone at the threshold. */
+  distinctiveCovered: number;
+}
+
+/**
+ * {@link bestTokenScore}, {@link tokenCoverage} of every query token, and
+ * {@link tokenCoverage} of the distinctive ones, from one pass over the query ×
+ * candidate token pairs: each pair's Jaro-Winkler is computed at most once, and
+ * each token is split into code points once. A query token's remaining pairs are
+ * skipped only once it is covered and the best score is already 1, when none of
+ * them can change a result — so all three equal the separate helpers' results.
+ */
+export function scoreTokenPairs(
+  query: readonly ScoringToken[],
+  candidateTokens: readonly string[],
+  threshold: number,
+): TokenPairScores {
+  const candidate = candidateTokens.map((text) => ({ text, codePoints: codePoints(text) }));
+  let best = 0;
+  let covered = 0;
+  let distinctiveCovered = 0;
+  for (const q of query) {
+    let hit = false;
+    for (const c of candidate) {
+      const score = q.text === c.text ? 1 : jaroWinklerOf(q.codePoints, c.codePoints);
+      if (score > best) best = score;
+      if (score >= threshold) {
+        hit = true;
+        if (best === 1) break;
+      }
+    }
+    if (hit) {
+      covered++;
+      if (q.distinctive) distinctiveCovered++;
+    }
+  }
+  return { best, covered, distinctiveCovered };
+}
+
 /**
  * Length ratio of two strings in code points — the shorter length over the longer, in [0, 1].
  * 1.0 means equal-length strings; a small value means one is far shorter than the
@@ -230,6 +297,78 @@ export function lengthRatio(a: string, b: string): number {
   const longer = Math.max(lenA, lenB);
   if (longer === 0) return 1;
   return Math.min(lenA, lenB) / longer;
+}
+
+// ─── Fuzzy stoplist ───────────────────────────────────────────────────────────
+
+/**
+ * Folded query tokens that say what kind of entity a name is, not which one:
+ * legal forms, articles and other function words, and bare jurisdiction codes.
+ * A candidate that shares only these with a query matches nothing about it —
+ * `Sovcomflot Ltd` fuzzy-admitted fifty unrelated `… LTD` entities at coverage
+ * 1/2 — and counting them raised the share a real match had to cover:
+ * `SOVCOMFLOT (UK) LTD` matched three Sovcomflot designations on its one
+ * distinctive word and failed the half-coverage gate at 1/3.
+ *
+ * Built from token counts over `name.normalized` of the 2026-10-03 lists (102,467
+ * names): every legal-form word in a language the lists publish that occurs in
+ * at least 5 names, the articles, conjunctions, and prepositions those names
+ * carry inside organization names, and the codes `uk`, `usa`, `uae`, `rf`. Left
+ * out on purpose: country names, which are listed names in their own right
+ * (`Iran Air`); one-letter tokens, which are also initials (`s a` from `S.A.`);
+ * and person-name particles that are not articles (`bin`, `abu`, `ibn`, `van`).
+ * Some entries are also person-name syllables (`uk` in `Pae Won Uk`, `co` in
+ * `Augusto Mario Co`, `ag` in `Iyad Ag Ghali`, `sa` from `Sa'id`). Such a name
+ * still covers its other words, so it keeps its place; the syllable only stops
+ * counting toward admission and stops forming a blocking lookup of its own.
+ *
+ * The list changes the fuzzy admission gate and blocking only (see
+ * `ScreeningService.admitFuzzy` and `poolCandidates`). The normalized query,
+ * strict matching, the surfaced score, the whole-string arm, and
+ * `queryTokenCoverage` count every token.
+ */
+export const FUZZY_STOPLIST: ReadonlySet<string> = new Set(
+  [
+    // Legal forms — English
+    'company co limited ltd llc inc incorporated corp corporation plc llp lp',
+    'joint stock liability',
+    // Legal forms — Russian, transliterated and Cyrillic
+    'jsc ojsc cjsc pjsc ao oao zao pao ooo obshchestvo ogranichennoi ogranichennoy',
+    'otvetstvennostyu aktsionernoe aktsionernoye otkrytoe zakrytoe kompaniya',
+    'общество ограниченнои ответственностью акционерное компания ооо ао пао зао оао',
+    // Legal forms — German, Romance, Dutch, Hungarian, Turkish, Balkan, Polish
+    'gmbh ag kg aktiengesellschaft sa sarl srl spa sl sas ltda cia sociedad anonima',
+    'societatea actiuni bv nv kft reszvenytarsasag sirketi anonim doo spolka',
+    // Legal forms — Gulf free zones, South and Southeast Asia
+    'fze fzco fzc fz dmcc pte pvt pty sdn bhd',
+    // Articles, conjunctions, prepositions
+    'al el la le les de des du del der die the of and for ve wa und et en',
+    // Jurisdiction codes
+    'uk usa uae rf',
+  ]
+    .join(' ')
+    .split(' '),
+);
+
+/** True when a folded token is on {@link FUZZY_STOPLIST}. */
+export function isStoplistToken(token: string): boolean {
+  return FUZZY_STOPLIST.has(token);
+}
+
+/**
+ * A fuzzy query's tokens split on {@link FUZZY_STOPLIST}: `distinctive` holds the
+ * tokens off the list, in query order, and `stoplisted` the rest. A query made
+ * only of stoplist tokens has nothing else to match on, so all of them are then
+ * distinctive and none stoplisted.
+ */
+export function splitOnStoplist(tokens: readonly string[]): {
+  distinctive: string[];
+  stoplisted: string[];
+} {
+  const distinctive = tokens.filter((token) => !isStoplistToken(token));
+  return distinctive.length === 0
+    ? { distinctive: [...tokens], stoplisted: [] }
+    : { distinctive, stoplisted: tokens.filter(isStoplistToken) };
 }
 
 // ─── Double Metaphone (single primary key) ─────────────────────────────────────

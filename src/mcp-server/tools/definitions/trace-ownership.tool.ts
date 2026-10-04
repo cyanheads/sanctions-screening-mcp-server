@@ -1,21 +1,39 @@
 /**
  * @fileoverview `sanctions_trace_ownership` — the GLEIF Level 2 ownership graph
  * for an LEI: direct and ultimate parents and children, with relationship type,
- * traversed breadth-first to a bounded depth. Each node whose parents the walk
- * read also says what GLEIF publishes about its direct and ultimate parent — a
- * relationship, a reporting exception with its reasons, or nothing — so "its
- * parent is a natural person" never reads as "it has no parent". Optionally
- * screens every node against the watchlists, the cross-source workflow that
+ * traversed breadth-first to a bounded depth — up from the root to its parents and
+ * down to its children, never sideways, with ultimate-parent edges returned but
+ * never counted as a hop. Each node whose parents the walk read also says what
+ * GLEIF publishes about its direct and ultimate parent — a relationship, a
+ * reporting exception with its reasons, or nothing — so "its parent is a natural
+ * person" never reads as "it has no parent". Optionally cross-references every
+ * node against the watchlists by the same rule as `sanctions_get_entity` — its
+ * names strict, its LEI and country-matched registration number as identifiers,
+ * a node with no Level 1 record by its LEI alone — the cross-source workflow that
  * justifies one server over two.
  * @module mcp-server/tools/definitions/trace-ownership.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import {
+  type CrossReferenceResult,
+  crossReferenceEntity,
+} from '@/services/screening/cross-reference.js';
+import { leiChecksumValid } from '@/services/screening/lei-checksum.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
-import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
-import { SCREENING_CAVEAT } from './_shared.js';
+import { type NormalizedLeiRelationship, SOURCE_LABELS } from '@/services/screening/types.js';
+import {
+  alsoListedText,
+  crossReferencePointer,
+  HitSourcesSchema,
+  MatchedIdentifierSchema,
+  matchedIdentifierText,
+  SCREENING_CAVEAT,
+  ScreenedInputSchema,
+  screenedInputText,
+} from './_shared.js';
 
 const LEI_RE = /^[A-Z0-9]{18}[0-9]{2}$/;
 
@@ -23,7 +41,7 @@ const ParentLevelSchema = z.object({
   status: z
     .enum(['relationship', 'exception', 'none', 'unknown'])
     .describe(
-      'relationship = a Level 2 relationship at this level is published (see edges); exception = the entity filed a GLEIF reporting exception instead of naming this parent; none = GLEIF publishes neither; unknown = no relationship is published and reporting exceptions are not loaded in the mirror, so whether one was filed is unknown.',
+      "relationship = a Level 2 relationship at this level is published — it is in edges when that parent is also a node of this graph (a flagged leaf's parents and a children-side node's other parents are read for this status, never walked); exception = the entity filed a GLEIF reporting exception instead of naming this parent; none = GLEIF publishes neither; unknown = no relationship is published and reporting exceptions are not loaded in the mirror, so whether one was filed is unknown.",
     ),
   exceptionReasons: z
     .array(z.string())
@@ -34,11 +52,12 @@ const ParentLevelSchema = z.object({
 });
 
 /**
- * Potential matches returned per node by the cross-reference screen. A graph of
- * ten nodes would otherwise carry ten full screening result sets, so the per-node
- * list is a preview, not the whole set: every screened node reports its own
- * `sanctionsScreen.totalAvailable` / `hasMore`, and a node with more matches than
- * this is re-screened in full with `sanctions_screen_name` on its legal name.
+ * Potential matches returned per node by the cross-reference, after its merge. A
+ * graph of ten nodes would otherwise carry ten full screening result sets, so the
+ * per-node list is a preview, not the whole set: every screened node reports its
+ * own `sanctionsScreen.totalAvailable` / `hasMore`, and a node with more matches
+ * than this is re-screened in full with `sanctions_screen_name` and
+ * `sanctions_screen_identifier`.
  */
 const PER_NODE_SCREEN_LIMIT = 10;
 
@@ -62,13 +81,22 @@ interface ParentLevelStatus {
   status: 'relationship' | 'exception' | 'none' | 'unknown';
 }
 
+/**
+ * GLEIF's shortcut from an entity to the top of its group. It is returned as an
+ * edge but never counts as a hop: following it would put every group member one
+ * level below its head, whatever the direct chain between them.
+ */
+const ULTIMATE_TYPE = PARENT_LEVELS.ultimate.relationshipType;
+
 interface GraphNode {
-  /** BFS depth from the root (root = 0). */
+  /** Depth from the root (root = 0), counted over every relationship type but {@link ULTIMATE_TYPE}. */
   depth: number;
   jurisdiction?: string;
   legalName: string;
   lei: string;
-  /** 'root', 'parent', or 'child' relative to the traversal. */
+  /** Set when only an ultimate-parent edge reaches the node within the depth: a leaf, never walked. */
+  reachedVia?: 'ultimate';
+  /** 'root', or the side of the walk that reached the node: parents → 'parent', children → 'child'. */
   role: 'root' | 'parent' | 'child';
   status?: string;
 }
@@ -87,22 +115,44 @@ const edgeKeyOf = (rel: {
   relationshipType: string;
 }): string => `${rel.childLei}|${rel.parentLei}|${rel.relationshipType}`;
 
+/** Each walk side: the end of a row it moves to, and the role it gives what it reaches. */
+const SIDES = {
+  parents: { far: (rel: NormalizedLeiRelationship) => rel.parentLei, role: 'parent' },
+  children: { far: (rel: NormalizedLeiRelationship) => rel.childLei, role: 'child' },
+} as const;
+
+type Side = keyof typeof SIDES;
+
 /**
- * Breadth-first traversal over the relationship table to `depth`, in the
- * requested direction(s). Returns nodes (deduped), edges, whether the walk was
- * cut off, and — when the walk reads parents — the parent relationship types of
- * each node whose parents it read. The traversal is bounded by `depth` and by the
- * relationship table itself (the mirror's corpus), so it terminates even on cyclic
- * ownership structures via the visited set.
+ * Breadth-first walk over the relationship table to `depth`. `both` is a parents
+ * walk plus a children walk from the root, each to `depth`: the parents walk
+ * never reads an ancestor's children and the children walk never follows a
+ * descendant's other parents, so siblings and co-parents are never reached. Each
+ * side keeps its own visited set, so a node both sides reach (a cycle) is still
+ * walked on each; it appears once, with the parents walk's placement, since that
+ * side runs first.
  *
- * `truncated` distinguishes a graph cut off by `depth` from one that simply ran
- * out of relationships. Frontier-emptiness alone cannot: a node discovered
+ * {@link ULTIMATE_TYPE} rows never extend a walk. Their far ends are resolved
+ * after both walks, so a node any other edge reaches within `depth` is placed by
+ * that edge whatever order the rows arrive in; a node only an ultimate row
+ * reaches becomes a leaf flagged `reachedVia: 'ultimate'`, its depth that one hop.
+ *
+ * On a parents or both walk, every node short of the depth limit — a flagged leaf
+ * and a children-side node included — has its own parent rows read for its
+ * parent status; those rows never extend the walk. Edges are the rows read whose
+ * two ends are both returned nodes.
+ *
+ * `truncated` distinguishes a graph that leaves relationships out from one that
+ * simply ran out of them. Frontier-emptiness alone cannot: a node discovered
  * exactly at the boundary may publish no further relationships, in which case the
- * graph is honestly complete there. So the boundary nodes are probed one hop
- * further and the result is used only as a yes/no — the probed relationships are
- * never materialized into the returned graph, which stays bounded by `depth`. A
- * probe that finds only already-collected edges (the cycle case) is not
- * truncation.
+ * graph is honestly complete there. So each side's boundary nodes are probed one
+ * hop further on that side, and the result is used only as a yes/no — the probed
+ * relationships are never materialized into the returned graph, which stays
+ * bounded by `depth`. A flagged leaf is never walked, so it is probed the same
+ * way on the side that reached it: a leaf whose own direct parent (or child) the
+ * graph does not show leaves it a partial view at any depth. A probed row the
+ * graph already shows (the cycle case) is not truncation, and neither is an
+ * ultimate row.
  */
 async function traverse(
   svc: ScreeningService,
@@ -115,50 +165,81 @@ async function traverse(
   parentTypesByLei: Map<string, Set<string>>;
   truncated: boolean;
 }> {
-  const nodes = new Map<string, GraphNode>();
-  const edges: GraphEdge[] = [];
-  const seenEdges = new Set<string>();
-  const parentTypesByLei = new Map<string, Set<string>>();
-  nodes.set(rootLei, { lei: rootLei, legalName: rootLei, depth: 0, role: 'root' });
+  const nodes = new Map<string, GraphNode>([
+    [rootLei, { lei: rootLei, legalName: rootLei, depth: 0, role: 'root' }],
+  ]);
+  const rowsRead = new Map<string, NormalizedLeiRelationship>();
+  const parentRows = new Map<string, NormalizedLeiRelationship[]>();
+  const readParents = async (lei: string): Promise<NormalizedLeiRelationship[]> => {
+    const cached = parentRows.get(lei);
+    if (cached) return cached;
+    const rows = await svc.getRelationships(lei, 'parents');
+    parentRows.set(lei, rows);
+    return rows;
+  };
+  const readSide = (lei: string, side: Side) =>
+    side === 'parents' ? readParents(lei) : svc.getRelationships(lei, 'children');
+  const ultimateLeaves: { depth: number; lei: string; role: 'parent' | 'child' }[] = [];
+  /** The nodes probed one hop further on their side: each side's boundary, and every flagged leaf. */
+  const probes: { lei: string; side: Side }[] = [];
 
-  let frontier = [rootLei];
-  for (let level = 0; level < depth && frontier.length > 0; level++) {
-    const next: string[] = [];
-    for (const lei of frontier) {
-      const rels = await svc.getRelationships(lei, direction);
-      if (direction !== 'children') {
-        parentTypesByLei.set(
-          lei,
-          new Set(rels.filter((rel) => rel.childLei === lei).map((rel) => rel.relationshipType)),
-        );
-      }
-      for (const rel of rels) {
-        const edgeKey = edgeKeyOf(rel);
-        if (!seenEdges.has(edgeKey)) {
-          seenEdges.add(edgeKey);
-          edges.push({
-            childLei: rel.childLei,
-            parentLei: rel.parentLei,
-            relationshipType: rel.relationshipType,
-            ...(rel.relationshipStatus ? { relationshipStatus: rel.relationshipStatus } : {}),
-          });
-        }
-        // The neighbor is whichever end of the edge isn't `lei`.
-        const neighbor = rel.childLei === lei ? rel.parentLei : rel.childLei;
-        const role: GraphNode['role'] = rel.childLei === lei ? 'parent' : 'child';
-        if (!nodes.has(neighbor)) {
-          nodes.set(neighbor, { lei: neighbor, legalName: neighbor, depth: level + 1, role });
-          next.push(neighbor);
+  const sides: Side[] = direction === 'both' ? ['parents', 'children'] : [direction];
+  for (const side of sides) {
+    const { far, role } = SIDES[side];
+    const visited = new Set([rootLei]);
+    let frontier = [rootLei];
+    for (let level = 0; level < depth && frontier.length > 0; level++) {
+      const next: string[] = [];
+      for (const lei of frontier) {
+        for (const rel of await readSide(lei, side)) {
+          rowsRead.set(edgeKeyOf(rel), rel);
+          const neighbor = far(rel);
+          if (rel.relationshipType === ULTIMATE_TYPE) {
+            ultimateLeaves.push({ lei: neighbor, depth: level + 1, role });
+          } else if (!visited.has(neighbor)) {
+            visited.add(neighbor);
+            next.push(neighbor);
+            if (!nodes.has(neighbor)) {
+              nodes.set(neighbor, { lei: neighbor, legalName: neighbor, depth: level + 1, role });
+            }
+          }
         }
       }
+      frontier = next;
     }
-    frontier = next;
+    probes.push(...frontier.map((lei) => ({ lei, side })));
   }
 
+  for (const leaf of ultimateLeaves) {
+    if (!nodes.has(leaf.lei)) {
+      nodes.set(leaf.lei, { ...leaf, legalName: leaf.lei, reachedVia: 'ultimate' });
+      probes.push({ lei: leaf.lei, side: leaf.role === 'parent' ? 'parents' : 'children' });
+    }
+  }
+
+  const parentTypesByLei = new Map<string, Set<string>>();
+  if (direction !== 'children') {
+    for (const node of nodes.values()) {
+      if (node.depth >= depth) continue;
+      const rows = await readParents(node.lei);
+      for (const rel of rows) rowsRead.set(edgeKeyOf(rel), rel);
+      parentTypesByLei.set(node.lei, new Set(rows.map((rel) => rel.relationshipType)));
+    }
+  }
+
+  const shown = (rel: NormalizedLeiRelationship): boolean =>
+    rowsRead.has(edgeKeyOf(rel)) && nodes.has(rel.childLei) && nodes.has(rel.parentLei);
+  const edges: GraphEdge[] = [...rowsRead.values()].filter(shown).map((rel) => ({
+    childLei: rel.childLei,
+    parentLei: rel.parentLei,
+    relationshipType: rel.relationshipType,
+    ...(rel.relationshipStatus ? { relationshipStatus: rel.relationshipStatus } : {}),
+  }));
+
   let truncated = false;
-  for (const lei of frontier) {
-    const rels = await svc.getRelationships(lei, direction);
-    if (rels.some((rel) => !seenEdges.has(edgeKeyOf(rel)))) {
+  for (const { lei, side } of probes) {
+    const rels = await readSide(lei, side);
+    if (rels.some((rel) => rel.relationshipType !== ULTIMATE_TYPE && !shown(rel))) {
       truncated = true;
       break;
     }
@@ -197,24 +278,43 @@ async function parentStatuses(
   return statuses;
 }
 
-/** How each parent-level status reads in the markdown. */
-const PARENT_STATUS_TEXT: Record<ParentLevelStatus['status'], string> = {
-  relationship: 'relationship published (see edges)',
-  exception: 'reporting exception',
-  none: 'none published',
-  unknown: 'unknown — reporting exceptions not loaded',
+/**
+ * How each parent-level status reads in the markdown: in the expanded block of a
+ * node with potential matches, and on the one line of a node without.
+ */
+const PARENT_STATUS_TEXT: Record<ParentLevelStatus['status'], Record<'block' | 'line', string>> = {
+  relationship: { block: 'relationship published', line: 'relationship' },
+  exception: { block: 'reporting exception', line: 'reporting exception' },
+  none: { block: 'none published', line: 'none published' },
+  unknown: { block: 'unknown — reporting exceptions not loaded', line: 'unknown' },
 };
 
-/** One parent level of a node, as the markdown renders it — the exception's reasons included. */
-function renderParentLevel(name: ParentLevel, level: ParentLevelStatus): string {
+/**
+ * One parent level of a node — the exception's reasons included. A published
+ * relationship says whether its edge is in this graph: a flagged leaf's parents
+ * and a children-side node's other parents are read for status, never walked.
+ */
+function parentLevelText(
+  level: ParentLevelStatus,
+  form: 'block' | 'line',
+  edgeShown: boolean,
+): string {
   const reasons = level.exceptionReasons?.length ? ` (${level.exceptionReasons.join(', ')})` : '';
-  return `  - ${name} parent: ${PARENT_STATUS_TEXT[level.status]}${reasons}`;
+  const where =
+    level.status !== 'relationship'
+      ? ''
+      : !edgeShown
+        ? ' (parent not in this graph)'
+        : form === 'block'
+          ? ' (see edges)'
+          : '';
+  return `${PARENT_STATUS_TEXT[level.status][form]}${reasons}${where}`;
 }
 
 export const traceOwnershipTool = tool('sanctions_trace_ownership', {
   title: 'sanctions-screening-mcp-server: trace ownership',
   description:
-    'Trace the GLEIF Level 2 corporate-ownership graph for an LEI: direct and ultimate parents and/or children, traversed breadth-first to a bounded depth, with relationship type for each edge. Set screenNodes to also screen every entity in the graph against all loaded watchlists — resolving "is anyone in this ownership chain sanctioned." Each per-node screen is a screening AID: hits are candidates to verify, and an empty result for a node is not a clearance of that node. Each node whose parents were walked carries parentStatus for its direct and ultimate parent: a published relationship, a reporting exception with the reasons the entity gave (such as NATURAL_PERSONS or NON_CONSOLIDATING), none, or unknown when reporting exceptions are not loaded. The response says what it could not do: complete/truncated/missingEntityLeis report whether the loaded relationship graph within the depth is fully shown, screeningStatus reports whether the cross-reference actually ran, and each screened node reports whether its own hit list was capped. Requires a valid 20-character LEI (use sanctions_resolve_entity to obtain one).',
+    'Trace the GLEIF Level 2 corporate-ownership graph for an LEI: direct and ultimate parents and/or children, traversed breadth-first to a bounded depth, with relationship type for each edge. Direction both walks up to the parents and down to the children from the root, never sideways into siblings or co-parents. An ultimate-parent edge is a shortcut to the top of the group, not a hop: a node only it reaches within the depth is returned as a leaf flagged reachedVia: ultimate. Set screenNodes to also cross-reference every entity in the graph against all loaded watchlists — resolving "is anyone in this ownership chain sanctioned." Each node is cross-referenced as sanctions_get_entity does it: its legal name and every other and transliterated name screened strict (exact, then all tokens present — never fuzzy), and its LEI and registration number looked up as exact non-document identifiers, the registration number matching only an identifier published for the country of its legal jurisdiction; hits merge to one per designation, an OFAC party both OFAC lists publish to one hit whose sources names both, matchedOn naming every input that produced each. A node with no Level 1 record (missingEntityLeis) has no names, so it is looked up by its LEI alone. Each per-node screen is a screening AID: hits are candidates to verify, and an empty result for a node is not a clearance of that node. Each node whose parents were walked carries parentStatus for its direct and ultimate parent: a published relationship, a reporting exception with the reasons the entity gave (such as NATURAL_PERSONS or NON_CONSOLIDATING), none, or unknown when reporting exceptions are not loaded. The response says what it could not do: complete/truncated/missingEntityLeis report whether the loaded relationship graph within the depth is fully shown, screeningStatus reports whether the cross-reference actually ran, and each screened node reports whether its own hit list was capped. Requires a valid 20-character LEI (use sanctions_resolve_entity to obtain one).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     lei: z
@@ -224,19 +324,23 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     direction: z
       .enum(['parents', 'children', 'both'])
       .default('both')
-      .describe('Walk parents (who owns it), children (what it owns), or both (default).'),
+      .describe(
+        'Walk parents (who owns it), children (what it owns), or both (default): a parents walk plus a children walk from the root, each to depth, never into siblings or co-parents.',
+      ),
     depth: z
       .number()
       .int()
       .min(1)
       .max(5)
       .default(3)
-      .describe('Maximum traversal depth from the root entity (1–5).'),
+      .describe(
+        'Maximum traversal depth from the root entity (1–5), on each side of a both walk. Ultimate-parent edges do not count as hops.',
+      ),
     screenNodes: z
       .boolean()
       .default(false)
       .describe(
-        "When true, screen every node's legal name against all watchlists — the ownership-chain cross-reference.",
+        "When true, cross-reference every node against all watchlists — the ownership-chain cross-reference: the node's legal, other, and transliterated names screened strict, and its LEI and country-matched registration number looked up as identifiers. A node with no Level 1 record has no names: its LEI lookup alone.",
       ),
   }),
   output: z.object({
@@ -251,10 +355,22 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
               .describe("The node's legal name (the LEI itself if not hydrated)."),
             jurisdiction: z.string().optional().describe('Jurisdiction (ISO code), when known.'),
             status: z.string().optional().describe('GLEIF registration status, when known.'),
-            depth: z.number().describe('Breadth-first depth from the root (root = 0).'),
+            depth: z
+              .number()
+              .describe(
+                'Breadth-first depth from the root (root = 0), counted over every relationship type except IS_ULTIMATELY_CONSOLIDATED_BY. On a node flagged reachedVia: ultimate it counts that one ultimate hop instead, so it can be shallower than the direct chain to the node.',
+              ),
             role: z
               .enum(['root', 'parent', 'child'])
-              .describe('Position relative to the traversal.'),
+              .describe(
+                'root = the traced entity; parent = an ancestor, reached by walking parents; child = a descendant, reached by walking children. On a both walk, the side that reached the node — siblings and co-parents are never walked.',
+              ),
+            reachedVia: z
+              .enum(['ultimate'])
+              .optional()
+              .describe(
+                'Present (ultimate) when only an IS_ULTIMATELY_CONSOLIDATED_BY edge reaches this node within the depth. That edge is a shortcut to the top of the group, not a hop, so the node is a leaf: its own parents (on the parents side) or children (on the children side) are never walked, and truncated is true when any of them is not in this graph. A higher depth places it by direct links only when a direct chain from the root reaches it; where that chain is broken (a parent reported by exception, or not at all), no depth does.',
+              ),
             parentStatus: z
               .object({
                 direct: ParentLevelSchema.describe('What GLEIF publishes about the direct parent.'),
@@ -272,22 +388,27 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
                   .number()
                   .int()
                   .describe(
-                    "Potential matches this node's screen found before the per-node cap was applied.",
+                    "Distinct designations this node's cross-reference found across every screened name and identifier, an OFAC party both OFAC lists publish counted once, before the per-node cap was applied.",
                   ),
                 totalAvailableBasis: z
                   .enum(['exact', 'lower_bound'])
                   .describe(
-                    'How to read totalAvailable: exact = the complete strict match set for this node; lower_bound = a bounded scan produced it, so more may exist.',
+                    "How to read totalAvailable. Always exact here: every name is screened strict, never fuzzy, and a strict screen counts every designation it reaches, so totalAvailable is the whole set across this node's screened names and identifiers.",
                   ),
                 hasMore: z
                   .boolean()
                   .describe(
-                    "True when this node's potential matches were capped — screen its legal name with sanctions_screen_name to page through the rest.",
+                    "True when this node's potential matches were capped — re-screen its names with sanctions_screen_name and look up its LEI and registration number with sanctions_screen_identifier to see the rest. A node in missingEntityLeis has no names: look up its LEI.",
+                  ),
+                screenedInputs: z
+                  .array(ScreenedInputSchema)
+                  .describe(
+                    'What the cross-reference screened beyond the legal name and the LEI, which it screens on every node with a Level 1 record: every other and transliterated name, then the registration number when the node publishes one (a not-available placeholder such as N/A is none) and a legal jurisdiction to match it by. Empty when there is nothing beyond those two, and always on a node in missingEntityLeis, which has no name and is looked up by its LEI alone.',
                   ),
               })
               .optional()
               .describe(
-                "Disclosure for this node's cross-reference screen: how many potential matches existed before the per-node cap, and whether sanctionsHits is the complete set. Present only when the node was screened.",
+                "Disclosure for this node's cross-reference: how many potential matches existed before the per-node cap, whether sanctionsHits is the complete set, and what was screened. Present only when the node was screened.",
               ),
             sanctionsHits: z
               .array(
@@ -295,25 +416,51 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
                   .object({
                     source: z
                       .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])
-                      .describe('Watchlist the candidate is on.'),
+                      .describe(
+                        'Watchlist whose record this hit is attributed to: primaryName comes from it. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched better, and matchedName, matchedIdentifiers, and matchedOn cover what either record matched; sources names every list.',
+                      ),
                     sourceLabel: z.string().describe('Human-readable source list name.'),
                     sourceEntryId: z
                       .string()
                       .describe('Source entry ID — pass to sanctions_get_designation.'),
+                    sources: HitSourcesSchema,
                     primaryName: z.string().describe('Primary published name of the designation.'),
-                    matchedName: z.string().describe('The name/alias that matched this node.'),
+                    matchedName: z
+                      .string()
+                      .optional()
+                      .describe(
+                        "The designation's name or alias that matched one of this node's screened names — the strongest match. Absent when only an identifier produced the hit.",
+                      ),
                     matchType: z
                       .enum(['exact', 'strong', 'approximate'])
-                      .describe('Match classification.'),
+                      .optional()
+                      .describe(
+                        'Match classification of matchedName: exact or strong, never approximate (the cross-reference screens strict, never fuzzy). Absent when only an identifier produced the hit.',
+                      ),
                     score: z
                       .number()
                       .optional()
-                      .describe('Raw Jaro-Winkler similarity (0–1) for approximate hits only.'),
+                      .describe(
+                        'Never set by this cross-reference: only an approximate (fuzzy) match carries a raw Jaro-Winkler score, and the cross-reference screens strict.',
+                      ),
+                    matchedIdentifiers: z
+                      .array(MatchedIdentifierSchema)
+                      .optional()
+                      .describe(
+                        "Every identifier the designation publishes that equals this node's LEI or its country-matched registration number, as published. Present only when an identifier produced the hit.",
+                      ),
+                    matchedOn: z
+                      .array(ScreenedInputSchema)
+                      .describe(
+                        'Every input of this node that produced the hit — its legal name, an other or transliterated name, its LEI, or its registration number — in screening order. Only its LEI on a node in missingEntityLeis.',
+                      ),
                   })
                   .describe('A potential watchlist match on this node — verify, do not assume.'),
               )
               .optional()
-              .describe('Per-node screening results, present only when screenNodes is true.'),
+              .describe(
+                'Per-node cross-reference results, one hit per designation (an OFAC party both OFAC lists publish once) — exact name and identifier matches first, then strong name matches. Present only when screenNodes is true.',
+              ),
           })
           .describe('One entity in the ownership graph.'),
       )
@@ -334,16 +481,18 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
           })
           .describe('One directed ownership edge (child is consolidated by parent).'),
       )
-      .describe('Directed ownership edges between the nodes.'),
+      .describe(
+        'Directed ownership edges between the nodes — every edge joins two nodes of this graph.',
+      ),
     complete: z
       .boolean()
       .describe(
-        "True when the loaded Level 2 relationships within the requested depth are all shown (nothing was cut off by depth) AND every node resolved to a GLEIF Level 1 record. It does not say every parent is known — most entities publish no parent relationship; read each node's parentStatus for what GLEIF publishes instead. False means the graph below is a partial view — read truncated and missingEntityLeis for which.",
+        "True when truncated is false (no loaded relationship on the walked side is left out) AND every node resolved to a GLEIF Level 1 record. It does not say every parent is known — most entities publish no parent relationship; read each node's parentStatus for what GLEIF publishes instead. False means the graph below is a partial view — read truncated and missingEntityLeis for which.",
       ),
     truncated: z
       .boolean()
       .describe(
-        'True when further ownership relationships exist beyond the requested depth — re-run with a higher depth to see them. False means the traversal reached the edge of the loaded relationship corpus.',
+        'True when the loaded relationships hold ownership links on the walked side that this graph does not show: past the requested depth (re-run with a higher depth to see them), or the parents (or, on the children side, children) of a node flagged reachedVia: ultimate, which is never walked. An ultimate-parent edge never counts. False means neither: every chain the walk followed ends within the depth. Siblings and co-parents are never walked and never count.',
       ),
     reportingExceptionsLoaded: z
       .boolean()
@@ -353,7 +502,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     missingEntityLeis: z
       .array(z.string())
       .describe(
-        'LEIs published in the relationship corpus but absent from the GLEIF Level 1 entity mirror. Their nodes carry the LEI in place of a legal name and no jurisdiction/status — never read that LEI as a legal name, and note any per-node screen for them ran against the LEI string.',
+        'LEIs published in the relationship corpus but absent from the GLEIF Level 1 entity mirror. Their nodes carry the LEI in place of a legal name and no jurisdiction/status — never read that LEI as a legal name. A per-node screen for them is the LEI looked up as an identifier, nothing else: with no record there is no legal name, other name, or registration number to screen, so their screenedInputs is empty and each hit is matchedOn their lei.',
       ),
     screeningStatus: z
       .enum(['screened', 'not_requested', 'not_ready'])
@@ -374,9 +523,16 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     {
       reason: 'lei_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No GLEIF entity exists for the root LEI in the mirror.',
+      when: 'No GLEIF entity in the mirror carries the root LEI, and its check digits are valid.',
       recovery:
         'Resolve the entity name with sanctions_resolve_entity to obtain a valid root LEI first.',
+    },
+    {
+      reason: 'invalid_lei_checksum',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'No GLEIF entity in the mirror carries the root LEI, and its ISO 17442 check digits fail.',
+      recovery:
+        'Re-check the root LEI for a mistyped or transposed character, or resolve the entity name with sanctions_resolve_entity to obtain a valid LEI.',
     },
     {
       reason: 'mirror_not_ready',
@@ -391,16 +547,17 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
   async handler(input, ctx) {
     const svc = getScreeningService();
     if (!(await svc.leiReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.', {
-        ...ctx.recoveryFor('mirror_not_ready'),
-      });
+      throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.');
     }
 
     const root = await svc.getLeiEntity(input.lei);
     if (!root) {
-      throw ctx.fail('lei_not_found', `No GLEIF entity with LEI "${input.lei}".`, {
-        ...ctx.recoveryFor('lei_not_found'),
-      });
+      throw leiChecksumValid(input.lei)
+        ? ctx.fail('lei_not_found', `No GLEIF entity with LEI "${input.lei}".`)
+        : ctx.fail(
+            'invalid_lei_checksum',
+            `LEI "${input.lei}" fails its ISO 17442 check digits, and no GLEIF entity carries it.`,
+          );
     }
 
     const { nodes, edges, parentTypesByLei, truncated } = await traverse(
@@ -438,21 +595,16 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
         : 'not_requested';
     let screenedNodeCount = 0;
     let flaggedNodeCount = 0;
-    const screensByLei = new Map<string, Awaited<ReturnType<typeof svc.screenName>>>();
+    const screensByLei = new Map<string, CrossReferenceResult>();
 
     if (screened) {
       for (const node of nodes.values()) {
-        const screen = await svc.screenName(
-          {
-            query: node.legalName,
-            entityType: 'any',
-            matchMode: 'strict',
-            // Per-node cross-reference: strict only. Auto-fuzzy would flag nearly
-            // every node on a single shared common token, defeating the signal.
-            autoFallback: false,
-            sources: [...SOURCE_CODES],
-            limit: PER_NODE_SCREEN_LIMIT,
-          },
+        // A node with no Level 1 record has only its LEI, which stands in for its
+        // legal name in the output but is never screened as one.
+        const screen = await crossReferenceEntity(
+          svc,
+          byLei.get(node.lei) ?? { lei: node.lei },
+          PER_NODE_SCREEN_LIMIT,
           ctx,
         );
         screenedNodeCount++;
@@ -475,6 +627,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
           ...(node.status ? { status: node.status } : {}),
           depth: node.depth,
           role: node.role,
+          ...(node.reachedVia ? { reachedVia: node.reachedVia } : {}),
           ...(parentStatus ? { parentStatus } : {}),
           ...(screen
             ? {
@@ -484,15 +637,19 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
                   // The per-node screen never pages, so whatever the cap left
                   // behind is everything past the hits returned here.
                   hasMore: screen.hits.length < screen.totalAvailable,
+                  screenedInputs: screen.screenedInputs,
                 },
                 sanctionsHits: screen.hits.map((h) => ({
                   source: h.source,
                   sourceLabel: SOURCE_LABELS[h.source],
                   sourceEntryId: h.sourceEntryId,
+                  sources: h.sources,
                   primaryName: h.primaryName,
-                  matchedName: h.matchedName,
-                  matchType: h.matchType,
+                  ...(h.matchedName !== undefined ? { matchedName: h.matchedName } : {}),
+                  ...(h.matchType !== undefined ? { matchType: h.matchType } : {}),
                   ...(h.score !== undefined ? { score: h.score } : {}),
+                  ...(h.matchedIdentifiers ? { matchedIdentifiers: h.matchedIdentifiers } : {}),
+                  matchedOn: h.matchedOn,
                 })),
               }
             : {}),
@@ -521,7 +678,9 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     );
     if (r.truncated) {
       lines.push(
-        '- Truncated at the requested depth: further ownership relationships exist beyond it. Re-run with a higher depth (max 5).',
+        r.nodes.some((node) => node.reachedVia)
+          ? '- Truncated: the loaded relationships hold ownership links on the walked side that this graph does not show — past the requested depth, or of a node reached only via an ultimate-parent edge, which is never walked. A higher depth (max 5) shows the first, and places a flagged node only when a direct chain from the root reaches it.'
+          : '- Truncated at the requested depth: further ownership relationships exist beyond it. Re-run with a higher depth (max 5).',
       );
     }
     if (r.missingEntityLeis.length > 0) {
@@ -530,7 +689,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
           .map((lei) => `\`${lei}\``)
           .join(
             ', ',
-          )}. Those nodes show their LEI where a legal name would be, and any screen for them ran against that LEI.`,
+          )}. Those nodes show their LEI where a legal name would be; a per-node screen of one is its LEI lookup alone, since with no record there is no name to screen.`,
       );
     }
 
@@ -545,38 +704,85 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
         ? '**Node screening:** requested but NOT run — the sanctions mirror has never synced, so no node was screened. That is not a clearance for any node.'
         : r.screeningStatus === 'not_requested'
           ? '**Node screening:** not requested — no node was cross-referenced against the watchlists (set screenNodes: true).'
-          : `**Node screening:** screened ${r.screenedNodeCount} node(s); ${r.flaggedNodeCount} had potential matches.`,
+          : `**Node screening:** screened ${r.screenedNodeCount} node(s); ${r.flaggedNodeCount} had potential matches; ${r.nodes.filter((node) => node.sanctionsScreen?.hasMore).length} capped.`,
     );
 
+    // Which parent levels have their relationship edge in this graph.
+    const shownParentEdges = new Set(r.edges.map((e) => `${e.childLei}|${e.relationshipType}`));
+    const recordless = new Set(r.missingEntityLeis);
     lines.push('\n## Entities');
     for (const node of r.nodes) {
       const meta = [node.jurisdiction, node.status].filter(Boolean).join(', ');
-      lines.push(
-        `- **${node.legalName}** \`${node.lei}\` — ${node.role}, depth ${node.depth}${meta ? ` (${meta})` : ''}`,
-      );
-      if (node.parentStatus) {
-        lines.push(renderParentLevel('direct', node.parentStatus.direct));
-        lines.push(renderParentLevel('ultimate', node.parentStatus.ultimate));
-      }
-      if (node.sanctionsHits && node.sanctionsHits.length > 0) {
-        for (const h of node.sanctionsHits) {
-          const scoreStr = h.score !== undefined ? ` · score ${h.score.toFixed(3)}` : '';
-          lines.push(
-            `  - ⚠ ${h.primaryName} — ${h.sourceLabel} (\`${h.source}\`, entry ${h.sourceEntryId}): matched "${h.matchedName}" — ${h.matchType}${scoreStr}`,
+      const via = node.reachedVia
+        ? ', reached only via an ultimate-parent edge (leaf, not walked)'
+        : '';
+      const entity = `- **${node.legalName}** \`${node.lei}\` — ${node.role}, depth ${node.depth}${meta ? ` (${meta})` : ''}${via}`;
+      const levelText = (name: ParentLevel, form: 'block' | 'line'): string =>
+        node.parentStatus
+          ? parentLevelText(
+              node.parentStatus[name],
+              form,
+              shownParentEdges.has(`${node.lei}|${PARENT_LEVELS[name].relationshipType}`),
+            )
+          : '';
+      const hits = node.sanctionsHits ?? [];
+      const hasRecord = !recordless.has(node.lei);
+      // What a screen ran beyond the legal name and LEI; a node with no Level 1
+      // record had no name screened, only its LEI looked up.
+      const screenedInputs = node.sanctionsScreen?.screenedInputs ?? [];
+      const screenedNote = !hasRecord
+        ? ': the LEI lookup only (no Level 1 record, so no name was screened)'
+        : screenedInputs.length > 0
+          ? ` beyond the legal name and LEI: ${screenedInputs.map(screenedInputText).join('; ')}`
+          : undefined;
+
+      // A node with no potential matches — screened or not — is one line carrying
+      // every field it has, so the nodes with matches stand out below the fold.
+      if (hits.length === 0) {
+        const parts = [entity];
+        if (node.parentStatus) {
+          parts.push(
+            `parents — direct: ${levelText('direct', 'line')}; ultimate: ${levelText('ultimate', 'line')}`,
           );
         }
-      } else if (node.sanctionsHits) {
-        lines.push('  - No potential matches (not a clearance).');
+        if (node.sanctionsScreen) {
+          parts.push(
+            `screen: no potential matches (not a clearance), 0 of ${node.sanctionsScreen.totalAvailable} (count basis: ${node.sanctionsScreen.totalAvailableBasis})`,
+          );
+          if (screenedNote) parts.push(`screened${screenedNote}`);
+        }
+        lines.push(parts.join(' · '));
+        continue;
+      }
+
+      lines.push(entity);
+      if (node.parentStatus) {
+        lines.push(`  - direct parent: ${levelText('direct', 'block')}`);
+        lines.push(`  - ultimate parent: ${levelText('ultimate', 'block')}`);
+      }
+      for (const h of hits) {
+        const scoreStr = h.score !== undefined ? ` · score ${h.score.toFixed(3)}` : '';
+        const matched = [
+          ...(h.matchedName !== undefined
+            ? [`matched "${h.matchedName}" — ${h.matchType}${scoreStr}`]
+            : []),
+          ...(h.matchedIdentifiers ?? []).map(matchedIdentifierText),
+        ];
+        const also = alsoListedText(h.source, h.sources);
+        lines.push(
+          `  - ⚠ ${h.primaryName} — ${h.sourceLabel} (\`${h.source}\`, entry ${h.sourceEntryId}${also ? `; also listed on ${also}` : ''}): ${matched.join('; ')} — matched on: ${h.matchedOn.map(screenedInputText).join('; ')}`,
+        );
       }
       if (node.sanctionsScreen) {
         const s = node.sanctionsScreen;
         lines.push(
-          `  - Screen coverage: showing ${node.sanctionsHits?.length ?? 0} of ${s.totalAvailable} potential match(es) (count basis: ${s.totalAvailableBasis}); more available: ${s.hasMore}${
+          `  - Screen coverage: showing ${hits.length} of ${s.totalAvailable} potential match(es) (count basis: ${s.totalAvailableBasis}); more available: ${s.hasMore}${
             s.hasMore
-              ? ` — screen "${node.legalName}" with sanctions_screen_name to page through the rest.`
+              ? ` — ${crossReferencePointer(hasRecord ? node.legalName : undefined, node.lei, s.screenedInputs)}`
               : ''
           }`,
         );
+        if (screenedNote) lines.push(`  - Screened${screenedNote}`);
       }
     }
     if (r.edges.length > 0) {

@@ -5,13 +5,19 @@
  * @module tests/integration/matching-correctness.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
 import { tokenize } from '@/services/screening/text-matching.js';
-import type { NormalizedDesignation } from '@/services/screening/types.js';
+import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
-import { freshService, type SeededService, seededService } from '../services/_helpers.js';
+import {
+  freshService,
+  type SeededService,
+  seededGlobalService,
+  seededService,
+} from '../services/_helpers.js';
 
 const matchingDesignations: NormalizedDesignation[] = [
   {
@@ -239,7 +245,10 @@ describe('screenName name-shape correctness', () => {
     const intendedRank = result.hits.findIndex((hit) => hit.sourceEntryId === 'TM-1002');
     const weakerRank = result.hits.findIndex((hit) => hit.sourceEntryId === 'FX-6006');
     expect(intendedRank).toBe(0);
-    expect(weakerRank).toBeGreaterThan(intendedRank);
+    // `Mohammed Al-Testi` shares only `Mohammed` and the article `al` with the
+    // query. It once ranked second at 2/4 coverage; an article no longer counts
+    // toward admission (#55), so one shared word of three distinctive ones keeps it out.
+    expect(weakerRank).toBe(-1);
   });
 
   it('separates the tied candidates by coverage while leaving both scores raw', async () => {
@@ -258,7 +267,7 @@ describe('screenName name-shape correctness', () => {
     expect(weaker?.queryTokenCoverage).toEqual({ covered: 2, total: 3 });
   });
 
-  it('orders every approximate hit by score, then by coverage, then by designation id', async () => {
+  it('orders every approximate hit by score, then by coverage, then by list and entry ID', async () => {
     const result = await service.screenName(
       { ...defaults, query: 'Nikolas Maduro Moros', matchMode: 'fuzzy' },
       createMockContext(),
@@ -268,17 +277,165 @@ describe('screenName name-shape correctness', () => {
       .map((hit) => [
         -(hit.score ?? 0),
         -(hit.queryTokenCoverage?.covered ?? 0),
-        hit.designationId,
+        hit.source,
+        hit.sourceEntryId,
       ]);
     expect(keys).toEqual([...keys].sort(compareRankKeys));
   });
 });
 
-/** One hit's ranking key, ascending: negated score, negated coverage, designation id. */
-type RankKey = [number, number, string];
+/** One hit's ranking key, ascending: negated score, negated coverage, list, entry ID. */
+type RankKey = [number, number, SourceCode, string];
 
+const entryIdCollator = new Intl.Collator('en', { numeric: true });
+
+/**
+ * Score and coverage, then identity: the list in `SOURCE_CODES` order, the entry
+ * ID by numeric collation, then the entry ID by code units, which orders the
+ * zero-padded variants numeric collation calls equal.
+ */
 const compareRankKeys = (a: RankKey, b: RankKey): number =>
-  a[0] - b[0] || a[1] - b[1] || a[2].localeCompare(b[2]);
+  a[0] - b[0] ||
+  a[1] - b[1] ||
+  SOURCE_CODES.indexOf(a[2]) - SOURCE_CODES.indexOf(b[2]) ||
+  entryIdCollator.compare(a[3], b[3]) ||
+  (a[3] < b[3] ? -1 : a[3] > b[3] ? 1 : 0);
+
+/**
+ * Nine designations under one name, spread over every list, with entry IDs whose
+ * string order and numeric order disagree (`26079`/`2677`, `12`/`3`, `10`/`9`)
+ * and a zero-padded pair that numeric collation calls equal (`RUS0251`/`RUS251`).
+ * Every screen below ties them on match signal, so only identity orders them.
+ */
+const identityTies: NormalizedDesignation[] = (
+  [
+    ['un', '10'],
+    ['uk', 'RUS251'],
+    ['eu', '12'],
+    ['ofac_sdn', '26079'],
+    ['un', '9'],
+    ['ofac_consolidated', '5'],
+    ['uk', 'RUS0251'],
+    ['eu', '3'],
+    ['ofac_sdn', '2677'],
+  ] as const
+).map(
+  ([source, sourceEntryId]): NormalizedDesignation => ({
+    id: `${source}:${sourceEntryId}`,
+    source,
+    sourceEntryId,
+    entityType: 'organization',
+    primaryName: 'Lattice Probe Varnok',
+    payload: {
+      aliases: [],
+      identifiers: [],
+      addresses: [],
+      datesOfBirth: [],
+      nationalities: [],
+    },
+  }),
+);
+
+/** Lists in `SOURCE_CODES` order; entry IDs by numeric value, `RUS0251` before `RUS251`. */
+const IDENTITY_ORDER = [
+  'ofac_sdn:2677',
+  'ofac_sdn:26079',
+  'ofac_consolidated:5',
+  'eu:3',
+  'eu:12',
+  'uk:RUS0251',
+  'uk:RUS251',
+  'un:9',
+  'un:10',
+];
+
+describe('designation identity order for tied hits (issue #60)', () => {
+  let standalone: SeededService;
+
+  afterEach(async () => {
+    await standalone.cleanup();
+  });
+
+  const ingest = async (designations: NormalizedDesignation[]): Promise<ScreeningService> => {
+    standalone = await freshService();
+    await standalone.service.ingestDesignations(designations);
+    await standalone.service.markSanctionsReady(designations.length);
+    return standalone.service;
+  };
+
+  it.each([
+    ['as listed', identityTies],
+    ['reversed', [...identityTies].reverse()],
+  ])(
+    'orders a strict tie by list, then entry ID by numeric value (stored %s)',
+    async (_stored, designations) => {
+      const service = await ingest(designations);
+      const result = await service.screenName(
+        { ...defaults, query: 'Lattice Probe Varnok' },
+        createMockContext(),
+      );
+      expect(result.hits.map((hit) => hit.matchType)).toEqual(IDENTITY_ORDER.map(() => 'exact'));
+      expect(result.hits.map((hit) => hit.designationId)).toEqual(IDENTITY_ORDER);
+    },
+  );
+
+  it('orders a fuzzy tie on score and coverage by the same identity key', async () => {
+    const service = await ingest(identityTies);
+    const result = await service.screenName(
+      { ...defaults, query: 'Latice Probe Varnok', matchMode: 'fuzzy' },
+      createMockContext(),
+    );
+    const signals = result.hits.map((hit) => [
+      hit.matchType,
+      hit.score,
+      hit.queryTokenCoverage?.covered,
+    ]);
+    expect(new Set(signals.map((signal) => JSON.stringify(signal))).size).toBe(1);
+    expect(signals[0]?.[0]).toBe('approximate');
+    expect(result.hits.map((hit) => hit.designationId)).toEqual(IDENTITY_ORDER);
+  });
+
+  it('walks disjoint strict pages that reassemble the identity order', async () => {
+    const service = await ingest([...identityTies].reverse());
+    const pages = await Promise.all(
+      [0, 2, 4, 6, 8].map((offset) =>
+        service.screenName(
+          { ...defaults, query: 'Lattice Probe Varnok', limit: 2, offset },
+          createMockContext(),
+        ),
+      ),
+    );
+    expect(pages.flatMap((page) => page.hits.map((hit) => hit.designationId))).toEqual(
+      IDENTITY_ORDER,
+    );
+  });
+});
+
+describe('sanctions_screen_name identity order on both surfaces (issue #60)', () => {
+  let harness: SeededService;
+
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  it('lists tied hits in the same identity order in structuredContent and content', async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations(identityTies);
+
+    const result = await runToolContract(screenNameTool, { name: 'Lattice Probe Varnok' });
+    expect(result.isError).toBeFalsy();
+    const { hits } = result.structuredContent as {
+      hits: { source: SourceCode; sourceEntryId: string }[];
+    };
+    expect(hits.map((hit) => `${hit.source}:${hit.sourceEntryId}`)).toEqual(IDENTITY_ORDER);
+
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    const rendered = [...text.matchAll(/\(`([a-z_]+)`\) \| \*\*Entry ID:\*\* (\S+)/g)].map(
+      ([, source, entryId]) => `${source}:${entryId}`,
+    );
+    expect(rendered).toEqual(IDENTITY_ORDER);
+  });
+});
 
 describe('designation merge and deduplication', () => {
   let standalone: SeededService;
@@ -406,8 +563,9 @@ describe('native-script names (issue #20)', () => {
     handle.exec(
       `CREATE VIRTUAL TABLE temp.name_terms USING fts5vocab(main, 'name_fts', 'instance')`,
     );
+    // `name_fts` holds the `normalized` column alone, which strict matching reads.
     const terms = handle.prepare<{ term: string }>(
-      'SELECT term FROM temp.name_terms WHERE doc = ? ORDER BY "offset"',
+      `SELECT term FROM temp.name_terms WHERE doc = ? AND col = 'normalized' ORDER BY "offset"`,
     );
     const indexed = handle
       .prepare<{ rowid: number; normalized: string }>('SELECT rowid, normalized FROM name')

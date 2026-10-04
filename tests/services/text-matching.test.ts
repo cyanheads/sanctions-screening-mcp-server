@@ -10,10 +10,15 @@ import {
   bestTokenScore,
   buildFtsMatch,
   doubleMetaphone,
+  FUZZY_STOPLIST,
   fold,
+  isStoplistToken,
   jaro,
   jaroWinkler,
   lengthRatio,
+  scoreTokenPairs,
+  scoringQuery,
+  splitOnStoplist,
   tokenCoverage,
   tokenize,
 } from '@/services/screening/text-matching.js';
@@ -225,6 +230,81 @@ describe('tokenCoverage', () => {
   });
 });
 
+describe('scoreTokenPairs — one pass equals the separate helpers', () => {
+  /** mulberry32: a seeded generator, so a failing case reproduces. */
+  const seeded = (seed: number) => () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const random = seeded(71);
+  const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+  // Name words, near variants, stoplisted words, short and supplementary-plane tokens.
+  const VOCABULARY = [
+    ...['volkov', 'volkow', 'ivan', 'ivanov', 'mohammed', 'muhammad', 'mohammad', 'nicolas'],
+    ...['nikolas', 'maduro', 'moros', 'rosneft', 'oil', 'bank', 'banco', 'deutsche', 'x', 'ab'],
+    ...['ltd', 'company', 'al', 'de', 'the', 'gmbh', 'uk', '𠀀𠀁𠀂', '𠀀𠀁𠀃', 'ab𠀀'],
+  ];
+  /** A vocabulary word, or a random word over a small alphabet, so near pairs are common. */
+  const token = (): string =>
+    random() < 0.6
+      ? pick(VOCABULARY)
+      : Array.from({ length: 1 + Math.floor(random() * 7) }, () => pick([...'abdeimnorv'])).join(
+          '',
+        );
+  const tokens = (min: number, max: number): string[] =>
+    Array.from({ length: min + Math.floor(random() * (max - min + 1)) }, token);
+
+  it('returns bestTokenScore and both coverages over 20,000 random token lists and thresholds', () => {
+    const mismatches: unknown[] = [];
+    const exercised = { allStoplisted: 0, astral: 0, bestOneCoveredMany: 0, distinctiveDiffers: 0 };
+    for (let i = 0; i < 20_000; i++) {
+      const queryTokens = tokens(1, 8);
+      const candidateTokens = tokens(0, 6);
+      // Fixed floors, random ones, and a floor equal to a real pair score, so `>=` meets equality.
+      const threshold =
+        i % 4 === 0
+          ? pick([0, 0.5, 0.85, 0.9, 1])
+          : i % 4 === 1 && candidateTokens.length > 0
+            ? jaroWinkler(pick(queryTokens), pick(candidateTokens))
+            : random();
+      const expected = {
+        best: bestTokenScore(queryTokens, candidateTokens),
+        covered: tokenCoverage(queryTokens, candidateTokens, threshold),
+        distinctiveCovered: tokenCoverage(
+          splitOnStoplist(queryTokens).distinctive,
+          candidateTokens,
+          threshold,
+        ),
+      };
+      const actual = scoreTokenPairs(scoringQuery(queryTokens), candidateTokens, threshold);
+      if (
+        !Object.is(actual.best, expected.best) ||
+        actual.covered !== expected.covered ||
+        actual.distinctiveCovered !== expected.distinctiveCovered
+      ) {
+        mismatches.push({ queryTokens, candidateTokens, threshold, expected, actual });
+      }
+      if (queryTokens.every(isStoplistToken)) exercised.allStoplisted++;
+      if ([...queryTokens, ...candidateTokens].some((t) => /[\ud800-\udfff]/.test(t))) {
+        exercised.astral++;
+      }
+      if (expected.best === 1 && expected.covered > 1) exercised.bestOneCoveredMany++;
+      if (expected.distinctiveCovered !== expected.covered) exercised.distinctiveDiffers++;
+    }
+    expect(mismatches.slice(0, 5)).toEqual([]);
+    for (const [shape, count] of Object.entries(exercised)) expect(count, shape).toBeGreaterThan(0);
+  });
+
+  it('marks the distinctive tokens as splitOnStoplist splits them', () => {
+    const marks = (query: string[]) => scoringQuery(query).map((t) => t.distinctive);
+    expect(marks(['rosneft', 'oil', 'company'])).toEqual([true, true, false]);
+    expect(marks(['limited', 'liability', 'company'])).toEqual([true, true, true]);
+    expect(marks([])).toEqual([]);
+  });
+});
+
 describe('lengthRatio', () => {
   it('is 1 for equal-length strings and for two empty strings', () => {
     expect(lengthRatio('volkov', 'moros!')).toBe(1); // both 6 chars
@@ -252,6 +332,53 @@ describe('lengthRatio', () => {
     // The recall the whole-string arm exists for — the guard must not block these.
     expect(lengthRatio('van den berg', 'vandenberg')).toBeGreaterThan(0.8);
     expect(lengthRatio('vanderbergshipping', 'van der berg shipping')).toBeGreaterThan(0.8);
+  });
+});
+
+describe('fuzzy stoplist (issue #55)', () => {
+  it('lists legal forms, articles, and the bare jurisdiction codes', () => {
+    for (const token of ['ltd', 'company', 'jsc', 'общество', 'gmbh', 'sirketi', 'fze', 'pte']) {
+      expect(isStoplistToken(token), token).toBe(true);
+    }
+    for (const token of ['al', 'el', 'de', 'la', 'the', 'of', 'and']) {
+      expect(isStoplistToken(token), token).toBe(true);
+    }
+    for (const token of ['uk', 'usa', 'uae', 'rf'])
+      expect(isStoplistToken(token), token).toBe(true);
+  });
+
+  it('leaves out country names, one-letter tokens, and person-name particles', () => {
+    for (const token of ['iran', 'korea', 'china', 'russia', 'syria', 'air']) {
+      expect(isStoplistToken(token), token).toBe(false);
+    }
+    for (const token of ['s', 'a', 'y', 'e']) expect(isStoplistToken(token), token).toBe(false);
+    for (const token of ['bin', 'abu', 'ibn', 'ben', 'van']) {
+      expect(isStoplistToken(token), token).toBe(false);
+    }
+  });
+
+  it('holds only folded single tokens, so a folded query token can equal one', () => {
+    expect(FUZZY_STOPLIST.size).toBeGreaterThan(0);
+    for (const token of FUZZY_STOPLIST) expect(tokenize(fold(token)), token).toEqual([token]);
+  });
+
+  it('splits a query into its distinctive and stoplisted tokens, in query order', () => {
+    expect(splitOnStoplist(tokenize(fold('SOVCOMFLOT (UK) LTD')))).toEqual({
+      distinctive: ['sovcomflot'],
+      stoplisted: ['uk', 'ltd'],
+    });
+    expect(splitOnStoplist(['rosneft', 'oil', 'company'])).toEqual({
+      distinctive: ['rosneft', 'oil'],
+      stoplisted: ['company'],
+    });
+  });
+
+  it('keeps every token distinctive when the query has nothing else', () => {
+    expect(splitOnStoplist(['limited', 'liability', 'company'])).toEqual({
+      distinctive: ['limited', 'liability', 'company'],
+      stoplisted: [],
+    });
+    expect(splitOnStoplist([])).toEqual({ distinctive: [], stoplisted: [] });
   });
 });
 

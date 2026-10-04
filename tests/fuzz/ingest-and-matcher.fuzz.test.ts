@@ -1,7 +1,8 @@
 /**
  * @fileoverview Deterministic fuzz coverage for XML ingest and fuzzy matching.
- * Exercises hostile text, malformed/truncated records, invalid UTF-8, and
- * one-edit variants of public designation names without network access.
+ * Exercises hostile text, malformed/truncated records, invalid UTF-8, one-edit
+ * variants of public designation names, and distinctive words wrapped in
+ * fuzzy-stoplist tokens, without network access.
  * @module tests/fuzz/ingest-and-matcher.fuzz.test
  */
 
@@ -24,6 +25,7 @@ import {
 import {
   buildFtsMatch,
   doubleMetaphone,
+  FUZZY_STOPLIST,
   fold,
   jaro,
   jaroWinkler,
@@ -32,6 +34,7 @@ import type {
   AddressRecord,
   DesignationPayload,
   DobRecord,
+  FeatureRecord,
   IdentifierRecord,
   NormalizedDesignation,
 } from '@/services/screening/types.js';
@@ -243,7 +246,7 @@ describe('ingest parser fuzz invariants', () => {
     expect(await collect(streamLeiLevel1FromBytes(bytes()))).toHaveLength(0);
   });
 
-  it('resolves OFAC cross-references, feature identifiers, and birthdates the same buffered and streamed', async () => {
+  it('resolves OFAC cross-references, feature identifiers, descriptive features, and birthdates the same buffered and streamed', async () => {
     const random = mulberry32(0x0fac22);
     for (let round = 0; round < 40; round++) {
       const doc = randomOfacCrossReferenceDocument(random);
@@ -269,6 +272,9 @@ describe('ingest parser fuzz invariants', () => {
         );
         expect(designation.payload.datesOfBirth, `round ${round} party ${index}`).toEqual(
           expected?.datesOfBirth,
+        );
+        expect(designation.payload.features, `round ${round} party ${index}`).toEqual(
+          expected?.features,
         );
       }
 
@@ -407,6 +413,79 @@ describe('near-miss designation fuzzing', () => {
   });
 });
 
+describe('stoplist admission fuzzing', () => {
+  let standalone: SeededService | undefined;
+
+  afterEach(async () => {
+    await standalone?.cleanup();
+  });
+
+  it('admits a one-edit variant of the distinctive word, never a lookalike sharing only stoplist tokens (sanctions names)', async () => {
+    standalone = await freshService();
+    const cases = stoplistCases(mulberry32(0x55_5704), 40);
+    const designations = cases.flatMap((c, round) =>
+      [c.target, ...c.lookalikes].map((name, i) =>
+        designation('ofac_sdn', `SL${round}-${i}`, name),
+      ),
+    );
+    await standalone.service.ingestDesignations(designations);
+    await standalone.service.markSanctionsReady(designations.length);
+
+    for (const [round, c] of cases.entries()) {
+      const result = await standalone.service.screenName(
+        {
+          query: c.query,
+          entityType: 'any',
+          matchMode: 'fuzzy',
+          sources: [...SOURCE_CODES],
+          minScore: STOPLIST_FUZZ_FLOOR,
+          limit: 100,
+        },
+        createMockContext(),
+      );
+      const admitted = result.hits.map((hit) => hit.sourceEntryId);
+      expect(admitted, `${c.query} → ${c.target}`).toContain(`SL${round}-0`);
+      for (const [i, lookalike] of c.lookalikes.entries()) {
+        expect(admitted, `${c.query} admitted ${lookalike}`).not.toContain(`SL${round}-${i + 1}`);
+      }
+    }
+  });
+
+  it('admits a one-edit variant of the distinctive word, never a lookalike sharing only stoplist tokens (GLEIF names)', async () => {
+    standalone = await freshService();
+    const cases = stoplistCases(mulberry32(0x55_1e15), 40);
+    const lei = (round: number, i: number) => `${`SL${round}L${i}`.padEnd(18, '0')}42`;
+    const entities = cases.flatMap((c, round) =>
+      [c.target, ...c.lookalikes].map((legalName, i) => ({
+        lei: lei(round, i),
+        legalName,
+        otherNames: [],
+        status: 'ISSUED',
+      })),
+    );
+    await standalone.service.ingestLeiEntities(entities);
+    await standalone.service.markLeiReady(entities.length, undefined, { namesIndexed: true });
+
+    for (const [round, c] of cases.entries()) {
+      const result = await standalone.service.resolveEntity(
+        {
+          query: c.query,
+          matchMode: 'fuzzy',
+          status: 'any',
+          minScore: STOPLIST_FUZZ_FLOOR,
+          limit: 100,
+        },
+        createMockContext(),
+      );
+      const admitted = result.matches.map((match) => match.lei);
+      expect(admitted, `${c.query} → ${c.target}`).toContain(lei(round, 0));
+      for (const [i, lookalike] of c.lookalikes.entries()) {
+        expect(admitted, `${c.query} admitted ${lookalike}`).not.toContain(lei(round, i + 1));
+      }
+    }
+  });
+});
+
 function designation(
   source: NormalizedDesignation['source'],
   sourceEntryId: string,
@@ -440,12 +519,120 @@ function oneEditVariants(value: string): string[] {
   return variants;
 }
 
+/** The Jaro-Winkler floor the stoplist property screens at — the configured default, pinned. */
+const STOPLIST_FUZZ_FLOOR = 0.85;
+
+interface StoplistCase {
+  /** Names that share every stoplist token of the query and its blocking prefix, and nothing else. */
+  lookalikes: string[];
+  /** A one-edit variant of the target's distinctive word among one to three stoplist tokens. */
+  query: string;
+  /** The distinctive word, with up to two stoplist tokens of its own. */
+  target: string;
+}
+
+/**
+ * Cases for the fuzzy gate's stoplist rule (#55). Each round draws a distinctive
+ * word — 7–11 letters under a three-letter prefix no other round uses, below the
+ * floor against every stoplist token — and queries a one-edit variant of it among one
+ * to three random stoplist tokens. Its lookalikes carry every one of those tokens
+ * beside a different word under the same prefix, so the prefix block pools them
+ * and the admission gate alone decides. The edit falls past the prefix to keep the
+ * target in that block: this property is about admission, not blocking. A
+ * lookalike whose word is near the variant, or whose whole name is near the whole
+ * query (the whole-string arm, which counts every token by design), shares more
+ * than stoplist tokens and is redrawn.
+ */
+function stoplistCases(random: () => number, rounds: number): StoplistCase[] {
+  const letters = [...'abcdefghijklmnopqrstuvwxyz'];
+  const stoplist = [...FUZZY_STOPLIST];
+  const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+  const capitalize = (value: string) => `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+  const shuffle = (items: string[]): string[] => {
+    for (let i = items.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [items[i], items[j]] = [items[j] as string, items[i] as string];
+    }
+    return items;
+  };
+  const word = (prefix: string): string => {
+    const length = 7 + Math.floor(random() * 5);
+    let value = prefix;
+    while (value.length < length) value += pick(letters);
+    return value;
+  };
+  const stoplisted = (count: number): string[] => {
+    const tokens = new Set<string>();
+    while (tokens.size < count) tokens.add(pick(stoplist));
+    return [...tokens].map((token) => token.toUpperCase());
+  };
+  const oneEdit = (value: string): string => {
+    const at = 3 + Math.floor(random() * (value.length - 3));
+    const other = pick(letters.filter((letter) => letter !== value[at]));
+    const substituted = `${value.slice(0, at)}${other}${value.slice(at + 1)}`;
+    switch (pick(['substitute', 'delete', 'insert', 'transpose'] as const)) {
+      case 'delete':
+        return `${value.slice(0, at)}${value.slice(at + 1)}`;
+      case 'insert':
+        return `${value.slice(0, at)}${other}${value.slice(at)}`;
+      case 'transpose': {
+        const next = value[at + 1];
+        return next && next !== value[at]
+          ? `${value.slice(0, at)}${next}${value[at]}${value.slice(at + 2)}`
+          : substituted;
+      }
+      default:
+        return substituted;
+    }
+  };
+
+  const prefixes = new Set<string>();
+  const cases: StoplistCase[] = [];
+  while (cases.length < rounds) {
+    const prefix = Array.from({ length: 3 }, () => pick(letters)).join('');
+    if (prefixes.has(prefix)) continue;
+    const distinctive = word(prefix);
+    const variant = oneEdit(distinctive);
+    if (
+      stoplist.some(
+        (token) =>
+          jaroWinkler(distinctive, token) >= STOPLIST_FUZZ_FLOOR ||
+          jaroWinkler(variant, token) >= STOPLIST_FUZZ_FLOOR,
+      )
+    ) {
+      continue;
+    }
+    prefixes.add(prefix);
+    // A one-edit variant past the prefix stays well inside the floor of its word.
+    expect(jaroWinkler(variant, distinctive), variant).toBeGreaterThanOrEqual(STOPLIST_FUZZ_FLOOR);
+
+    const queryStoplisted = stoplisted(1 + Math.floor(random() * 3));
+    const query = shuffle([capitalize(variant), ...queryStoplisted]).join(' ');
+    const targetStoplisted = stoplisted(Math.floor(random() * 3));
+    const target = shuffle([capitalize(distinctive), ...targetStoplisted]).join(' ');
+    const lookalikes: string[] = [];
+    while (lookalikes.length < 4) {
+      const other = word(prefix);
+      const name = shuffle([capitalize(other), ...queryStoplisted]).join(' ');
+      if (
+        jaroWinkler(variant, other) >= STOPLIST_FUZZ_FLOOR ||
+        jaroWinkler(fold(query), fold(name)) >= STOPLIST_FUZZ_FLOOR
+      ) {
+        continue;
+      }
+      lookalikes.push(name);
+    }
+    cases.push({ lookalikes, query, target });
+  }
+  return cases;
+}
+
 interface CrossReferenceDocument {
   /** Per party, the detail groups a correct resolution produces. */
-  expected: Pick<
+  expected: (Pick<
     DesignationPayload,
     'addresses' | 'datesOfBirth' | 'identifiers' | 'nationalities'
-  >[];
+  > & { features: FeatureRecord[] })[];
   partyIds: string[];
   xml: string;
 }
@@ -453,9 +640,10 @@ interface CrossReferenceDocument {
 /**
  * An OFAC advanced document whose parties point at a random mix of published,
  * never-published, placeholder, and partial `<Location>`s and `<IDRegDocument>`s,
- * carry a random mix of identifier-class and descriptive text features, and
- * publish Birthdates in every `DatePeriod` shape OFAC uses — with the detail
- * groups a correct resolution yields computed alongside it.
+ * carry a random mix of identifier-class and descriptive text, lookup, and
+ * location features, and publish Birthdates and a descriptive date in every
+ * `DatePeriod` shape OFAC uses — with the detail groups a correct resolution
+ * yields computed alongside it.
  */
 function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceDocument {
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
@@ -546,20 +734,29 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
     const features: string[] = [];
     const addresses: AddressRecord[] = [];
     const nationalities: string[] = [];
+    // Descriptive features, in document order: a location, text, lookup, or date.
+    const descriptive: FeatureRecord[] = [];
     const featureCount = Math.floor(random() * 5);
     for (let f = 0; f < featureCount; f++) {
       const lid = String(1 + Math.floor(random() * 8));
-      const nationality = random() < 0.4;
+      const kind = pick(['nationality', 'address', 'registration'] as const);
+      const typeId = { nationality: '10', address: '25', registration: '365' }[kind];
       features.push(
-        `<Feature FeatureTypeID="${nationality ? '10' : '25'}"><FeatureVersion><VersionLocation LocationID="${lid}" /></FeatureVersion></Feature>`,
+        `<Feature FeatureTypeID="${typeId}"><FeatureVersion><VersionLocation LocationID="${lid}" /></FeatureVersion></Feature>`,
       );
       const target = rendered.get(lid);
-      if (target && nationality) nationalities.push(target.full);
-      if (target && !nationality) addresses.push(target);
+      if (!target) continue;
+      if (kind === 'nationality') nationalities.push(target.full);
+      if (kind === 'address') addresses.push(target);
+      if (kind === 'registration') {
+        descriptive.push({ type: 'Nationality of Registration', value: target.full });
+      }
     }
 
     // Text features: identifier-class labels land after the documents, in document
-    // order; a descriptive label, an unresolved type, or an empty value adds nothing.
+    // order; a descriptive label is a feature, and a lookup is one when its
+    // reference resolves; an unresolved type or reference, or an empty value, adds
+    // nothing.
     const featureIdentifiers: IdentifierRecord[] = [];
     const textCount = Math.floor(random() * 4);
     for (let t = 0; t < textCount; t++) {
@@ -572,6 +769,8 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
         'xbt',
         'new-currency',
         'title',
+        'gender',
+        'unresolved-gender',
         'unresolved',
         'empty',
       ]);
@@ -594,6 +793,14 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
           break;
         case 'title':
           features.push(text('26', value));
+          descriptive.push({ type: 'Title', value });
+          break;
+        case 'gender':
+        case 'unresolved-gender':
+          features.push(
+            `<Feature FeatureTypeID="224"><FeatureVersion><VersionDetail DetailTypeID="1431" DetailReferenceID="${kind === 'gender' ? '91526' : '99999'}" /></FeatureVersion></Feature>`,
+          );
+          if (kind === 'gender') descriptive.push({ type: 'Gender', value: 'Male' });
           break;
         case 'unresolved':
           features.push(text('7777', value));
@@ -606,12 +813,25 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
       }
     }
 
+    // Birthdates, and the same DatePeriod shapes as a descriptive date.
     const datesOfBirth: DobRecord[] = [];
     const birthCount = Math.floor(random() * 3);
     for (let b = 0; b < birthCount; b++) {
       const birth = randomOfacBirthdate(random, pick);
-      features.push(birth.xml);
-      datesOfBirth.push(birth.expected);
+      if (random() < 0.5) {
+        features.push(birth.xml);
+        datesOfBirth.push(birth.expected);
+      } else {
+        features.push(birth.xml.replace('FeatureTypeID="8"', 'FeatureTypeID="125"'));
+        const { date, circa } = birth.expected;
+        if (date) {
+          descriptive.push({
+            type: 'Aircraft Manufacture Date',
+            value: date,
+            ...(circa ? { circa } : {}),
+          });
+        }
+      }
     }
 
     const fixedRef = `900${p}`;
@@ -624,6 +844,7 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
       identifiers: uniqueJson([...identifiers, ...featureIdentifiers]),
       datesOfBirth: uniqueJson(datesOfBirth),
       nationalities: uniqueJson(nationalities),
+      features: uniqueJson(descriptive),
     });
   }
 
@@ -631,6 +852,7 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
     <ReferenceValueSets>
       <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
       <CountryValues>${[...countries].map(([id, name]) => `<Country ID="${id}">${name}</Country>`).join('')}<Country ID="9">undetermined</Country></CountryValues>
+      <DetailReferenceValues><DetailReference ID="91526">Male</DetailReference></DetailReferenceValues>
       <FeatureTypeValues>
         <FeatureType ID="8">Birthdate</FeatureType>
         <FeatureType ID="10">Nationality Country</FeatureType>
@@ -638,7 +860,10 @@ function randomOfacCrossReferenceDocument(random: () => number): CrossReferenceD
         <FeatureType ID="14">Website</FeatureType>
         <FeatureType ID="25">Location</FeatureType>
         <FeatureType ID="26">Title</FeatureType>
+        <FeatureType ID="125">Aircraft Manufacture Date</FeatureType>
+        <FeatureType ID="224">Gender</FeatureType>
         <FeatureType ID="344">Digital Currency Address - XBT</FeatureType>
+        <FeatureType ID="365">Nationality of Registration</FeatureType>
         <FeatureType ID="4000">Digital Currency Address - NEWC</FeatureType>
       </FeatureTypeValues>
       <IDRegDocTypeValues><IDRegDocType ID="1570">Passport</IDRegDocType></IDRegDocTypeValues>

@@ -19,9 +19,9 @@
  *
  * **The OFAC deferred join.** OFAC advanced is not a flat repeating document:
  * `<ReferenceValueSets>` opens it, but `<SanctionsEntries>` — which supplies
- * `program` and `designationDate` — is published *after* every
+ * `program`, `designationDate`, and `legalBasis` — is published *after* every
  * `<DistinctParty>`. A single forward pass cannot attach those fields inline.
- * Both columns are nullable, so parties stream out as they are read and the
+ * The columns are nullable, so parties stream out as they are read and the
  * programme fields are collected behind them into {@link DeferredDesignationFields},
  * applied by the sync as an UPDATE once the source's rows have landed. The other
  * direction is forward: a party's addresses, nationalities, and identity
@@ -51,6 +51,7 @@ import type {
   AddressRecord,
   DobRecord,
   EntityType,
+  FeatureRecord,
   IdentifierRecord,
   NameRecord,
   NormalizedDesignation,
@@ -71,9 +72,10 @@ import {
  */
 export type DeferredDesignationFields = ReadonlyMap<string, DeferredColumns>;
 
-/** The two columns OFAC publishes after the parties they belong to. */
+/** The three columns OFAC publishes after the parties they belong to. */
 export interface DeferredColumns {
   designationDate?: string;
+  legalBasis?: string;
   program?: string;
 }
 
@@ -158,28 +160,32 @@ function opt<K extends string>(key: K, value: string | undefined): Record<K, str
 // ─── Detail groups ──────────────────────────────────────────────────────────────
 //
 // Shared by every normalizer's identifiers, addresses, dates and places of birth,
-// and nationalities. Absence stays absence: a component that carries no letter or
-// digit, or that is a placeholder, is not published; an entry with no published
-// component is skipped; and nothing is inferred from another group. A date is ISO
-// 8601 at the precision its source published, never widened to a day it did not
-// name; a value with no ISO form stays as published.
+// nationalities, and features. Absence stays absence: a component that carries no
+// letter or digit, or that is a placeholder, is not published; an entry with no
+// published component is skipped; and nothing is inferred from another group. A
+// date is ISO 8601 at the precision its source published, never widened to a day
+// it did not name; a value with no ISO form stays as published.
 
 /**
  * Whole values the sources write where they have nothing to publish: the EU's
- * `UNKNOWN` country and the UN's `na`. Matched case-insensitively against the
- * whole component only. Names never pass through here, so a name part such as the
- * surname `Na` is untouched; and no detail read takes a country *code* (every
- * country is read by name), so Namibia's ISO code `NA` never reaches this test.
+ * `UNKNOWN` country, the UN's `na`, and the UK's `N/A` passport number. Matched
+ * case-insensitively against the whole component, with `.` and `/` dropped so
+ * every spelling of "not available" (`N/A`, `n.a.`) reads as `na`. Names never
+ * pass through here, so a name part such as the surname `Na` is untouched; and
+ * no detail read takes a country *code* (every country is read by name), so
+ * Namibia's ISO code `NA` never reaches this test.
  */
 const PLACEHOLDER_VALUES = new Set(['na', 'unknown']);
 
 /**
  * One published detail component: text carrying a letter or digit that is not a
- * placeholder, so a lone `-`, `UNKNOWN`, or `na` reads as absent.
+ * placeholder, so a lone `-`, `UNKNOWN`, `na`, or `N/A` reads as absent. The
+ * entity cross-reference applies the same rule to a GLEIF registration number,
+ * which publishes `N/A` and `n.a.` the same way.
  */
-function componentText(value: unknown): string | undefined {
+export function componentText(value: unknown): string | undefined {
   const text = asText(value);
-  if (!text || PLACEHOLDER_VALUES.has(text.toLowerCase())) return;
+  if (!text || PLACEHOLDER_VALUES.has(text.toLowerCase().replace(/[./]/gu, ''))) return;
   return /[\p{L}\p{N}]/u.test(text) ? text : undefined;
 }
 
@@ -472,6 +478,7 @@ export async function* streamOfacFromText(
 ): AsyncGenerator<NormalizedDesignation> {
   let refs = emptyOfacReferenceSets();
   const xrefs = emptyOfacCrossReferences();
+  const entries = emptyOfacEntryIndex(state.deferredFields);
   for await (const fragment of scanRecordFragments(textChunks, OFAC_RECORD_TAGS)) {
     const body = recordBody(parseXml<Record<string, unknown>>(fragment.xml), fragment.name);
     switch (fragment.name) {
@@ -485,7 +492,7 @@ export async function* streamOfacFromText(
         foldOfacIdRegDocument(body, refs, xrefs);
         continue;
       case 'SanctionsEntry':
-        foldOfacSanctionsEntry(body, state.deferredFields);
+        foldOfacSanctionsEntry(body, source, refs, entries);
         continue;
     }
     if (fragment.name === 'sdnEntry') {
@@ -548,7 +555,7 @@ export function parseOfac(
   for (const document of elementsAt(sanctions, 'IDRegDocuments', 'IDRegDocument')) {
     foldOfacIdRegDocument(document as Record<string, unknown>, refs, xrefs);
   }
-  const programsByProfile = buildOfacProgramIndex(sanctions);
+  const programsByProfile = buildOfacProgramIndex(sanctions, source, refs);
   return elementsAt(sanctions, 'DistinctParties', 'DistinctParty')
     .map((p) =>
       parseOfacAdvanced(
@@ -578,10 +585,20 @@ interface OfacReferenceSets {
    * country is left out, so a reference to it reads as absence.
    */
   country: Map<string, string>;
+  /** DetailReference ID → label (705 = Tug, 91526 = Male, …): a lookup feature's value. */
+  detailReference: Map<string, string>;
   /** FeatureType ID → label (8 = Birthdate, 9 = Place of Birth, 25 = Location, …). */
   featureType: Map<string, string>;
   /** IDRegDocType ID → label (1570 = Cedula No., …). */
   idRegDocType: Map<string, string>;
+  /**
+   * LegalBasis ID → its `LegalBasisShortRef` (92049 = Executive Order 14024
+   * (Russia)). OFAC's `Unknown` basis is left out, so a reference to it reads as
+   * absence.
+   */
+  legalBasis: Map<string, string>;
+  /** List ID → label (1550 = SDN List, 91512 = Consolidated List, …). */
+  list: Map<string, string>;
   /** LocPartType ID → label (1451 = ADDRESS1, 1454 = CITY, 1 = Unknown, …). */
   locPartType: Map<string, string>;
   /** PartySubType ID → label (Vessel / Aircraft / Unknown). */
@@ -595,8 +612,11 @@ function emptyOfacReferenceSets(): OfacReferenceSets {
   return {
     aliasType: new Map(),
     country: new Map(),
+    detailReference: new Map(),
     featureType: new Map(),
     idRegDocType: new Map(),
+    legalBasis: new Map(),
+    list: new Map(),
     locPartType: new Map(),
     subTypeToPartyType: new Map(),
     subTypeLabel: new Map(),
@@ -719,11 +739,21 @@ function buildOfacReferenceSets(sets: Record<string, unknown>): OfacReferenceSet
   }
   const country = ofacLabels(sets, 'CountryValues', 'Country');
   for (const [id, name] of country) if (name.toLowerCase() === 'undetermined') country.delete(id);
+  const legalBasis = new Map<string, string>();
+  for (const raw of elementsAt(sets, 'LegalBasisValues', 'LegalBasis')) {
+    const basis = raw as Record<string, unknown>;
+    const id = asText(basis['@_ID']);
+    const shortRef = componentText(basis['@_LegalBasisShortRef']);
+    if (id && shortRef) legalBasis.set(id, shortRef);
+  }
   return {
     aliasType: ofacLabels(sets, 'AliasTypeValues', 'AliasType'),
     country,
+    detailReference: ofacLabels(sets, 'DetailReferenceValues', 'DetailReference'),
     featureType: ofacLabels(sets, 'FeatureTypeValues', 'FeatureType'),
     idRegDocType: ofacLabels(sets, 'IDRegDocTypeValues', 'IDRegDocType'),
+    legalBasis,
+    list: ofacLabels(sets, 'ListValues', 'List'),
     locPartType: ofacLabels(sets, 'LocPartTypeValues', 'LocPartType'),
     subTypeToPartyType,
     subTypeLabel,
@@ -747,45 +777,107 @@ function ofacLabels(
 }
 
 /**
- * Build a `profileId → { program, designationDate }` index from the advanced
- * schema's `<SanctionsEntries>`. The programme name is published as a
- * `<SanctionsMeasure><Comment>` and the designation date as the `<EntryEvent>`
- * `<Date>` (Year/Month/Day elements). Keyed by `ProfileID` (== the DistinctParty
- * `FixedRef`).
+ * Build a `profileId → { program, designationDate, legalBasis }` index from the
+ * advanced schema's `<SanctionsEntries>` — see {@link foldOfacSanctionsEntry}.
+ * Keyed by `ProfileID` (== the DistinctParty `FixedRef`).
  */
-function buildOfacProgramIndex(sanctions: Record<string, unknown>): Map<string, DeferredColumns> {
-  const out = new Map<string, DeferredColumns>();
-  const entries = (sanctions.SanctionsEntries ?? {}) as Record<string, unknown>;
-  for (const raw of asArray(entries.SanctionsEntry as unknown)) {
-    foldOfacSanctionsEntry(raw as Record<string, unknown>, out);
+function buildOfacProgramIndex(
+  sanctions: Record<string, unknown>,
+  source: SourceCode,
+  refs: OfacReferenceSets,
+): Map<string, DeferredColumns> {
+  const index = emptyOfacEntryIndex(new Map());
+  for (const raw of elementsAt(sanctions, 'SanctionsEntries', 'SanctionsEntry')) {
+    foldOfacSanctionsEntry(raw as Record<string, unknown>, source, refs, index);
   }
-  return out;
+  return index.columns;
+}
+
+/** OFAC's label for the one list `ofac_sdn` publishes; `ofac_consolidated` publishes every other. */
+const OFAC_SDN_LIST = 'SDN List';
+
+/**
+ * Whether the list labelled `list` is one `source` publishes: the SDN List for
+ * `ofac_sdn`, any other list for `ofac_consolidated`. Each file carries a
+ * party's entries on lists the other file publishes (a Consolidated party's SDN
+ * List entry, an SDN party's Consolidated List entry), and their dates differ.
+ */
+function isOfacSourceList(source: SourceCode, list: string): boolean {
+  return source === 'ofac_sdn' ? list === OFAC_SDN_LIST : list !== OFAC_SDN_LIST;
 }
 
 /**
- * Fold one `<SanctionsEntry>` into a programme index, keyed by `ProfileID`.
- * Several entries can share a profile; a later entry overrides a field it
- * publishes and leaves the rest of the earlier entry's values in place. Shared
- * by the buffered {@link buildOfacProgramIndex} and the streaming scan, so both
- * derive the same index from the same document order.
+ * Joins the legal bases a designation publishes. The EU's regulation titles
+ * carry commas (`2015/2043 (OJ L 300, p. 1)`), so they cannot be the separator.
+ */
+const LEGAL_BASIS_SEPARATOR = '; ';
+
+/**
+ * The `<SanctionsEntries>` index as it folds: the deferred columns per profile,
+ * plus each profile's legal bases as a list, so a basis a later entry repeats
+ * collapses into the one already read.
+ */
+interface OfacEntryIndex {
+  /** Profile ID → every legal basis folded so far, in document order, duplicates collapsed. */
+  bases: Map<string, string[]>;
+  /** Profile ID → the deferred columns the entries folded so far publish. */
+  columns: Map<string, DeferredColumns>;
+}
+
+/** An empty entry index whose columns land in `columns`. */
+function emptyOfacEntryIndex(columns: Map<string, DeferredColumns>): OfacEntryIndex {
+  return { bases: new Map(), columns };
+}
+
+/**
+ * Fold one `<SanctionsEntry>` into the entry index, keyed by `ProfileID`. A party
+ * has one entry per OFAC list it is on, and an entry has one `<EntryEvent>` per
+ * legal basis it cites.
+ *
+ * - `program` — the entry's `<SanctionsMeasure><Comment>`s joined; a later entry
+ *   that publishes any replaces an earlier one's, on any list.
+ * - `designationDate` — the earliest `<EntryEvent><Date>` over the entries on a
+ *   list the source publishes ({@link isOfacSourceList}): when OFAC first put
+ *   the party on one of that file's lists. A later list's own date reflects a
+ *   list reorganization, so a later entry never replaces an earlier date.
+ * - `legalBasis` — the `LegalBasisShortRef` of every event on those same
+ *   entries, in document order, duplicates collapsed.
+ *
+ * An entry whose `ListID` resolves to no label dates nothing and cites nothing,
+ * and an event whose `LegalBasisID` resolves to none cites nothing. Shared by the
+ * buffered {@link buildOfacProgramIndex} and the streaming scan, so both derive
+ * the same index from the same document order.
  */
 function foldOfacSanctionsEntry(
   entry: Record<string, unknown>,
-  index: Map<string, DeferredColumns>,
+  source: SourceCode,
+  refs: OfacReferenceSets,
+  index: OfacEntryIndex,
 ): void {
   const profileId = asText(entry['@_ProfileID']);
   if (!profileId) return;
+  const columns = { ...index.columns.get(profileId) };
   const programs = asArray(entry.SanctionsMeasure as unknown)
     .map((m) => asText((m as Record<string, unknown>).Comment))
     .filter((x): x is string => Boolean(x));
-  const event = (entry.EntryEvent ?? {}) as Record<string, unknown>;
-  const designationDate = composeOfacDate(event.Date as Record<string, unknown> | undefined);
-  const existing = index.get(profileId) ?? {};
-  index.set(profileId, {
-    ...existing,
-    ...(programs.length ? { program: programs.join(', ') } : {}),
-    ...(designationDate ? { designationDate } : {}),
-  });
+  if (programs.length) columns.program = programs.join(', ');
+
+  const list = refs.list.get(asText(entry['@_ListID']) ?? '');
+  if (list && isOfacSourceList(source, list)) {
+    const bases = index.bases.get(profileId) ?? [];
+    for (const raw of asArray(entry.EntryEvent as unknown)) {
+      const event = raw as Record<string, unknown>;
+      const date = composeOfacDate(event.Date as Record<string, unknown> | undefined);
+      if (date && !(columns.designationDate && columns.designationDate <= date)) {
+        columns.designationDate = date;
+      }
+      const basis = refs.legalBasis.get(asText(event['@_LegalBasisID']) ?? '');
+      if (basis && !bases.includes(basis)) bases.push(basis);
+    }
+    index.bases.set(profileId, bases);
+    if (bases.length) columns.legalBasis = bases.join(LEGAL_BASIS_SEPARATOR);
+  }
+  index.columns.set(profileId, columns);
 }
 
 /** A calendar day as `[year, month, day]`, month and day 1-based. */
@@ -916,7 +1008,8 @@ function composeOfacDate(date: Record<string, unknown> | undefined): string | un
  * identifiers are kept — an identity-document type or an identifier-class
  * feature — plus the vessel call sign, which this schema publishes under
  * `vesselInfo`; gender, sanctions notes, and vessel or aircraft descriptors stay
- * out. The schema has no designation-date field, so none is set.
+ * out, and are not read as features either, so this path publishes none. The
+ * schema has no designation-date field, so none is set.
  */
 function parseOfacStandard(
   e: Record<string, unknown>,
@@ -1002,6 +1095,7 @@ function parseOfacStandard(
       addresses,
       datesOfBirth,
       nationalities,
+      features: [],
       ...opt('remarks', remarks),
     },
   };
@@ -1020,7 +1114,7 @@ interface OfacAliasName {
  * `PartyType`), the primary name and typed aliases (via `AliasTypeID` /
  * `LowQuality`), the detail groups (via `Feature` type labels and the
  * cross-reference index), and the identity documents joined on the party's
- * `<Identity ID>`. The programme + designation date come from the
+ * `<Identity ID>`. The programme, designation date, and legal basis come from the
  * `<SanctionsEntries>` index, keyed by profile id. Resilient to the deep nesting
  * and to sparse records; null when the party carries neither a `FixedRef` nor an
  * `ID`, or no usable name. A dangling cross-reference drops only the entry it
@@ -1099,6 +1193,7 @@ function parseOfacAdvanced(
     entityType: mapOfacPartySubType(asText(profile?.['@_PartySubTypeID']), refs),
     primaryName: primaryEntry.name,
     ...(program?.program ? { program: program.program } : {}),
+    ...(program?.legalBasis ? { legalBasis: program.legalBasis } : {}),
     ...(program?.designationDate ? { designationDate: program.designationDate } : {}),
     payload: {
       aliases,
@@ -1106,6 +1201,7 @@ function parseOfacAdvanced(
       addresses: dedupe(features.addresses),
       datesOfBirth: birthRecords(features.datesOfBirth, features.placesOfBirth),
       nationalities: dedupe(features.nationalities),
+      features: dedupe(features.features),
     },
   };
 }
@@ -1144,6 +1240,7 @@ function mapOfacPartySubType(subTypeId: string | undefined, refs: OfacReferenceS
 interface OfacFeatureValues {
   addresses: AddressRecord[];
   datesOfBirth: BirthDate[];
+  features: FeatureRecord[];
   identifiers: IdentifierRecord[];
   nationalities: string[];
   placesOfBirth: string[];
@@ -1325,7 +1422,9 @@ function isOfacStandardIdentifier(idType: string): boolean {
  * identifier-class feature ({@link isOfacIdentifierFeature}) is an identifier
  * typed by its label verbatim, its `VersionDetail` text the value, with no
  * country. Every other feature (gender, title, vessel flag, registration
- * country, …) has no normalized field.
+ * country, …) is a descriptive feature typed by its label verbatim
+ * ({@link ofacFeatureValues}), so a label OFAC adds later lands without a code
+ * change. A feature whose type resolves to no label publishes nothing.
  */
 function extractOfacFeatures(
   profile: Record<string, unknown> | undefined,
@@ -1335,6 +1434,7 @@ function extractOfacFeatures(
   const values: OfacFeatureValues = {
     addresses: [],
     datesOfBirth: [],
+    features: [],
     identifiers: [],
     nationalities: [],
     placesOfBirth: [],
@@ -1369,14 +1469,44 @@ function extractOfacFeatures(
           values.nationalities.push(...locations.map((l) => l.full));
           break;
         default:
-          if (label && isOfacIdentifierFeature(label)) {
+          if (!label) break;
+          if (isOfacIdentifierFeature(label)) {
             const value = componentText(version.VersionDetail);
             if (value) values.identifiers.push({ type: label, value });
+          } else {
+            values.features.push(...ofacFeatureValues(label, version, refs, locations));
           }
       }
     }
   }
   return values;
+}
+
+/**
+ * A descriptive feature version's values, typed `type`, in whichever of OFAC's
+ * four value shapes it publishes: a `DatePeriod` as ISO 8601 at its published
+ * precision (the Birthdate rule), `circa` when flagged approximate; a
+ * `VersionLocation` as its rendered location; a `VersionDetail` whose
+ * `DetailReferenceID` names a `<DetailReference>`, as that label; or the
+ * `VersionDetail` text. A reference that resolves to nothing and an empty value
+ * publish nothing.
+ */
+function ofacFeatureValues(
+  type: string,
+  version: Record<string, unknown>,
+  refs: OfacReferenceSets,
+  locations: readonly AddressRecord[],
+): FeatureRecord[] {
+  const date = ofacPeriodDate(elementsAt(version, 'DatePeriod')[0]);
+  const details = elementsAt(version, 'VersionDetail').map((detail) => {
+    const referenceId = asText((detail as Record<string, unknown>)['@_DetailReferenceID']);
+    return componentText(referenceId ? refs.detailReference.get(referenceId) : detail);
+  });
+  return [
+    ...(date ? [{ type, value: date.date, ...(date.circa ? { circa: date.circa } : {}) }] : []),
+    ...locations.map((location) => ({ type, value: location.full })),
+    ...details.flatMap((value) => (value ? [{ type, value }] : [])),
+  ];
 }
 
 function mapOfacType(t: string | undefined): EntityType {
@@ -1470,6 +1600,14 @@ function parseEuEntity(
       'program',
       asText((e.regulation as Record<string, unknown> | undefined)?.['@_programme']),
     ),
+    // The entity-level regulation's title (`2024/1488 (OJ L27052024)`) — never the
+    // `regulationSummary` a detail element carries for its own amendment.
+    ...opt(
+      'legalBasis',
+      dedupe(elementsAt(e, 'regulation').flatMap((r) => euText(r, 'numberTitle') ?? [])).join(
+        LEGAL_BASIS_SEPARATOR,
+      ),
+    ),
     // The entity's own designation date. The entity-level <regulation> is the
     // latest act touching the entry (usually an amendment), so its publication
     // date is not when the entry was designated.
@@ -1484,6 +1622,7 @@ function parseEuEntity(
       addresses: dedupe(asArray(e.address as unknown).flatMap(euAddress)),
       datesOfBirth: dedupe(asArray(e.birthdate as unknown).flatMap(euBirth)),
       nationalities: dedupe(citizenships),
+      features: [],
     },
   };
 }
@@ -1636,6 +1775,10 @@ function parseUkDesignation(
     entityType: mapUkType(asText(d.IndividualEntityShip ?? d.GroupType)),
     primaryName: primary,
     ...opt('program', asText(d.RegimeName)),
+    // The list names a regime by the regulations it is made under (`The Russia
+    // (Sanctions) (EU Exit) Regulations 2019`), so the name is the designation's
+    // legal basis as well as its programme.
+    ...opt('legalBasis', asText(d.RegimeName)),
     ...opt('designationDate', designated && ukDate(designated)),
     // The legacy OFSI Group ID. The UK list issues none for a designation made
     // after 28 Jan 2026, and one Group ID can cover two designations.
@@ -1695,9 +1838,29 @@ function parseUkDesignation(
         }),
       ),
       nationalities: dedupe(textsAt(individuals, 'Nationalities', 'Nationality')),
+      features: dedupe(ukShipFeatures(d)),
       ...opt('remarks', asText(d.OtherInformation)),
     },
   };
+}
+
+/**
+ * A ship's published details but its IMO number (an identifier), typed by the
+ * element the list publishes each value in (`CurrentBelievedFlagOfShip`,
+ * `TypeOfShip`, `YearBuilt`, …), in document order. Each detail sits in its own
+ * wrapper element (`CurrentBelievedFlagOfShips`, `YearsBuilt`), which names no value.
+ */
+function ukShipFeatures(d: Record<string, unknown>): FeatureRecord[] {
+  return elementsAt(d, 'ShipDetails', 'Ship').flatMap((ship) =>
+    Object.entries(ship as Record<string, unknown>)
+      .filter(([wrapper]) => wrapper !== 'IMONumbers')
+      .flatMap(([, wrappers]) => asArray(wrappers))
+      .flatMap((wrapper) =>
+        typeof wrapper === 'object' && wrapper !== null ? Object.entries(wrapper) : [],
+      )
+      .filter(([type]) => !type.startsWith('@_') && type !== '#text')
+      .flatMap(([type, values]) => textsAt(values).map((value) => ({ type, value }))),
+  );
 }
 
 /**
@@ -1867,6 +2030,7 @@ function parseUnEntry(
       ),
       datesOfBirth: birthRecords(dates, places),
       nationalities,
+      features: [],
       ...opt('remarks', asText(e.COMMENTS1)),
     },
   };
@@ -1932,8 +2096,8 @@ export const MAX_PRUNE_SHARE = 0.5;
 export interface SanctionsSyncOptions {
   /**
    * Apply a deferring source's columns once its harvest completed: each kept
-   * designation gets its entry in `fields` (keyed by source entry id), or neither
-   * column when the source published none for it. The runner persists each
+   * designation gets its entry in `fields` (keyed by source entry id), or none of
+   * the columns when the source published none for it. The runner persists each
    * yielded page before resuming the generator, so every kept row is in the
    * mirror by the time this is called.
    */
@@ -2018,6 +2182,7 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
     for (const row of rows) {
       const fields = stored.get(String(row.id));
       row.program = fields?.program ?? null;
+      row.legal_basis = fields?.legalBasis ?? null;
       row.designation_date = fields?.designationDate ?? null;
     }
     return rows;
@@ -2092,7 +2257,7 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
 /**
  * The error a harvest interrupted by the run's signal ends the run with. A time
  * bound (a `TimeoutError` reason) is reported as that, naming the source it
- * stopped in: the fetch it interrupted reports only that it was aborted. Any
+ * stopped in and the bound: the fetch it interrupted names neither. Any
  * other abort is the caller's cancellation and stays as the harvest raised it.
  */
 function abortedHarvest(signal: AbortSignal, source: SourceCode, err: unknown): unknown {

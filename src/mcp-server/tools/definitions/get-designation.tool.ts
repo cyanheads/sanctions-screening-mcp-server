@@ -2,9 +2,9 @@
  * @fileoverview `sanctions_get_designation` — the full record for one sanctions
  * entry by source list + entry ID or published reference number. The drill-in
  * after sanctions_screen_name surfaces a candidate: all aliases, identifiers,
- * addresses, dates/places of birth, nationalities, program, legal basis, and
- * designation date. Still a screening aid — the record is what the source
- * published, not a determination.
+ * addresses, dates/places of birth, nationalities, descriptive features, program,
+ * legal basis, and designation date. Still a screening aid — the record is what
+ * the source published, not a determination.
  * @module mcp-server/tools/definitions/get-designation.tool
  */
 
@@ -17,7 +17,7 @@ import { SCREENING_CAVEAT } from './_shared.js';
 export const getDesignationTool = tool('sanctions_get_designation', {
   title: 'sanctions-screening-mcp-server: get designation',
   description:
-    "Fetch the full record for one sanctions designation by source list + entry ID or the list's published reference number — the drill-in after sanctions_screen_name or sanctions_screen_identifier surfaces a candidate, or the lookup for a reference a notice cites (UN QDe.004, EU EU.27.28, UK OFSI Group ID). Returns all published aliases, identifiers (passport, national ID, tax and registration numbers, SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, websites), addresses, dates and places of birth at the precision the source published, nationalities, sanctioning program, legal basis, and designation date. The record reflects exactly what the source published; missing fields mean the source omitted them. This is a screening aid — the designation record supports a compliance review, it is not itself a determination.",
+    "Fetch the full record for one sanctions designation by source list + entry ID or the list's published reference number — the drill-in after sanctions_screen_name or sanctions_screen_identifier surfaces a candidate, or the lookup for a reference a notice cites (UN QDe.004, EU EU.27.28, UK OFSI Group ID). Returns all published aliases, identifiers (passport, national ID, tax and registration numbers, SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, websites), addresses, dates and places of birth at the precision the source published, nationalities, descriptive features (a vessel's flag, type, and tonnage; an aircraft's model and operator; a title or gender; sanctions notes), sanctioning program, legal basis, and designation date. The record reflects exactly what the source published; missing fields mean the source omitted them. This is a screening aid — the designation record supports a compliance review, it is not itself a determination.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     source: z
@@ -47,11 +47,18 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       .describe('Entity classification as published.'),
     primaryName: z.string().describe('Primary published name.'),
     program: z.string().optional().describe('Sanctioning program / regime, when published.'),
-    legalBasis: z.string().optional().describe('Statutory / regulatory basis, when published.'),
+    legalBasis: z
+      .string()
+      .optional()
+      .describe(
+        "Statutory / regulatory basis as the list publishes it — OFAC's legal-basis references, the EU regulation title, the UK regime's regulations — several joined with '; '. Absent when unpublished; the UN list publishes none.",
+      ),
     designationDate: z
       .string()
       .optional()
-      .describe("The source's own designation date as YYYY-MM-DD; absent when unpublished."),
+      .describe(
+        "The source's own designation date as YYYY-MM-DD; absent when unpublished. An OFAC party is dated from its entries on the lists that file publishes, so its ofac_sdn and ofac_consolidated records can differ.",
+      ),
     aliases: z
       .array(
         z
@@ -115,6 +122,30 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       )
       .describe('Published dates and places of birth (persons).'),
     nationalities: z.array(z.string()).describe('Published nationalities / citizenships.'),
+    features: z
+      .array(
+        z
+          .object({
+            type: z
+              .string()
+              .describe(
+                "The source's own label for the value, verbatim (e.g. Vessel Flag, VESSEL TYPE, Secondary sanctions risk:, CurrentBelievedFlagOfShip).",
+              ),
+            value: z
+              .string()
+              .describe(
+                'The value as published; a date is ISO 8601 at the precision the source published.',
+              ),
+            circa: z
+              .literal(true)
+              .optional()
+              .describe('Present when the source flags a date value as approximate.'),
+          })
+          .describe('One published descriptive value.'),
+      )
+      .describe(
+        "Values the source publishes to describe the party rather than identify it, in published order: OFAC's vessel flag, type, and tonnage, aircraft model and operator, title, gender, and sanctions notes; the UK list's ship details. Empty when the source publishes none. Screening never matches on them.",
+      ),
     remarks: z
       .string()
       .optional()
@@ -152,9 +183,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
   async handler(input, ctx) {
     const svc = getScreeningService();
     if (!(await svc.sanctionsReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.', {
-        ...ctx.recoveryFor('mirror_not_ready'),
-      });
+      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.');
     }
 
     const lookup = await svc.resolveDesignation(input.source as SourceCode, input.entryId);
@@ -162,14 +191,13 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       throw ctx.fail(
         'reference_ambiguous',
         `Reference number "${input.entryId.trim()}" is published by ${lookup.sourceEntryIds.length} ${input.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
-        { sourceEntryIds: lookup.sourceEntryIds, ...ctx.recoveryFor('reference_ambiguous') },
+        { sourceEntryIds: lookup.sourceEntryIds },
       );
     }
     if (lookup.kind === 'not_found') {
       throw ctx.fail(
         'designation_not_found',
         `No ${input.source} designation with entry ID or reference number "${input.entryId}".`,
-        { ...ctx.recoveryFor('designation_not_found') },
       );
     }
 
@@ -189,6 +217,8 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       addresses: d.payload.addresses,
       datesOfBirth: d.payload.datesOfBirth,
       nationalities: d.payload.nationalities,
+      // A record stored before the group existed carries none.
+      features: d.payload.features ?? [],
       ...(d.payload.remarks ? { remarks: d.payload.remarks } : {}),
       caveat: SCREENING_CAVEAT,
     };
@@ -235,6 +265,14 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     }
     if (r.nationalities.length > 0)
       lines.push(`\n**Nationalities:** ${r.nationalities.join(', ')}`);
+    if (r.features.length > 0) {
+      lines.push('\n## Features');
+      // An OFAC label can carry its own closing punctuation (`Secondary sanctions risk:`).
+      for (const f of r.features) {
+        const label = /[:-]$/.test(f.type) ? f.type : `${f.type}:`;
+        lines.push(`- **${label}** ${f.circa ? 'circa ' : ''}${f.value}`);
+      }
+    }
     if (r.remarks) lines.push(`\n**Remarks:** ${r.remarks}`);
     lines.push(`\n> ${r.caveat}`);
     return [{ type: 'text', text: lines.join('\n') }];

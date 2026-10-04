@@ -32,6 +32,34 @@ describe('vetCounterpartyPrompt', () => {
     expect(text).toMatch(/reporting exception/i);
   });
 
+  it('summarizes what produced each match, a name or an identifier (#37, #56)', async () => {
+    const args = vetCounterpartyPrompt.args!.parse({ name: 'Acme Corp' });
+    const messages = await vetCounterpartyPrompt.generate(args);
+    const text = messages[0]!.content.type === 'text' ? messages[0]!.content.text : '';
+    expect(text).toMatch(/every other and transliterated name/i);
+    expect(text).toMatch(/LEI and registration number/i);
+    expect(text).toMatch(/from matchedOn/);
+    expect(text).toMatch(/matchedIdentifiers and no matchedName came from an identifier alone/);
+  });
+
+  it('asks for a match type and score only where a hit carries them', async () => {
+    const args = vetCounterpartyPrompt.args!.parse({ name: 'Acme Corp' });
+    const messages = await vetCounterpartyPrompt.generate(args);
+    const text = messages[0]!.content.type === 'text' ? messages[0]!.content.text : '';
+    // An identifier-only hit has neither; a strict name match has a type and no score.
+    expect(text).not.toMatch(/the match type and score,/);
+    expect(text).toMatch(/for a name match its match type, and its score when approximate/);
+    expect(text).toMatch(/an identifier match has neither/);
+  });
+
+  it('names every list of a hit in the summary, an OFAC party on both OFAC lists as one (#61)', async () => {
+    const args = vetCounterpartyPrompt.args!.parse({ name: 'Acme Corp' });
+    const messages = await vetCounterpartyPrompt.generate(args);
+    const text = messages[0]!.content.type === 'text' ? messages[0]!.content.text : '';
+    expect(text).toMatch(/every list in the hit's sources/);
+    expect(text).toMatch(/one hit, not two/);
+  });
+
   it('never asks for a fuzzy retry the empty strict screen has already run (#36)', async () => {
     const args = vetCounterpartyPrompt.args!.parse({ name: 'Acme Corp' });
     const messages = await vetCounterpartyPrompt.generate(args);

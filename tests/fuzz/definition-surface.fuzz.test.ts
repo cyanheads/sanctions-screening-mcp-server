@@ -12,6 +12,7 @@
  * @module tests/fuzz/definition-surface.fuzz.test
  */
 
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { fuzzPrompt, fuzzResource, fuzzTool } from '@cyanheads/mcp-ts-core/testing/fuzz';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { vetCounterpartyPrompt } from '@/mcp-server/prompts/definitions/vet-counterparty.prompt.js';
@@ -46,6 +47,25 @@ const resources = [
   ['sanctions://sources', sourcesResource],
 ] as const;
 
+const LEI_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+/** `count` LEIs the input schemas accept (18 alphanumerics + 2 digits), from a fixed-seed LCG. */
+function schemaValidLeis(count: number): string[] {
+  let state = FUZZ.seed;
+  const next = (bound: number) => {
+    state = (Math.imul(state, 1_103_515_245) + 12_345) >>> 0;
+    return state % bound;
+  };
+  return Array.from({ length: count }, () => {
+    const body = Array.from({ length: 18 }, () => LEI_ALPHABET[next(36)]).join('');
+    return `${body}${next(10)}${next(10)}`;
+  });
+}
+
+/** ISO 7064 MOD 97-10 over the base-36 expansion, as a BigInt — independent of the server's helper. */
+const mod97 = (lei: string): bigint =>
+  BigInt([...lei].map((char) => Number.parseInt(char, 36)).join('')) % 97n;
+
 describe('definition surface fuzz (seeded mirror)', () => {
   let seeded: SeededService;
 
@@ -75,6 +95,33 @@ describe('definition surface fuzz (seeded mirror)', () => {
     expect(report.crashes).toHaveLength(0);
     expect(report.leaks).toHaveLength(0);
     expect(report.prototypePollution).toBe(false);
+  });
+
+  it('lands every schema-valid LEI the mirror lacks on a declared reason, by its check digits (#62)', async () => {
+    const leis = [...schemaValidLeis(60), '529900UNKNOWNLEI0009', '549300NOTINMIRROR077'];
+    const seen = new Set<string>();
+    for (const lei of leis) {
+      const expected = mod97(lei) === 1n ? 'lei_not_found' : 'invalid_lei_checksum';
+      seen.add(expected);
+      for (const tool of [getEntityTool, traceOwnershipTool]) {
+        const result = await runToolContract(tool, { lei });
+        const envelope = result.structuredContent as {
+          error?: { data?: { recovery?: { hint?: string }; reason?: string } };
+        };
+        expect(envelope.error?.data?.reason, `${tool.name} ${lei}`).toBe(expected);
+        expect(envelope.error?.data?.recovery?.hint, `${tool.name} ${lei}`).toBeTruthy();
+      }
+      const failure = await Promise.resolve()
+        .then(() =>
+          entityResource.handler(
+            entityResource.params!.parse({ lei }),
+            createMockContext({ errors: entityResource.errors }),
+          ),
+        )
+        .catch((error: unknown) => error);
+      expect(failure, `sanctions://entity/${lei}`).toMatchObject({ data: { reason: expected } });
+    }
+    expect([...seen].sort()).toEqual(['invalid_lei_checksum', 'lei_not_found']);
   });
 
   it('sanctions_vet_counterparty survives schema-derived and adversarial args', async () => {

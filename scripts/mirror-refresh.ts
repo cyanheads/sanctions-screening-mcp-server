@@ -6,7 +6,9 @@
  * the GLEIF mirror current from its checkpoint: per dataset, the smallest delta
  * window that reaches back to the last file applied, streamed in bounded batches,
  * deletions included. Reporting exceptions with no recorded load get their golden
- * copy. The HTTP server runs the same refresh on a cron, deltas only.
+ * copy. A GLEIF mirror without the exact-name index strict resolution reads first
+ * gains it here, in one pass over the names. The HTTP server runs the same
+ * refresh on a cron, deltas only, and never builds that index.
  *
  * Exits non-zero when a sanctions list failed, or when the GLEIF mirror cannot be
  * caught up from deltas — no checkpoint recorded (every mirror written before
@@ -46,6 +48,10 @@ async function main(): Promise<void> {
       throw new Error(
         `GLEIF ${gleif.needsInit.join(', ')} cannot be caught up from delta files — nothing was applied and leiAsOf is unchanged. Run mirror:init to reload the GLEIF golden copies.`,
       );
+    }
+    if (gleif) {
+      log.info('mirror:refresh — building the GLEIF exact-name index if missing', ctx);
+      await service.indexLeiExactNames();
     }
     log.info('mirror:refresh — complete', ctx);
   } finally {

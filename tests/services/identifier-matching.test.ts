@@ -134,6 +134,17 @@ describe('identifierProbes', () => {
     ]);
   });
 
+  it('probes the non-document labels alone for other — never a document, IMO, BIC, or wallet', () => {
+    // An LEI's first eight characters would otherwise reach a BIC8, and an `IMO`
+    // prefix an IMO number: the cross-reference's lookups run as `other` only.
+    expect(identifierProbes('253400DYLWR5A6YAWJ69', 'other')).toEqual([
+      { category: 'other', key: '253400DYLWR5A6YAWJ69' },
+    ]);
+    expect(identifierProbes('HRB 14604', 'other')).toEqual([
+      { category: 'other', key: 'HRB14604' },
+    ]);
+  });
+
   it('drops a probe whose key is empty, and returns none for a value of separators only', () => {
     expect(identifierProbes('IMO', 'imo')).toEqual([]);
     expect(identifierProbes('IMO', 'any').map((p) => p.category)).not.toContain('imo');

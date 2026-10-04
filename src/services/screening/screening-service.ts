@@ -29,8 +29,9 @@ import { defineMirror, sqliteMirrorStore } from '@cyanheads/mcp-ts-core/mirror';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig, type ServerConfig } from '@/config/server-config.js';
+import { poolCandidates } from '@/services/screening/candidate-pool.js';
 import {
-  type IdentifierType,
+  type IdentifierCategory,
   identifierCategory,
   identifierKey,
   identifierProbes,
@@ -42,28 +43,35 @@ import {
   type SanctionsIngester,
 } from '@/services/screening/sanctions-ingest.js';
 import {
+  createLeiNameNormalizedIndex,
   designationStoreSpec,
+  dropNameIndex,
   ensureDesignationAuxSchema,
   ensureLeiAuxSchema,
+  hasLeiNameNormalizedIndex,
   IDENTIFIER_STAMP_TABLE,
   IDENTIFIER_TABLE,
   LEI_EXCEPTION_TABLE,
   LEI_NAME_FTS_TABLE,
+  LEI_NAME_NORMALIZED_INDEX,
   LEI_NAME_STAMP_TABLE,
   LEI_NAME_TABLE,
   LEI_RELATIONSHIP_TABLE,
   leiStoreSpec,
+  NAME_BLOCKING_FTS_TABLE,
   NAME_FTS_TABLE,
+  NAME_INDEX_STAMP_TABLE,
   NAME_TABLE,
 } from '@/services/screening/schema.js';
 import {
-  bestTokenScore,
   buildFtsMatch,
   doubleMetaphone,
   fold,
   jaroWinkler,
   lengthRatio,
-  tokenCoverage,
+  scoreTokenPairs,
+  scoringQuery,
+  splitOnStoplist,
   tokenize,
 } from '@/services/screening/text-matching.js';
 import type {
@@ -90,8 +98,8 @@ import { LEGAL_NAME_TYPE, SOURCE_CODES, UNKNOWN_NAME_TYPE } from '@/services/scr
 
 /** A loaded source's provenance + freshness, surfaced by `sanctions_list_sources`. */
 export interface SourceStatus {
-  /** Source code (`ofac_sdn`, `eu`, …) or the GLEIF dataset key. */
-  code: string;
+  /** Source code (`ofac_sdn`, `eu`, …). */
+  code: SourceCode;
   /** Record count currently in the mirror for this source. */
   recordCount: number;
 }
@@ -107,15 +115,19 @@ export interface MirrorReadiness {
 
 /**
  * How to read a `totalAvailable`. `exact` is the complete matching set the query
- * can reach; `lower_bound` means a bounded scan produced it and more matches may
- * exist beyond what was scanned — never present a bound as a total.
+ * can reach; `lower_bound` means a bounded read produced it — a fuzzy pass, whose
+ * candidates come from blocking, or a strict resolution scan that hit its bound —
+ * and more matches may exist beyond it. Never present a bound as a total. Either
+ * way, every match the count includes is reachable by paging.
  */
 export type CountBasis = 'exact' | 'lower_bound';
 
 /** Options for {@link ScreeningService.screenName}. */
 export interface ScreenNameOptions {
   /**
-   * Whether a strict pass that finds nothing auto-upgrades to a fuzzy pass.
+   * Whether strict mode runs a fuzzy pass over the selected lists it found
+   * nothing on: a full pass when it found nothing anywhere, otherwise a
+   * full-coverage completion of those lists (see {@link ScreenNameResult.fuzzySources}).
    * Defaults to `true` for the user-facing `sanctions_screen_name` tool (an empty
    * strict result there is unhelpful). The internal cross-reference screens in
    * `sanctions_get_entity` / `sanctions_trace_ownership` set this `false`: a
@@ -138,16 +150,28 @@ export interface ScreenNameOptions {
 
 /** Result of a screening pass — hits plus how matching ran. */
 export interface ScreenNameResult {
-  /** True when a strict pass returned nothing and fuzzy was attempted. */
+  /** True when a strict pass returned nothing on every selected list and fuzzy was attempted. */
   fuzzyFallbackTriggered: boolean;
+  /**
+   * The selected lists the fuzzy pass searched, in {@link SOURCE_CODES} order;
+   * absent when none ran. Every selected list in fuzzy mode or after a strict
+   * pass that found nothing; otherwise the lists strict found nothing on, whose
+   * candidates are kept only when they cover every distinctive query word.
+   */
+  fuzzySources?: SourceCode[];
   hits: ScreeningHit[];
-  /** The match mode actually used (may upgrade strict→fuzzy on empty strict). */
+  /** `fuzzy` when every selected list was fuzzy-searched, else `strict` (possibly completed). */
   modeUsed: MatchMode;
   /** Folded query the server matched on. */
   normalizedQuery: string;
+  /**
+   * True when a fuzzy pass ran and a list's candidate budget left a block out,
+   * so names sharing only a common query word were not all scored.
+   */
+  poolBounded: boolean;
   /** Matching designations before `limit`/`offset` — read with `totalAvailableBasis`. */
   totalAvailable: number;
-  /** Whether {@link totalAvailable} is the complete count or a scanned-set floor. */
+  /** `exact` for a strict-only pass, `lower_bound` whenever a fuzzy pass ran. */
   totalAvailableBasis: CountBasis;
 }
 
@@ -180,9 +204,20 @@ export interface ResolveEntityResult {
   matches: LeiMatch[];
   modeUsed: MatchMode;
   normalizedQuery: string;
+  /**
+   * True when a fuzzy pass ran and its candidate bound left names out — the
+   * budget on the name index; on the legal-name path, the per-prefix row limit
+   * or the scan cap that left a query word's prefix unsearched.
+   */
+  poolBounded: boolean;
+  /**
+   * True when the strict scan read as many name rows as its bound allows, so
+   * strong matches past the bound were never read.
+   */
+  strictScanBounded: boolean;
   /** Matching LEIs before `limit`/`offset` — read with `totalAvailableBasis`. */
   totalAvailable: number;
-  /** Whether {@link totalAvailable} is the complete count or a scanned-set floor. */
+  /** `lower_bound` when a fuzzy pass ran or the strict scan hit its bound, else `exact`. */
   totalAvailableBasis: CountBasis;
 }
 
@@ -198,7 +233,11 @@ export type DesignationLookup =
 /** Options for {@link ScreeningService.screenIdentifier}. */
 export interface ScreenIdentifierOptions {
   sources: SourceCode[];
-  type: IdentifierType | 'any';
+  /**
+   * The category to probe, or `any`. `other` reaches the non-document labels
+   * alone — the entity cross-reference's LEI and registration-number lookups.
+   */
+  type: IdentifierCategory | 'any';
   value: string;
 }
 
@@ -209,8 +248,11 @@ export interface IdentifierHit {
   matchedIdentifiers: IdentifierRecord[];
   primaryName: string;
   program?: string;
+  /** The list whose record every other field describes. */
   source: SourceCode;
   sourceEntryId: string;
+  /** Every selected list whose record matched — see {@link ScreeningHit.sources}. */
+  sources: SourceCode[];
 }
 
 /** Internal row shape from the `name` join used during matching. */
@@ -288,19 +330,38 @@ interface LeiNameRow {
 const WHOLE_STRING_MIN_LENGTH_RATIO = 0.5;
 
 /**
- * Cap on RAW (pre-dedup) alias rows the strict designation scan reads. A common
- * token can match far more alias rows than designations, so the scan is bounded
- * rather than unbounded. When the cap binds, the deduplicated designation count
- * derived from those rows is a floor, not a total — {@link ScreeningService.runStrict}
- * reports that so the caller can label it `lower_bound` instead of overclaiming.
+ * The most name rows the strict LEI scan reads, and the most the exact-name
+ * lookup reads. One common word matches far more GLEIF names than a request can
+ * read (`limited` alone is in 409,879 of 4.0M), so the scan stops here and its
+ * count is a floor; exact names are read first, through their own index (see
+ * {@link ScreeningService.runLeiStrict}), so the bound never drops one. The
+ * strict designation scan has no bound: the most common sanctions token, `al`,
+ * is in 6,940 of 102,467 alias rows.
  */
-const STRICT_RAW_ROW_CAP = 5000;
+export const LEI_STRICT_SCAN_BOUND = 2000;
 
 /**
- * The same bound for the strict LEI scan. It counts name rows, about 1.2 per
- * entity across GLEIF, so a lower cap than the designation scan's suffices.
+ * Rows each `LIKE` lookup of the legal-name LEI fuzzy pass pools, in whatever
+ * order the scan reads them — that pre-index path's bound. A lookup that reaches
+ * it may have left names out.
  */
-const LEI_STRICT_RAW_ROW_CAP = 2000;
+const LEGACY_LEI_FUZZY_ROWS_PER_PREFIX = 200;
+
+/**
+ * The most `LIKE` lookups one legal-name LEI fuzzy pass runs: the query's
+ * distinct distinctive-word prefixes in the order their words appear, up to
+ * this many. A prefix in fewer than {@link LEGACY_LEI_FUZZY_ROWS_PER_PREFIX}
+ * names reads all ~3.4M rows of `lei_entity` before its limit can stop it —
+ * 1.2–1.7 s each on the 2026-10-03 GLEIF mirror, on the request thread — so an
+ * unbounded pass grew with the word count (64 unmatched words: 110 s). Three
+ * keeps every query of up to three such prefixes, the shape of 73% of ISSUED
+ * legal names, pooling as before. Query order rather than longest words first:
+ * a legal name opens with the words that identify it, and a longer word's
+ * prefix is no rarer — on 318 one-transposition typos of ISSUED legal names
+ * past the cap, the first three prefixes pool the target for 80, the three of
+ * the longest words for 50, and all of them for 95.
+ */
+export const LEGACY_LEI_FUZZY_PREFIX_SCANS = 3;
 
 /**
  * Designation rows read per keyset slice by the index rebuilds
@@ -311,11 +372,21 @@ const LEI_STRICT_RAW_ROW_CAP = 2000;
  */
 const DESIGNATION_READ_SLICE = 2000;
 
-/** A bounded strict scan: its ordered results plus whether the row cap bound. */
+/** A bounded strict LEI scan: its ordered results plus whether the bound bound. */
 interface BoundedScan<T> {
-  /** True when the raw scan hit its row cap, making `results` an incomplete set. */
+  /** True when a read hit {@link LEI_STRICT_SCAN_BOUND}, making `results` an incomplete set. */
   capped: boolean;
   results: T[];
+}
+
+/** A fuzzy pass: its ranked hits plus whether the candidate bound cut its pool. */
+interface FuzzyPass<T> {
+  hits: T[];
+  /**
+   * True when the pool's bound left candidates out, so names blocking matched
+   * were never scored (see `CandidatePool.bounded`).
+   */
+  poolBounded: boolean;
 }
 
 /**
@@ -412,13 +483,35 @@ export class ScreeningService {
    * clearance. The index carries the sync-state stamp of the run it followed; a
    * different stamp means a run it did not follow. While a run is in progress its
    * own rebuild follows, so only an index holding nothing is rebuilt then.
+   *
+   * The name index follows the same rule, under its own stamp, which only this
+   * release and later ones write. An earlier release reads `name_fts` alone and
+   * writes names without the suffix terms fuzzy blocking reads, so a mirror it
+   * wrote, or wrote to after a rollback, carries no stamp or a stale one, and the
+   * first open rebuilds the whole name index — both FTS indexes — from the stored
+   * designations, in one transaction with creating any part of it that is
+   * missing, before any screen reads it.
    */
   private async designationHandle(): Promise<SqliteHandle> {
     const raw = await this.designationMirror.raw();
     if (!this.designationAuxReady) {
-      ensureDesignationAuxSchema(raw);
       const state = await this.designationMirror.store.readState();
       const stamp = syncStamp(state);
+      const namesRebuilt = raw.transaction(() => {
+        ensureDesignationAuxSchema(raw);
+        const built = nameIndexStamp(raw);
+        if (built !== undefined && (built === stamp || state.status === 'in_progress')) {
+          return false;
+        }
+        rebuildNameIndex(raw, stamp);
+        return true;
+      });
+      if (namesRebuilt) {
+        logger.info(
+          'Sanctions mirror — name index rebuilt from the stored designations',
+          requestContextService.createRequestContext({ operation: 'mirror.nameIndexRebuild' }),
+        );
+      }
       const stale = state.status !== 'in_progress' && identifierStamp(raw) !== stamp;
       if (stale || identifierIndexUnbuilt(raw)) {
         raw.transaction(() => rebuildIdentifierIndex(raw, stamp));
@@ -550,13 +643,13 @@ export class ScreeningService {
 
   /**
    * Apply the columns a source could only publish after the records they belong
-   * to — the OFAC programme and designation date, which `SDN_ADVANCED.XML`
-   * carries in a `<SanctionsEntries>` block after every `<DistinctParty>`. The
-   * streaming harvest writes those parties first and hands the fields here once
-   * the source drains, keyed by `source_entry_id`, with the designation ids it
-   * kept (`{source}:{source_entry_id}`).
+   * to — the OFAC programme, designation date, and legal basis, which
+   * `SDN_ADVANCED.XML` carries in a `<SanctionsEntries>` block after every
+   * `<DistinctParty>`. The streaming harvest writes those parties first and hands
+   * the fields here once the source drains, keyed by `source_entry_id`, with the
+   * designation ids it kept (`{source}:{source_entry_id}`).
    *
-   * Every kept party gets its programme entry, or neither column when the
+   * Every kept party gets its programme entry, or none of the columns when the
    * document published none for it — its rows carried the previously stored
    * values while the harvest ran ({@link storedDeferredFields}). An UPDATE of kept
    * rows only: an entry with no kept party points at a party the document never
@@ -572,11 +665,16 @@ export class ScreeningService {
     const prefix = `${source}:`;
     handle.transaction(() => {
       const update = handle.prepare(
-        `UPDATE designation SET program = ?, designation_date = ? WHERE id = ?`,
+        `UPDATE designation SET program = ?, legal_basis = ?, designation_date = ? WHERE id = ?`,
       );
       for (const id of kept) {
         const value = fields.get(id.slice(prefix.length));
-        update.run(value?.program ?? null, value?.designationDate ?? null, id);
+        update.run(
+          value?.program ?? null,
+          value?.legalBasis ?? null,
+          value?.designationDate ?? null,
+          id,
+        );
       }
     });
   }
@@ -591,8 +689,13 @@ export class ScreeningService {
   ): Promise<ReadonlyMap<string, DeferredColumns>> {
     const handle = await this.designationHandle();
     const rows = handle
-      .prepare<{ designation_date: string | null; id: string; program: string | null }>(
-        `SELECT id, program, designation_date FROM designation
+      .prepare<{
+        designation_date: string | null;
+        id: string;
+        legal_basis: string | null;
+        program: string | null;
+      }>(
+        `SELECT id, program, legal_basis, designation_date FROM designation
          WHERE id IN (SELECT value FROM json_each(?))`,
       )
       .all(JSON.stringify(ids));
@@ -601,6 +704,7 @@ export class ScreeningService {
         row.id,
         {
           ...(row.program ? { program: row.program } : {}),
+          ...(row.legal_basis ? { legalBasis: row.legal_basis } : {}),
           ...(row.designation_date ? { designationDate: row.designation_date } : {}),
         },
       ]),
@@ -656,6 +760,7 @@ export class ScreeningService {
         writeIdentifiers(insertIdentifier, row.id, payload.identifiers);
       });
       writeIdentifierStamp(handle, stamp);
+      writeNameIndexStamp(handle, stamp);
     });
   }
 
@@ -883,6 +988,20 @@ export class ScreeningService {
   }
 
   /**
+   * Build the exact-name index strict resolution reads first, in one pass over
+   * `lei_name`; a no-op once built. Run by the mirror scripts and the fixture
+   * seed — never on open or by a request, since on full GLEIF it reads every name.
+   */
+  async indexLeiExactNames(): Promise<void> {
+    createLeiNameNormalizedIndex(await this.leiHandle());
+  }
+
+  /** True when the exact-name index {@link indexLeiExactNames} builds exists. */
+  async leiExactNamesIndexed(): Promise<boolean> {
+    return hasLeiNameNormalizedIndex(await this.leiHandle());
+  }
+
+  /**
    * Record that a GLEIF golden-copy load has started: the checkpoint is cleared, so
    * a load that never finishes leaves nothing for a refresh to apply deltas onto.
    * `completedAt` and `total` are durable in the store, so the mirror stays ready —
@@ -896,9 +1015,10 @@ export class ScreeningService {
   }
 
   /**
-   * Load a synthetic fixture into both mirrors and mark them ready, reporting
-   * exceptions recorded as loaded. For tests and a quick local smoke run — NOT the
-   * real corpus, which loads via `mirror:init`.
+   * Load a synthetic fixture into both mirrors, build the exact-name index as the
+   * mirror scripts do, and mark them ready, reporting exceptions recorded as
+   * loaded. For tests and a quick local smoke run — NOT the real corpus, which
+   * loads via `mirror:init`.
    */
   async seedFixtures(fixtures: {
     designations: NormalizedDesignation[];
@@ -910,6 +1030,7 @@ export class ScreeningService {
     await this.ingestLeiEntities(fixtures.leiEntities);
     await this.ingestLeiRelationships(fixtures.leiRelationships);
     await this.ingestReportingExceptions(fixtures.reportingExceptions);
+    await this.indexLeiExactNames();
     await this.markSanctionsReady(fixtures.designations.length);
     await this.markLeiReady(fixtures.leiEntities.length, { repex: new Date().toISOString() });
   }
@@ -918,8 +1039,11 @@ export class ScreeningService {
 
   /**
    * Screen a name against the loaded sanctions lists. Strict mode runs exact
-   * then all-tokens-present (FTS5). Fuzzy mode (explicit, or auto when strict is
-   * empty) adds Jaro-Winkler + phonetic scoring against the per-alias index.
+   * then all-tokens-present (FTS5). A fuzzy pass adds Jaro-Winkler + phonetic
+   * scoring against the per-alias index: over every selected list in fuzzy mode,
+   * or in strict mode when strict found nothing on any of them, and otherwise
+   * over just the lists strict found nothing on, keeping only the candidates
+   * that cover every distinctive query word (see {@link ScreenNameResult.fuzzySources}).
    */
   async screenName(opts: ScreenNameOptions, ctx: Context): Promise<ScreenNameResult> {
     const normalizedQuery = fold(opts.query);
@@ -937,62 +1061,69 @@ export class ScreeningService {
         : ` AND d.entity_type = '${this.escapeLiteral(opts.entityType)}'`;
 
     // Step 1+2: exact-normalized, then strict all-tokens-present (FTS5 AND).
-    const strict = this.runStrict(handle, {
-      normalizedQuery,
-      sourceFilter,
-      typeFilter,
-    });
-    const strictHits = strict.results;
+    const strictHits = this.runStrict(handle, { normalizedQuery, sourceFilter, typeFilter });
 
-    // Explicit fuzzy always runs fuzzy; strict auto-upgrades to fuzzy on an empty
-    // result ONLY when auto-fallback is enabled (the default — off for internal
-    // cross-reference screens, see ScreenNameOptions.autoFallback).
-    const wantFuzzy =
-      opts.matchMode === 'fuzzy' || (opts.autoFallback !== false && strictHits.length === 0);
-    if (!wantFuzzy || queryTokens.length === 0) {
-      ctx.log.debug('Strict screening complete', {
-        normalizedQuery,
-        hitCount: strictHits.length,
-      });
-      return {
-        hits: strictHits.slice(offset, offset + opts.limit),
-        modeUsed: 'strict',
-        normalizedQuery,
-        fuzzyFallbackTriggered: false,
-        totalAvailable: strictHits.length,
-        totalAvailableBasis: strict.capped ? 'lower_bound' : 'exact',
-      };
-    }
+    // The lists step 3 searches. Explicit fuzzy searches every selected list, and
+    // so does strict when it found nothing on any of them. Otherwise strict is
+    // completed list by list: one fuzzy pass over the lists it found nothing on.
+    // The pass pools each list on its own (see runFuzzy), so a list's candidates
+    // never depend on which other lists were selected. The internal
+    // cross-reference screens (autoFallback false) search none.
+    const selected =
+      opts.sources.length > 0
+        ? SOURCE_CODES.filter((code) => opts.sources.includes(code))
+        : [...SOURCE_CODES];
+    const strictLists = new Set(strictHits.map((hit) => hit.source));
+    const fuzzySources =
+      queryTokens.length === 0
+        ? []
+        : opts.matchMode === 'fuzzy'
+          ? selected
+          : opts.autoFallback === false
+            ? []
+            : selected.filter((code) => !strictLists.has(code));
+    // A completion beside strict hits keeps only the candidates that cover every
+    // distinctive query word — the fuzzy analogue of strict's all-tokens rule:
+    // the same name, spelled differently, on a list strict missed.
+    const completion = opts.matchMode === 'strict' && strictHits.length > 0;
 
     // Step 3/3b: fuzzy (Jaro-Winkler) + phonetic over the candidate pool.
     const minScore = opts.minScore ?? this.config.fuzzyMinScore;
-    const fuzzyHits = this.runFuzzy(handle, {
-      normalizedQuery,
-      queryTokens,
-      sourceFilter,
-      typeFilter,
-      minScore,
-      cap: this.config.fuzzyMaxResults,
-    });
+    const fuzzy =
+      fuzzySources.length > 0
+        ? this.runFuzzy(handle, {
+            normalizedQuery,
+            queryTokens,
+            sources: fuzzySources,
+            typeFilter,
+            minScore,
+            fullCoverage: completion,
+          })
+        : undefined;
 
-    // Merge: keep strict hits (deterministic, unscored) ahead of fuzzy, dedup by id.
-    const merged = this.mergeHits(strictHits, fuzzyHits);
-    ctx.log.debug('Fuzzy screening complete', {
+    // Strict hits (deterministic, unscored) ahead of fuzzy, one per designation,
+    // and one per OFAC entry. This is the whole ordered match set: it is counted
+    // and paged as one, so every hit it holds is reachable by offset.
+    const ranked = groupOfacCopies(fuzzy ? this.mergeHits(strictHits, fuzzy.hits) : strictHits);
+    ctx.log.debug(fuzzy ? 'Fuzzy screening complete' : 'Strict screening complete', {
       normalizedQuery,
       strictCount: strictHits.length,
-      fuzzyCount: fuzzyHits.length,
-      minScore,
+      ...(fuzzy
+        ? { fuzzyCount: fuzzy.hits.length, fuzzySources, poolBounded: fuzzy.poolBounded, minScore }
+        : {}),
     });
     return {
-      hits: merged.slice(offset, offset + opts.limit),
-      modeUsed: 'fuzzy',
+      hits: ranked.slice(offset, offset + opts.limit),
+      modeUsed: fuzzy && !completion ? 'fuzzy' : 'strict',
       normalizedQuery,
-      fuzzyFallbackTriggered: opts.matchMode === 'strict' && strictHits.length === 0,
-      totalAvailable: merged.length,
-      // The fuzzy pool comes from bounded blocking queries and is truncated to
-      // `fuzzyMaxResults` before the merge, so no fuzzy-mode count can be a
-      // corpus-wide total — it is always a floor on what scoring actually saw.
-      totalAvailableBasis: 'lower_bound',
+      fuzzyFallbackTriggered: fuzzy !== undefined && opts.matchMode === 'strict' && !completion,
+      ...(fuzzy ? { fuzzySources } : {}),
+      poolBounded: fuzzy?.poolBounded ?? false,
+      totalAvailable: ranked.length,
+      // A strict pass reads every name its tokens reach, so its count is the whole
+      // set. A fuzzy pass scores only the candidates blocking pooled, so no count
+      // it adds to can be a corpus-wide total.
+      totalAvailableBasis: fuzzy ? 'lower_bound' : 'exact',
     };
   }
 
@@ -1004,6 +1135,11 @@ export class ScreeningService {
     return ` AND d.source IN (${list})`;
   }
 
+  /**
+   * Strict pass: every name holding every query token, exact (normalized
+   * equality) or strong. Unbounded — the most common token on the lists reaches
+   * 6,940 of 102,467 alias rows — so the set it returns is the whole strict set.
+   */
   private runStrict(
     handle: SqliteHandle,
     args: {
@@ -1011,9 +1147,11 @@ export class ScreeningService {
       sourceFilter: string;
       typeFilter: string;
     },
-  ): BoundedScan<ScreeningHit> {
+  ): ScreeningHit[] {
+    // Every query token, against `name_fts`, which holds fold tokens alone: the
+    // suffix and phonetic terms live in the blocking index and never widen a strict hit.
     const match = buildFtsMatch(args.normalizedQuery);
-    if (!match) return { results: [], capped: false };
+    if (!match) return [];
 
     // FTS over the name index; join back to name + designation. Classify each
     // matched name as exact (normalized equality) or strong (all tokens present).
@@ -1025,8 +1163,7 @@ export class ScreeningService {
          FROM ${NAME_FTS_TABLE} f
          JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
          JOIN designation d ON d.id = n.designation_id
-         WHERE ${NAME_FTS_TABLE} MATCH ?${args.sourceFilter}${args.typeFilter}
-         LIMIT ${STRICT_RAW_ROW_CAP}`,
+         WHERE ${NAME_FTS_TABLE} MATCH ?${args.sourceFilter}${args.typeFilter}`,
       )
       .all(match);
 
@@ -1040,85 +1177,100 @@ export class ScreeningService {
         byDesignation.set(row.designation_id, hit);
       }
     }
-    // Exact hits first, then strong; designation id breaks same-band ties. The
-    // id is the total order pagination needs — without it, tied hits fall back to
-    // incidental row-arrival/Map-insertion order and pages could overlap or drop rows.
-    return {
-      results: [...byDesignation.values()].sort(
-        (a, b) =>
-          matchRank(b.matchType) - matchRank(a.matchType) ||
-          a.designationId.localeCompare(b.designationId),
-      ),
-      capped: rows.length >= STRICT_RAW_ROW_CAP,
-    };
+    // Exact hits first, then strong; designation identity breaks same-band ties.
+    // Identity is the total order pagination needs — without it, tied hits fall back
+    // to incidental row-arrival/Map-insertion order and pages could overlap or drop rows.
+    return [...byDesignation.values()].sort(
+      (a, b) => matchRank(b.matchType) - matchRank(a.matchType) || compareDesignationIdentity(a, b),
+    );
   }
 
+  /**
+   * Fuzzy pass over the name index. Every distinct query-token prefix and every
+   * query word's phonetic key is a blocking key: a prefix reaches the names with
+   * a token, or an unsegmented-script suffix, that opens with it — the
+   * Jaro-Winkler-near variants (Volkov/Volkow) — and a phonetic key reaches the
+   * names with a word of that key — the transliteration-class variants
+   * (Mohammed/Muhammad share MHMT) whose Jaro-Winkler is low. Each list in
+   * `sources` is pooled on its own: a key's block on a list is the names the key
+   * matches there under the request's type filter, and {@link poolCandidates}
+   * pools each list's blocks under a budget of its own. A list's pool depends
+   * only on the query, that list, and the type filter — never on table order,
+   * and never on which other lists were selected, whose blocks would otherwise
+   * share the budget and push a block that fits on its own list out of the
+   * pool. A stoplisted word (`FUZZY_STOPLIST`) keys no block of its own; its
+   * prefix only pairs with a block that did not fit. With `fullCoverage`, a
+   * candidate must also cover every distinctive query word, every word when all
+   * are stoplisted.
+   */
   private runFuzzy(
     handle: SqliteHandle,
     args: {
+      fullCoverage: boolean;
+      minScore: number;
       normalizedQuery: string;
       queryTokens: string[];
-      sourceFilter: string;
+      sources: SourceCode[];
       typeFilter: string;
-      minScore: number;
-      cap: number;
     },
-  ): ScreeningHit[] {
-    const queryPhonetic = doubleMetaphone(args.normalizedQuery);
-    const phoneticKeys = [...new Set(queryPhonetic.split(/\s+/).filter(Boolean))];
-
-    // Candidate pool from two blocking strategies, each query SEPARATELY so no
-    // one strategy starves the others under the row cap:
-    //  (a) phonetic-key equality — seeds the pool with transliteration-class
-    //      variants (e.g. Mohammed/Muhammad share DM key MHMT) whose whole-string
-    //      Jaro-Winkler is low; they still face the admission gate below, which
-    //      their high-scoring significant token pairs (with coverage) clear.
-    //  (b) a leading-trigram prefix shared with any query token — pulls the
-    //      JW-near candidates whose phonetic key differs (e.g. Volkov/Volkow).
-    // A single OR'd query with one shared LIMIT let the first clause (e.g. a
-    // common given-name prefix) exhaust the cap before later tokens' rows were
-    // scanned, dropping the true multi-token match from the pool entirely
-    // (e.g. "nikolas maduro moros" never reaching "MADURO MOROS Nicolas"). Each
-    // strategy now gets its own bounded query and the rows are merged, deduped by
-    // rowid — every query token contributes candidates.
-    const select = `SELECT n.rowid AS rowid, n.designation_id, n.name, n.normalized,
+  ): FuzzyPass<ScreeningHit> {
+    const { distinctive, stoplisted } = splitOnStoplist(args.queryTokens);
+    const blockingKeys = [
+      ...blockingPrefixes(distinctive).map(prefixKey),
+      ...doubleMetaphone(distinctive.join(' '))
+        .split(' ')
+        .filter(Boolean)
+        .map((key) => `phonetic : "${key}"`),
+    ];
+    const partners = blockingPrefixes(stoplisted).map(prefixKey);
+    // One read per key, or pair of keys, serves every list: the names it matches
+    // on the selected lists, each joined to its designation — in that order, so
+    // the read's cost follows the names that match, never the table — split by
+    // list. A list's block is its share of the read.
+    const read = handle.prepare<{ rowid: number; source: SourceCode }>(
+      `SELECT f.rowid AS rowid, d.source AS source
+       FROM ${NAME_BLOCKING_FTS_TABLE} f
+       CROSS JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
+       CROSS JOIN designation d ON d.id = n.designation_id
+       WHERE ${NAME_BLOCKING_FTS_TABLE} MATCH ?${this.sourceFilterClause(args.sources)}${args.typeFilter}`,
+    );
+    const reads = new Map<string, Map<SourceCode, { rowid: number }[]>>();
+    const pooled = new Set<number>();
+    let poolBounded = false;
+    for (const source of args.sources) {
+      const pool = poolCandidates(
+        blockingKeys,
+        (keys, limit) => {
+          const expression = keys.map((key) => `(${key})`).join(' AND ');
+          let bySource = reads.get(expression);
+          if (!bySource) {
+            bySource = Map.groupBy(read.all(expression), (row) => row.source);
+            reads.set(expression, bySource);
+          }
+          const block = bySource.get(source) ?? [];
+          return block.length > limit ? undefined : block.map((row) => row.rowid);
+        },
+        partners,
+      );
+      for (const id of pool.ids) pooled.add(id);
+      poolBounded ||= pool.bounded;
+    }
+    if (pooled.size === 0) return { hits: [], poolBounded };
+    // In rowid order, a designation's names come in the order they were written,
+    // whatever order the lists were ingested in.
+    const rows = handle
+      .prepare<NameJoinRow & { rowid: number }>(
+        `SELECT n.rowid AS rowid, n.designation_id, n.name, n.normalized,
                 n.phonetic, n.name_type, d.source, d.source_entry_id, d.entity_type,
                 d.primary_name, d.program, d.designation_date, d.reference_number
          FROM ${NAME_TABLE} n
-         JOIN designation d ON d.id = n.designation_id`;
-    const prefixes = blockingPrefixes(args.queryTokens);
-    const limit = perStrategyLimit(args.cap);
-    const byRowid = new Map<number, NameJoinRow & { rowid: number }>();
-    const collect = (rows: (NameJoinRow & { rowid: number })[]): void => {
-      for (const r of rows) if (!byRowid.has(r.rowid)) byRowid.set(r.rowid, r);
-    };
+         JOIN designation d ON d.id = n.designation_id
+         WHERE n.rowid IN (SELECT value FROM json_each(?))`,
+      )
+      .all(JSON.stringify([...pooled]))
+      .sort((a, b) => a.rowid - b.rowid);
 
-    if (phoneticKeys.length > 0) {
-      const placeholders = phoneticKeys.map(() => '?').join(', ');
-      collect(
-        handle
-          .prepare<NameJoinRow & { rowid: number }>(
-            `${select} WHERE n.phonetic IN (${placeholders})${args.sourceFilter}${args.typeFilter} LIMIT ?`,
-          )
-          .all(...phoneticKeys, limit),
-      );
-    }
-    for (const prefix of prefixes) {
-      collect(
-        handle
-          .prepare<NameJoinRow & { rowid: number }>(
-            `${select} WHERE n.normalized LIKE ?${args.sourceFilter}${args.typeFilter} LIMIT ?`,
-          )
-          .all(`%${prefix}%`, limit),
-      );
-    }
-    if (byRowid.size === 0) return [];
-    const rows = [...byRowid.values()];
-
-    // The blocking SQL above *seeds the candidate pool* — phonetic-key equality
-    // pulls transliteration-class variants (e.g. Mohammed/Muhammad share DM key
-    // MHMT) whose whole-string Jaro-Winkler is low, the trigram prefix pulls the
-    // JW-near variants. Both are only candidates; admission is decided here.
+    // Pooling only seeds candidates; admission is decided here.
     //
     // The surfaced `score` stays a RAW Jaro-Winkler measurement — the max of the
     // whole-string similarity and the single best token-pair similarity — never a
@@ -1129,21 +1281,27 @@ export class ScreeningService {
     // variants (their significant tokens each score high) and word-order swaps (all
     // tokens present) stay admitted; a high explicit `minScore` still suppresses
     // uniformly; single-token queries are unchanged (the floor alone governs).
+    const required = requiredCoverage(args.queryTokens.length, distinctive.length);
+    const query = scoringQuery(args.queryTokens);
     const scored: ScreeningHit[] = [];
     for (const row of rows) {
-      const candidateTokens = tokenize(row.normalized);
-      const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
+      // Coverage of every query token is the surfaced ranking key; the token arm
+      // counts the distinctive ones only, and they are every token unless the
+      // query carries a stoplisted one.
+      const {
+        best: tokenScore,
+        covered,
+        distinctiveCovered,
+      } = scoreTokenPairs(query, tokenize(row.normalized), args.minScore);
       const wholeScore = jaroWinkler(args.normalizedQuery, row.normalized);
-      // Coverage is computed for every candidate, not just the ones the token arm
-      // gates: it is BOTH an admission input and the surfaced ranking key.
-      const covered = tokenCoverage(args.queryTokens, candidateTokens, args.minScore);
+      if (args.fullCoverage && distinctiveCovered < distinctive.length) continue;
 
       if (
         this.admitFuzzy(
           args.normalizedQuery,
           row.normalized,
-          args.queryTokens.length,
-          covered,
+          required,
+          distinctiveCovered,
           wholeScore,
           tokenScore,
           args.minScore,
@@ -1156,9 +1314,10 @@ export class ScreeningService {
       }
     }
 
-    // Best alias per designation, then rank, cap. Two aliases of one designation
-    // can tie on score, so coverage picks the one that explains the most of the
-    // query — the surfaced matchedName/score/coverage then describe one alias.
+    // Best alias per designation, then rank — every admitted designation, since a
+    // cut here would leave scored matches no offset could reach. Two aliases of one
+    // designation can tie on score, so coverage picks the one that explains the
+    // most of the query — the surfaced matchedName/score/coverage then describe one alias.
     const byDesignation = new Map<string, ScreeningHit>();
     for (const hit of scored) {
       const existing = byDesignation.get(hit.designationId);
@@ -1166,9 +1325,12 @@ export class ScreeningService {
         byDesignation.set(hit.designationId, hit);
       }
     }
-    return [...byDesignation.values()]
-      .sort((a, b) => compareFuzzyRank(a, b) || a.designationId.localeCompare(b.designationId))
-      .slice(0, args.cap);
+    return {
+      hits: [...byDesignation.values()].sort(
+        (a, b) => compareFuzzyRank(a, b) || compareDesignationIdentity(a, b),
+      ),
+      poolBounded,
+    };
   }
 
   /**
@@ -1191,26 +1353,34 @@ export class ScreeningService {
    *    0.83 across the live mirror) — far above the prefix-inflation failures (≤ 0.375)
    *    — so the guard drops the false positive while preserving that recall. OR
    *
-   *  - TOKEN-PAIR + coverage arm (issue #4): the best token pair clears `minScore` AND
-   *    at least half the query tokens each individually clear it (`coveredTokens`) —
-   *    so one strong token pair can't carry an otherwise-unrelated multi-token query.
+   *  - TOKEN-PAIR + coverage arm (issues #4, #55): the best token pair clears
+   *    `minScore` AND the candidate covers `requiredTokens` of the query's
+   *    distinctive tokens — those off `FUZZY_STOPLIST` — each individually clearing
+   *    it (`distinctiveCovered`). The requirement is half the query's tokens,
+   *    rounded up, or every distinctive token when fewer remain (see
+   *    {@link requiredCoverage}), so one strong token pair can't carry an
+   *    otherwise-unrelated multi-token query, a shared legal form or article
+   *    carries nothing, and a query whose one distinctive word is wrapped in
+   *    legal forms (`SOVCOMFLOT (UK) LTD`) still admits that word's matches.
    *
    * A candidate that fails the whole-string arm's length guard still admits through
    * the token arm when it genuinely covers the query. By construction the length
    * guard removes only whole-string-ONLY admissions where the two strings' lengths
-   * diverge sharply, and the coverage arm only tightens queries of three or more
-   * tokens (a one- or two-token query with a passing token score already has half-
-   * or-more coverage, so the `minScore` floor alone governs, exactly as before).
+   * diverge sharply. Without a stoplisted token, the coverage arm only tightens
+   * queries of three or more tokens (a one- or two-token query with a passing token
+   * score already has half-or-more coverage, so the `minScore` floor alone governs).
    *
-   * Every measurement arrives precomputed — the callers need `coveredTokens` for
-   * ranking regardless (see {@link compareFuzzyRank}), so computing it once at the
-   * call site keeps this a pure predicate over the candidate's measurements.
+   * Every measurement arrives precomputed — the callers need the all-token
+   * coverage for ranking regardless (see {@link compareFuzzyRank}), and it is the
+   * distinctive coverage whenever the query has no stoplisted token, so computing
+   * both at the call site keeps this a pure predicate over the candidate's
+   * measurements.
    */
   private admitFuzzy(
     normalizedQuery: string,
     candidateNormalized: string,
-    queryTokenCount: number,
-    coveredTokens: number,
+    requiredTokens: number,
+    distinctiveCovered: number,
     wholeScore: number,
     tokenScore: number,
     minScore: number,
@@ -1222,7 +1392,7 @@ export class ScreeningService {
       return true;
     }
     if (tokenScore < minScore) return false;
-    return coveredTokens * 2 >= queryTokenCount;
+    return distinctiveCovered >= requiredTokens;
   }
 
   private mergeHits(strict: ScreeningHit[], fuzzy: ScreeningHit[]): ScreeningHit[] {
@@ -1250,6 +1420,7 @@ export class ScreeningService {
       ...(row.program ? { program: row.program } : {}),
       ...(row.designation_date ? { designationDate: row.designation_date } : {}),
       ...(row.reference_number ? { referenceNumber: row.reference_number } : {}),
+      sources: [row.source as SourceCode],
     };
   }
 
@@ -1323,7 +1494,8 @@ export class ScreeningService {
    * The designations that publish an identifier equal to `value` after
    * normalization — per category, as {@link identifierProbes} keys it — one hit
    * per designation carrying every stored identifier that matched, ordered by
-   * source then entry ID. Joined to `designation`, so a designation a sync removed
+   * source then entry ID, with an OFAC entry's SDN and Consolidated records one
+   * hit ({@link groupOfacCopies}). Joined to `designation`, so a designation a sync removed
    * never surfaces, even before the post-sync rebuild drops its identifier rows.
    */
   async screenIdentifier(opts: ScreenIdentifierOptions): Promise<IdentifierHit[]> {
@@ -1360,13 +1532,10 @@ export class ScreeningService {
         primaryName: row.primary_name,
         ...(row.program ? { program: row.program } : {}),
         matchedIdentifiers: [matched],
+        sources: [row.source as SourceCode],
       });
     }
-    return [...byDesignation.values()].sort(
-      (a, b) =>
-        SOURCE_CODES.indexOf(a.source) - SOURCE_CODES.indexOf(b.source) ||
-        a.sourceEntryId.localeCompare(b.sourceEntryId, 'en', { numeric: true }),
-    );
+    return groupOfacCopies([...byDesignation.values()].sort(compareDesignationIdentity));
   }
 
   // ─── LEI resolution ──────────────────────────────────────────────────────
@@ -1381,10 +1550,14 @@ export class ScreeningService {
    * did, under the same status and jurisdiction rules, and says so in
    * `alternateNamesIndexed`.
    *
-   * The status predicate wraps the column in `UPPER()` on purpose. Non-sargable,
-   * it cannot become the access path: ISSUED is 57% of the corpus, and the planner
-   * choosing `lei_entity_status_idx` over the name lookup or the jurisdiction index
-   * ran ~45× slower. Strict, fuzzy, and the strict→fuzzy fallback share it.
+   * The status predicate filters the joined entity row; it is never the access
+   * path. ISSUED is 57% of the corpus, and a plan that walked a status index
+   * instead of the name lookup or the jurisdiction index ran ~45× slower.
+   * `lei_entity` has no such index — schema version 2 drops the one earlier
+   * releases built and maintained on every upsert — and the predicate keeps its
+   * non-sargable `UPPER()` form, so the index an earlier release rebuilds after a
+   * rollback stays off the plan too. Strict, fuzzy, and the strict→fuzzy fallback
+   * share it.
    */
   async resolveEntity(opts: ResolveEntityOptions, ctx: Context): Promise<ResolveEntityResult> {
     const normalizedQuery = fold(opts.query);
@@ -1397,10 +1570,11 @@ export class ScreeningService {
       opts.status === 'any'
         ? ''
         : ` AND UPPER(e.status) = '${opts.status === 'issued' ? 'ISSUED' : 'LAPSED'}'`;
-    // The index path intersects the jurisdiction inside its FTS lookup; the
-    // pre-index path filters the joined row, as it always has.
+    // The index path intersects the jurisdiction inside its FTS lookup, and its
+    // exact-name lookup by the same term; the pre-index path filters the joined
+    // row, as it always has.
     const indexScope = {
-      jurisdictionMatch: opts.jurisdiction ? jurisdictionMatch(opts.jurisdiction) : '',
+      jurisdictionTerm: opts.jurisdiction ? jurisdictionTerm(opts.jurisdiction) : '',
       statusClause,
     };
     const legacyScope = {
@@ -1411,66 +1585,75 @@ export class ScreeningService {
       ? this.runLeiStrict(handle, { normalizedQuery, queryTokens, ...indexScope })
       : this.runLegacyLeiStrict(handle, { normalizedQuery, ...legacyScope });
     const strict = strictScan.results;
-    const wantFuzzy = opts.matchMode === 'fuzzy' || strict.length === 0;
-    if (!wantFuzzy || queryTokens.length === 0) {
-      return {
-        alternateNamesIndexed: indexed,
-        matches: strict.slice(offset, offset + opts.limit),
-        modeUsed: 'strict',
-        normalizedQuery,
-        fuzzyFallbackTriggered: false,
-        totalAvailable: strict.length,
-        totalAvailableBasis: strictScan.capped ? 'lower_bound' : 'exact',
-      };
-    }
-
+    const wantFuzzy = queryTokens.length > 0 && (opts.matchMode === 'fuzzy' || strict.length === 0);
     const scoring = {
       normalizedQuery,
       queryTokens,
       minScore: opts.minScore ?? this.config.fuzzyMinScore,
-      cap: this.config.fuzzyMaxResults,
     };
-    const fuzzy = indexed
-      ? this.runLeiFuzzy(handle, { ...scoring, ...indexScope })
-      : this.runLegacyLeiFuzzy(handle, { ...scoring, ...legacyScope });
+    const fuzzy = !wantFuzzy
+      ? undefined
+      : indexed
+        ? this.runLeiFuzzy(handle, { ...scoring, ...indexScope })
+        : this.runLegacyLeiFuzzy(handle, { ...scoring, ...legacyScope });
+
+    // Strict matches ahead of fuzzy, one per LEI. This is the whole ordered
+    // candidate set: it is counted and paged as one, so every candidate it holds
+    // is reachable by offset.
     const seen = new Set(strict.map((m) => m.lei));
-    const merged = [...strict, ...fuzzy.filter((m) => !seen.has(m.lei))];
+    const ranked = fuzzy ? [...strict, ...fuzzy.hits.filter((m) => !seen.has(m.lei))] : strict;
     ctx.log.debug('LEI resolution complete', {
       normalizedQuery,
       alternateNamesIndexed: indexed,
       strictCount: strict.length,
-      fuzzyCount: fuzzy.length,
+      strictScanBounded: strictScan.capped,
+      ...(fuzzy ? { fuzzyCount: fuzzy.hits.length, poolBounded: fuzzy.poolBounded } : {}),
     });
     return {
       alternateNamesIndexed: indexed,
-      matches: merged.slice(offset, offset + opts.limit),
-      modeUsed: 'fuzzy',
+      matches: ranked.slice(offset, offset + opts.limit),
+      modeUsed: fuzzy ? 'fuzzy' : 'strict',
       normalizedQuery,
-      fuzzyFallbackTriggered: opts.matchMode === 'strict' && strict.length === 0,
-      totalAvailable: merged.length,
-      // Same bound as the screening path: the fuzzy candidate pool is blocked and
-      // capped before the merge, so its count is a floor, never a corpus total.
-      totalAvailableBasis: 'lower_bound',
+      fuzzyFallbackTriggered: fuzzy !== undefined && opts.matchMode === 'strict',
+      poolBounded: fuzzy?.poolBounded ?? false,
+      strictScanBounded: strictScan.capped,
+      totalAvailable: ranked.length,
+      // A fuzzy pass scores only the candidates blocking pooled, and a strict scan
+      // that hit its bound never read the names past it: either count is a floor.
+      totalAvailableBasis: fuzzy || strictScan.capped ? 'lower_bound' : 'exact',
     };
   }
 
   /**
    * Strict pass over the name index: every query token present in one name, the
-   * jurisdiction intersected inside the same FTS lookup. An LEI several of whose
-   * names match yields one candidate: its exact name if any, else its legal name,
-   * else its first-written name — so matchedName and matchType describe one name.
+   * jurisdiction intersected inside the same FTS lookup. The scan reads at most
+   * {@link LEI_STRICT_SCAN_BOUND} names, in the order the index holds them. When
+   * it reaches the bound on a mirror with the exact-name index
+   * (`lei_name_normalized_idx`, built by the mirror scripts), the names equal to
+   * the query are read through that index too, under the same filters — so the
+   * bound can drop a strong match, never an exact one, and exact matches rank
+   * first as always. A mirror without it runs the scan alone; the equality is
+   * never looked up without the index, which on full GLEIF would read 4M names.
+   *
+   * An LEI several of whose names match yields one candidate: its exact name if
+   * any, else its legal name, else its first-written name — so matchedName and
+   * matchType describe one name.
    */
   private runLeiStrict(
     handle: SqliteHandle,
     args: {
-      jurisdictionMatch: string;
+      jurisdictionTerm: string;
       normalizedQuery: string;
       queryTokens: string[];
       statusClause: string;
     },
   ): BoundedScan<LeiMatch> {
     if (args.queryTokens.length === 0) return { results: [], capped: false };
-    const match = [...args.queryTokens.map((t) => `normalized : "${t}"`), args.jurisdictionMatch]
+    const term = args.jurisdictionTerm;
+    const match = [
+      ...args.queryTokens.map((t) => `normalized : "${t}"`),
+      term ? jurisdictionMatch(term) : '',
+    ]
       .filter(Boolean)
       .join(' AND ');
     const rows = handle
@@ -1480,12 +1663,31 @@ export class ScreeningService {
          JOIN ${LEI_NAME_TABLE} n ON n.rowid = f.rowid
          JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
          WHERE ${LEI_NAME_FTS_TABLE} MATCH ?${args.statusClause}
-         LIMIT ${LEI_STRICT_RAW_ROW_CAP}`,
+         LIMIT ${LEI_STRICT_SCAN_BOUND}`,
       )
       .all(match);
+    // Under the bound the scan read every matching name, exact ones included.
+    // `jurisdiction_terms` holds the space-separated terms its FTS column
+    // tokenizes, so the padded test matches exactly the names that match does.
+    const scanBound = rows.length >= LEI_STRICT_SCAN_BOUND;
+    const withinTerm = term
+      ? ` AND instr(' ' || n.jurisdiction_terms || ' ', ' ${term} ') > 0`
+      : '';
+    const exactRows =
+      scanBound && hasLeiNameNormalizedIndex(handle)
+        ? handle
+            .prepare<LeiNameRow>(
+              `${LEI_NAME_SELECT}
+             FROM ${LEI_NAME_TABLE} n INDEXED BY ${LEI_NAME_NORMALIZED_INDEX}
+             JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
+             WHERE n.normalized = ?${withinTerm}${args.statusClause}
+             LIMIT ${LEI_STRICT_SCAN_BOUND}`,
+            )
+            .all(args.normalizedQuery)
+        : [];
 
     const byLei = new Map<string, { exact: boolean; row: LeiNameRow }>();
-    for (const row of rows) {
+    for (const row of [...exactRows, ...rows]) {
       const exact = row.normalized === args.normalizedQuery;
       const held = byLei.get(row.lei);
       if (
@@ -1503,42 +1705,53 @@ export class ScreeningService {
         .sort(
           (a, b) => matchRank(b.matchType) - matchRank(a.matchType) || a.lei.localeCompare(b.lei),
         ),
-      capped: rows.length >= LEI_STRICT_RAW_ROW_CAP,
+      capped: scanBound,
     };
   }
 
   /**
-   * Fuzzy pass over the name index. Each distinct query-token prefix is one FTS
-   * prefix lookup against the names and the unsegmented-script suffix terms, with
-   * the jurisdiction intersected inside it — so its cost follows the names that
-   * match, not the table. The pooled LEIs' names are then read by LEI and scored.
+   * Fuzzy pass over the name index. Each distinct query-token prefix is one
+   * blocking key, `{normalized suffix_terms} : "<prefix>"*`, reaching the names
+   * with a token or an unsegmented-script suffix that opens with it, and
+   * {@link poolCandidates} pools their blocks of LEIs under its budget, so the
+   * pool never depends on the order names were written in. A lookup reads
+   * `lei_name_fts` alone, the jurisdiction intersected inside the match, and
+   * stops one name past the budget; only a block or pair that fits is joined to
+   * its LEIs, under the status filter. A block is therefore measured in names,
+   * which bound its LEIs from above: names past the budget leave it out even when
+   * fewer LEIs hold them. A stoplisted word (`FUZZY_STOPLIST`) keys no block of
+   * its own; its prefix only pairs with a block that did not fit, so `deu` ×
+   * `akt` still narrows `Deutsche` to the names that carry `Aktiengesellschaft`.
+   * The pooled LEIs' names are then read by LEI and scored.
    */
   private runLeiFuzzy(
     handle: SqliteHandle,
-    args: LeiFuzzyArgs & { jurisdictionMatch: string; statusClause: string },
-  ): LeiMatch[] {
-    // Every query token blocks, one bounded lookup each: blocking on only the
-    // first token starved the pool when it wasn't the entity's leading word
-    // (order swaps) or was a common word that exhausted the cap.
-    const block = handle.prepare<{ lei: string }>(
-      `SELECT n.lei
-       FROM ${LEI_NAME_FTS_TABLE} f
-       JOIN ${LEI_NAME_TABLE} n ON n.rowid = f.rowid
-       JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
-       WHERE ${LEI_NAME_FTS_TABLE} MATCH ?${args.statusClause}
-       LIMIT ?`,
+    args: LeiFuzzyArgs & { jurisdictionTerm: string; statusClause: string },
+  ): FuzzyPass<LeiMatch> {
+    const { distinctive, stoplisted } = splitOnStoplist(args.queryTokens);
+    const within = args.jurisdictionTerm ? ` AND ${jurisdictionMatch(args.jurisdictionTerm)}` : '';
+    const names = handle.prepare<{ rowid: number }>(
+      `SELECT rowid FROM ${LEI_NAME_FTS_TABLE} WHERE ${LEI_NAME_FTS_TABLE} MATCH ? LIMIT ?`,
     );
-    const within = args.jurisdictionMatch ? ` AND ${args.jurisdictionMatch}` : '';
-    const pooled = new Set<string>();
-    for (const prefix of blockingPrefixes(args.queryTokens)) {
-      for (const { lei } of block.all(
-        `{normalized suffix_terms} : "${prefix}"*${within}`,
-        perStrategyLimit(args.cap),
-      )) {
-        pooled.add(lei);
-      }
-    }
-    if (pooled.size === 0) return [];
+    const leisOf = handle.prepare<{ lei: string }>(
+      `SELECT DISTINCT n.lei
+       FROM ${LEI_NAME_TABLE} n
+       JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
+       WHERE n.rowid IN (SELECT value FROM json_each(?))${args.statusClause}`,
+    );
+    const pool = poolCandidates(
+      blockingPrefixes(distinctive).map(prefixKey),
+      (keys, limit) => {
+        const rows = names.all(
+          `${keys.map((key) => `(${key})`).join(' AND ')}${within}`,
+          limit + 1,
+        );
+        if (rows.length > limit) return;
+        return leisOf.all(JSON.stringify(rows.map((row) => row.rowid))).map((row) => row.lei);
+      },
+      blockingPrefixes(stoplisted).map(prefixKey),
+    );
+    if (pool.ids.size === 0) return { hits: [], poolBounded: pool.bounded };
 
     const rows = handle
       .prepare<LeiNameRow>(
@@ -1547,17 +1760,20 @@ export class ScreeningService {
          JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
          WHERE n.lei IN (SELECT value FROM json_each(?))`,
       )
-      .all(JSON.stringify([...pooled]));
+      .all(JSON.stringify([...pool.ids]));
     const byLei = new Map<string, LeiNameRow[]>();
     for (const row of rows) {
-      const names = byLei.get(row.lei);
-      if (names) names.push(row);
+      const leiNames = byLei.get(row.lei);
+      if (leiNames) leiNames.push(row);
       else byLei.set(row.lei, [row]);
     }
-    return this.rankFuzzy(
-      [...byLei.values()].map((names) => names.sort(compareNameRows)),
-      args,
-    );
+    return {
+      hits: this.rankFuzzy(
+        [...byLei.values()].map((leiNames) => leiNames.sort(compareNameRows)),
+        args,
+      ),
+      poolBounded: pool.bounded,
+    };
   }
 
   /**
@@ -1585,7 +1801,7 @@ export class ScreeningService {
          FROM ${leiStoreSpec.table}_fts f
          JOIN ${leiStoreSpec.table} e ON e.rowid = f.rowid
          WHERE ${leiStoreSpec.table}_fts MATCH ?${args.filterClause}
-         LIMIT ${LEI_STRICT_RAW_ROW_CAP}`,
+         LIMIT ${LEI_STRICT_SCAN_BOUND}`,
       )
       .all(match);
     return {
@@ -1599,21 +1815,28 @@ export class ScreeningService {
         .sort(
           (a, b) => matchRank(b.matchType) - matchRank(a.matchType) || a.lei.localeCompare(b.lei),
         ),
-      capped: rows.length >= LEI_STRICT_RAW_ROW_CAP,
+      capped: rows.length >= LEI_STRICT_SCAN_BOUND,
     };
   }
 
   /**
-   * Fuzzy pass of a mirror whose name index is not built, as 0.3.0 ran it: a
-   * `LIKE '%prefix%'` scan of legal names per query token. Other names stored
-   * with the record are scored for an entity the scan pools, but never pool one.
+   * Fuzzy pass of a mirror whose name index is not built, as 0.3.0 ran it but
+   * for a bound on its scans: a `LIKE '%prefix%'` scan of legal names per
+   * distinct distinctive-word prefix (a stoplisted word scans nothing), the
+   * first {@link LEGACY_LEI_FUZZY_PREFIX_SCANS} in query order, each stopping at
+   * {@link LEGACY_LEI_FUZZY_ROWS_PER_PREFIX} rows. A prefix left unscanned, like
+   * a scan that reaches its row limit, marks the pool bounded. Other names
+   * stored with the record are scored for an entity the scan pools, but never
+   * pool one.
    */
   private runLegacyLeiFuzzy(
     handle: SqliteHandle,
     args: LeiFuzzyArgs & { filterClause: string },
-  ): LeiMatch[] {
+  ): FuzzyPass<LeiMatch> {
     const byLei = new Map<string, LeiCandidateRow>();
-    for (const prefix of blockingPrefixes(args.queryTokens)) {
+    const prefixes = blockingPrefixes(splitOnStoplist(args.queryTokens).distinctive);
+    let bounded = prefixes.length > LEGACY_LEI_FUZZY_PREFIX_SCANS;
+    for (const prefix of prefixes.slice(0, LEGACY_LEI_FUZZY_PREFIX_SCANS)) {
       const part = handle
         .prepare<LeiCandidateRow>(
           `SELECT e.lei, e.legal_name, e.normalized_name, e.other_names, e.jurisdiction, e.status
@@ -1621,47 +1844,57 @@ export class ScreeningService {
            WHERE e.normalized_name LIKE ?${args.filterClause}
            LIMIT ?`,
         )
-        .all(`%${prefix}%`, perStrategyLimit(args.cap));
+        .all(`%${prefix}%`, LEGACY_LEI_FUZZY_ROWS_PER_PREFIX);
+      if (part.length >= LEGACY_LEI_FUZZY_ROWS_PER_PREFIX) bounded = true;
       for (const r of part) if (!byLei.has(r.lei)) byLei.set(r.lei, r);
     }
-    return this.rankFuzzy(
-      [...byLei.values()].map((row) => [
-        { ...row, name: row.legal_name, name_type: LEGAL_NAME_TYPE },
-        ...(JSON.parse(row.other_names || '[]') as string[]).map((name) => ({
-          ...row,
-          name,
-          name_type: UNKNOWN_NAME_TYPE,
-        })),
-      ]),
-      args,
-    );
+    return {
+      hits: this.rankFuzzy(
+        [...byLei.values()].map((row) => [
+          { ...row, name: row.legal_name, name_type: LEGAL_NAME_TYPE },
+          ...(JSON.parse(row.other_names || '[]') as string[]).map((name) => ({
+            ...row,
+            name,
+            name_type: UNKNOWN_NAME_TYPE,
+          })),
+        ]),
+        args,
+      ),
+      poolBounded: bounded,
+    };
   }
 
   /**
    * Score each pooled LEI's names — legal name first — and keep its best
-   * admitted name, then rank and cap. The admission gate is runFuzzy's, applied
+   * admitted name, then rank every admitted LEI. The admission gate is runFuzzy's, applied
    * per name: a name is eligible only when it explains enough of the query (the
-   * whole string clears the floor, or at least half the query tokens do), so one
-   * strong token pair can't carry an unrelated multi-token query on a short name.
-   * The surfaced score is the raw Jaro-Winkler max of that one name, and coverage
-   * is the same name's, so matchedName / matchedNameType / score / coverage
+   * whole string clears the floor, or it covers enough of the query's distinctive
+   * tokens), so one strong token pair — or a shared legal form — can't carry an
+   * unrelated multi-token query on a short name. The surfaced score is the raw
+   * Jaro-Winkler max of that one name, and coverage is the same name's, over
+   * every query token, so matchedName / matchedNameType / score / coverage
    * describe one name. Ties on score go to higher coverage, then to the earlier name.
    */
   private rankFuzzy(candidates: LeiCandidateName[][], args: LeiFuzzyArgs): LeiMatch[] {
+    const { distinctive } = splitOnStoplist(args.queryTokens);
+    const required = requiredCoverage(args.queryTokens.length, distinctive.length);
+    const query = scoringQuery(args.queryTokens);
     const scored: LeiMatch[] = [];
     for (const names of candidates) {
       let best: { covered: number; name: (typeof names)[number]; score: number } | undefined;
       for (const name of names) {
         const folded = fold(name.name);
-        const candidateTokens = tokenize(folded);
         const wholeScore = jaroWinkler(args.normalizedQuery, folded);
-        const tokenScore = bestTokenScore(args.queryTokens, candidateTokens);
-        const covered = tokenCoverage(args.queryTokens, candidateTokens, args.minScore);
+        const {
+          best: tokenScore,
+          covered,
+          distinctiveCovered,
+        } = scoreTokenPairs(query, tokenize(folded), args.minScore);
         const admitted = this.admitFuzzy(
           args.normalizedQuery,
           folded,
-          args.queryTokens.length,
-          covered,
+          required,
+          distinctiveCovered,
           wholeScore,
           tokenScore,
           args.minScore,
@@ -1680,9 +1913,7 @@ export class ScreeningService {
         });
       }
     }
-    return scored
-      .sort((a, b) => compareFuzzyRank(a, b) || a.lei.localeCompare(b.lei))
-      .slice(0, args.cap);
+    return scored.sort((a, b) => compareFuzzyRank(a, b) || a.lei.localeCompare(b.lei));
   }
 
   /** Full GLEIF Level 1 entity by LEI, or null — in one shape whichever release stored it. */
@@ -1826,20 +2057,48 @@ function blockingPrefixes(tokens: readonly string[]): string[] {
   return [...new Set(prefixes)];
 }
 
+/** The FTS5 lookup of a blocking prefix in both name indexes: fold tokens and unsegmented-script suffixes. */
+function prefixKey(prefix: string): string {
+  return `{normalized suffix_terms} : "${prefix}"*`;
+}
+
 /**
- * Rows each fuzzy blocking lookup may pool: the per-strategy budget keeps total
- * work bounded while every query token contributes; the scored set is still
- * capped to `cap` afterwards.
+ * How many distinctive tokens (off `FUZZY_STOPLIST`) a candidate must cover to
+ * pass the token arm of the fuzzy gate: half the query's tokens, rounded up — so
+ * a stoplisted token never lowers the bar — or every distinctive token when fewer
+ * remain. A query with no stoplisted token keeps the plain half-coverage gate.
  */
-function perStrategyLimit(cap: number): number {
-  return Math.max(cap * 4, 200);
+function requiredCoverage(queryTokenCount: number, distinctiveCount: number): number {
+  return Math.min(Math.ceil(queryTokenCount / 2), distinctiveCount);
+}
+
+/**
+ * A token in a script written without word separators: its fold is one token
+ * however many words it holds, so it is also indexed by its suffixes.
+ */
+const UNSEGMENTED_SCRIPT =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+
+/**
+ * Every proper suffix of two or more code points of each unsegmented-script
+ * token in a folded name, space-separated — so a prefix lookup for `國際證`
+ * reaches `交銀國際證券有限公司`. Empty for a name with no such token. Both name
+ * indexes carry these terms, so both fuzzy paths block such names mid-token.
+ */
+function suffixTerms(normalized: string): string {
+  const terms: string[] = [];
+  for (const token of tokenize(normalized)) {
+    if (!UNSEGMENTED_SCRIPT.test(token)) continue;
+    const codePoints = [...token];
+    for (let i = 1; i <= codePoints.length - 2; i++) terms.push(codePoints.slice(i).join(''));
+  }
+  return terms.join(' ');
 }
 
 // ─── GLEIF name index ────────────────────────────────────────────────────────
 
 /** The inputs of a fuzzy LEI pass that scoring needs. */
 interface LeiFuzzyArgs {
-  cap: number;
   minScore: number;
   normalizedQuery: string;
   queryTokens: string[];
@@ -1861,13 +2120,6 @@ const LEI_NAME_SELECT = `SELECT n.rowid AS rowid, n.lei, n.name, n.normalized, n
 
 /** A two-letter country code, as opposed to an ISO 3166-2 subdivision code. */
 const COUNTRY_CODE = /^[A-Z]{2}$/;
-
-/**
- * A token in a script written without word separators: its fold is one token
- * however many words it holds, so it is also indexed by its suffixes.
- */
-const UNSEGMENTED_SCRIPT =
-  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
 
 /** Build a {@link LeiMatch} from an entity row and the one name it matched on. */
 function leiMatch(
@@ -1895,13 +2147,18 @@ function compareNameRows(a: LeiNameRow, b: LeiNameRow): number {
 }
 
 /**
- * The FTS clause matching a jurisdiction filter against `jurisdiction_terms`
- * (see {@link jurisdictionTerms}): a country matches its `jc` term, which every
- * subdivision under it carries too; a subdivision matches its own `jx` term.
+ * The `jurisdiction_terms` term a jurisdiction filter matches (see
+ * {@link jurisdictionTerms}): a country its `jc` term, which every subdivision
+ * under it carries too; a subdivision its own `jx` term. Letters and digits only.
  */
-function jurisdictionMatch(code: string): string {
+function jurisdictionTerm(code: string): string {
   const term = code.toLowerCase().replace(/[^a-z0-9]/g, '');
-  return `jurisdiction_terms : "${COUNTRY_CODE.test(code) ? 'jc' : 'jx'}${term}"`;
+  return `${COUNTRY_CODE.test(code) ? 'jc' : 'jx'}${term}`;
+}
+
+/** The FTS clause matching a {@link jurisdictionTerm} against `jurisdiction_terms`. */
+function jurisdictionMatch(term: string): string {
+  return `jurisdiction_terms : "${term}"`;
 }
 
 /**
@@ -1916,21 +2173,6 @@ function jurisdictionTerms(code: string | undefined): string {
   const country = upper.split('-')[0] ?? '';
   const clean = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
   return `jc${clean(country)} jx${clean(upper)}`;
-}
-
-/**
- * Every proper suffix of two or more code points of each unsegmented-script
- * token in a folded name, space-separated — so a prefix lookup for `國際證`
- * reaches `交銀國際證券有限公司`. Empty for a name with no such token.
- */
-function suffixTerms(normalized: string): string {
-  const terms: string[] = [];
-  for (const token of tokenize(normalized)) {
-    if (!UNSEGMENTED_SCRIPT.test(token)) continue;
-    const codePoints = [...token];
-    for (let i = 1; i <= codePoints.length - 2; i++) terms.push(codePoints.slice(i).join(''));
-  }
-  return terms.join(' ');
 }
 
 /**
@@ -2018,8 +2260,8 @@ function walkDesignations(
 
 function prepareNameInsert(handle: SqliteHandle): SqliteStatement {
   return handle.prepare(
-    `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type, suffix_terms)
+     VALUES (?, ?, ?, ?, ?, ?)`,
   );
 }
 
@@ -2040,8 +2282,44 @@ function writeNames(
   for (const rec of [{ name: primaryName, nameType: 'primary' as const }, ...aliases]) {
     const normalized = fold(rec.name);
     if (!normalized) continue;
-    insert.run(designationId, rec.name, normalized, doubleMetaphone(normalized), rec.nameType);
+    insert.run(
+      designationId,
+      rec.name,
+      normalized,
+      doubleMetaphone(normalized),
+      rec.nameType,
+      suffixTerms(normalized),
+    );
   }
+}
+
+/**
+ * Rebuild the name index from scratch — dropped and recreated in the current
+ * shape, so whatever shape or rows it held before — from every stored
+ * designation, and record `stamp` as the run it was built after. The caller owns
+ * the transaction.
+ */
+function rebuildNameIndex(handle: SqliteHandle, stamp: string): void {
+  dropNameIndex(handle);
+  ensureDesignationAuxSchema(handle);
+  const insert = prepareNameInsert(handle);
+  walkDesignations(handle, (row, payload) =>
+    writeNames(insert, row.id, row.primary_name, payload.aliases),
+  );
+  writeNameIndexStamp(handle, stamp);
+}
+
+/** The stamp the name index was last built under by this release or a later one, or undefined. */
+function nameIndexStamp(handle: SqliteHandle): string | undefined {
+  return handle
+    .prepare<{ stamp: string }>(`SELECT stamp FROM ${NAME_INDEX_STAMP_TABLE} WHERE id = 1`)
+    .get()?.stamp;
+}
+
+function writeNameIndexStamp(handle: SqliteHandle, stamp: string): void {
+  handle
+    .prepare(`INSERT OR REPLACE INTO ${NAME_INDEX_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
+    .run(stamp);
 }
 
 /** Index a designation's identifiers under their categories' keys; one that normalizes to nothing is skipped. */
@@ -2129,9 +2407,9 @@ function matchRank(type: ScreeningHit['matchType']): number {
  * explains; without a second key those ties fall through to an identity key that
  * carries no quality signal at all.
  *
- * Callers append that identity key (designation id / LEI) as the terminal
- * tie-break, which is what makes the order total — the precondition offset
- * pagination depends on.
+ * Callers append that identity key ({@link compareDesignationIdentity} / LEI) as
+ * the terminal tie-break, which is what makes the order total — the precondition
+ * offset pagination depends on.
  */
 function compareFuzzyRank(
   a: { queryTokenCoverage?: QueryTokenCoverage; score?: number },
@@ -2141,6 +2419,75 @@ function compareFuzzyRank(
     (b.score ?? 0) - (a.score ?? 0) ||
     (b.queryTokenCoverage?.covered ?? 0) - (a.queryTokenCoverage?.covered ?? 0)
   );
+}
+
+/** Compares digit runs by value, so `2677` sorts before `26079`. */
+const ENTRY_ID_COLLATOR = new Intl.Collator('en', { numeric: true });
+
+/**
+ * The identity order every designation sort ends on: source in
+ * {@link SOURCE_CODES} order, then entry ID by numeric collation, then entry ID
+ * by code units. Numeric collation equates zero-padded variants (`RUS0251`,
+ * `RUS251`); the last key separates them, keeping the order total for offset
+ * pagination. It carries no match signal — it only fixes where tied candidates fall.
+ */
+export function compareDesignationIdentity(
+  a: Pick<ScreeningHit, 'source' | 'sourceEntryId'>,
+  b: Pick<ScreeningHit, 'source' | 'sourceEntryId'>,
+): number {
+  return (
+    SOURCE_CODES.indexOf(a.source) - SOURCE_CODES.indexOf(b.source) ||
+    ENTRY_ID_COLLATOR.compare(a.sourceEntryId, b.sourceEntryId) ||
+    (a.sourceEntryId < b.sourceEntryId ? -1 : a.sourceEntryId > b.sourceEntryId ? 1 : 0)
+  );
+}
+
+/** The two OFAC files, which publish a party on the SDN List and a non-SDN list under one entry ID. */
+const OFAC_SOURCES: ReadonlySet<SourceCode> = new Set(['ofac_sdn', 'ofac_consolidated']);
+
+/**
+ * Fold a ranked hit list's records of one OFAC entry into one hit. OFAC
+ * publishes a party on both the SDN List and a non-SDN list (SSI, NS-PLC) in
+ * `SDN_ADVANCED.XML` and `CONS_ADVANCED.XML` under the same entry ID, so a
+ * screen of both lists reaches one party twice. The better-ranked record — the
+ * first, which is the SDN record on a tie, since every sort ends on
+ * {@link compareDesignationIdentity} — keeps its position and every field, so
+ * the hit is attributable to its `source`; the other record adds its list to
+ * `sources`. The two records can differ (each file dates the party from its own
+ * lists), and the other record stays reachable by entry ID under its own list.
+ * A list holding one hit per entry is returned as is, so grouping applies only
+ * when both OFAC lists were selected.
+ *
+ * `absorb` is for a hit that records what matched it rather than only the
+ * record (the cross-reference's producers and identifiers): it folds those of
+ * the other record into the kept hit. Which records group, which is kept, where
+ * it sits, and `sources` stay this function's rule.
+ */
+export function groupOfacCopies<
+  T extends Pick<ScreeningHit, 'source' | 'sourceEntryId' | 'sources'>,
+>(ranked: readonly T[], absorb: (kept: T, other: T) => T = (kept) => kept): T[] {
+  /** Each OFAC entry's kept hit and its position in `grouped`. */
+  const groups = new Map<string, { at: number; kept: T }>();
+  const grouped: T[] = [];
+  for (const hit of ranked) {
+    const group = OFAC_SOURCES.has(hit.source) ? groups.get(hit.sourceEntryId) : undefined;
+    if (!group) {
+      if (OFAC_SOURCES.has(hit.source)) {
+        groups.set(hit.sourceEntryId, { at: grouped.length, kept: hit });
+      }
+      grouped.push(hit);
+      continue;
+    }
+    const { kept } = group;
+    group.kept = {
+      ...absorb(kept, hit),
+      sources: SOURCE_CODES.filter(
+        (code) => kept.sources.includes(code) || hit.sources.includes(code),
+      ),
+    };
+    grouped[group.at] = group.kept;
+  }
+  return grouped;
 }
 
 /**

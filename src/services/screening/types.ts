@@ -79,6 +79,20 @@ export interface DobRecord {
 }
 
 /**
+ * A value a source publishes to describe a party rather than identify it — a
+ * vessel's flag, type, tonnage, or build year, an aircraft's model or operator, a
+ * title, a gender, a sanctions note. Never read by matching.
+ */
+export interface FeatureRecord {
+  /** Set when the source flags a date value approximate; never on another value. */
+  circa?: true;
+  /** The source's own label, verbatim: OFAC's feature type, the UK element name. */
+  type: string;
+  /** The value as published; a date is ISO 8601 at the precision the source published. */
+  value: string;
+}
+
+/**
  * The full normalized record for one designation, stored as JSON in
  * `designation.payload` and surfaced by `sanctions_get_designation`.
  */
@@ -86,6 +100,12 @@ export interface DesignationPayload {
   addresses: AddressRecord[];
   aliases: NameRecord[];
   datesOfBirth: DobRecord[];
+  /**
+   * Descriptive values, in document order, duplicates collapsed — `[]` from a
+   * source that publishes none. Absent only on a payload stored before the group
+   * existed, which the read path returns as `[]`.
+   */
+  features?: FeatureRecord[];
   identifiers: IdentifierRecord[];
   nationalities: string[];
   /** Free-form remarks/title published by the source, when present. */
@@ -289,8 +309,15 @@ export interface ScreeningHit {
    * which are deterministic and not scored.
    */
   score?: number;
+  /** The list whose record every other field describes — see {@link ScreeningHit.sources}. */
   source: SourceCode;
   sourceEntryId: string;
+  /**
+   * Every selected list whose record of this entry the screen reached, in
+   * {@link SOURCE_CODES} order: `[source]`, or `ofac_sdn` and `ofac_consolidated`
+   * when one OFAC entry's two records are grouped into this hit.
+   */
+  sources: SourceCode[];
 }
 
 /** A scored LEI resolution candidate. */

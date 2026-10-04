@@ -40,12 +40,6 @@ const ServerConfigSchema = z.object({
     .max(1)
     .default(0.85)
     .describe('Default Jaro-Winkler similarity floor for fuzzy matches when min_score is omitted.'),
-  fuzzyMaxResults: z.coerce
-    .number()
-    .int()
-    .min(1)
-    .default(50)
-    .describe('Hard cap on fuzzy candidates scored per query, to bound work on short queries.'),
   ofacSdnUrl: z
     .string()
     .default(DEFAULT_SOURCE_URLS.ofacSdn)
@@ -82,7 +76,6 @@ export function getServerConfig(): ServerConfig {
     mirrorPath: 'SANCTIONS_MIRROR_PATH',
     refreshCron: 'SANCTIONS_REFRESH_CRON',
     fuzzyMinScore: 'SANCTIONS_FUZZY_MIN_SCORE',
-    fuzzyMaxResults: 'SANCTIONS_FUZZY_MAX_RESULTS',
     ofacSdnUrl: 'OFAC_SDN_URL',
     ofacConsolidatedUrl: 'OFAC_CONSOLIDATED_URL',
     euFsfUrl: 'EU_FSF_URL',

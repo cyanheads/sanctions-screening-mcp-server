@@ -86,6 +86,7 @@ const OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
       <FeatureType ID="8">Birthdate</FeatureType>
       <FeatureType ID="9">Place of Birth</FeatureType>
     </FeatureTypeValues>
+    <ListValues><List ID="1550">SDN List</List></ListValues>
     <PartySubTypeValues>
       <PartySubType ID="1" PartyTypeID="4">Vessel</PartySubType>
       <PartySubType ID="2" PartyTypeID="4">Aircraft</PartySubType>
@@ -706,6 +707,7 @@ const DETAIL_OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
       <IDRegDocType ID="1570">Cedula No.</IDRegDocType>
       <IDRegDocType ID="1571">Passport</IDRegDocType>
     </IDRegDocTypeValues>
+    <ListValues><List ID="1550">SDN List</List></ListValues>
     <LocPartTypeValues>
       <LocPartType ID="1">Unknown</LocPartType>
       <LocPartType ID="1450">REGION</LocPartType>
@@ -1426,6 +1428,39 @@ describe('published designation details (issue #22)', () => {
     });
   });
 
+  it('stores no "not available" placeholder as an identifier, beside a real one (issue #67)', () => {
+    // CTI0008 publishes `N/A` as a passport number; the EU writes `number="-"`.
+    const [uk] = parseUk(
+      parseXml(`<Designations><Designation><UniqueID>CTI0008</UniqueID>
+        <Names><Name><Name6>PLACEHOLDER PASSPORT PERSON</Name6><NameType>Primary Name</NameType></Name></Names>
+        <IndividualEntityShip>Individual</IndividualEntityShip>
+        <IndividualDetails><Individual>
+          <PassportDetails>
+            <Passport><PassportNumber>N/A</PassportNumber></Passport>
+            <Passport><PassportNumber>n.a.</PassportNumber></Passport>
+            <Passport><PassportNumber>D0009871</PassportNumber></Passport>
+          </PassportDetails>
+          <NationalIdentifierDetails><NationalIdentifier><NationalIdentifierNumber>N/A</NationalIdentifierNumber></NationalIdentifier></NationalIdentifierDetails>
+        </Individual></IndividualDetails>
+      </Designation></Designations>`),
+    );
+    const [eu] = parseEu(
+      parseXml(`<export><sanctionEntity logicalId="177685"><subjectType code="enterprise"/>
+        <nameAlias wholeName="Dash Number Company" strong="true"/>
+        <identification number="-" identificationTypeCode="regnumber" identificationTypeDescription="Registration Number" countryDescription="IRAN (ISLAMIC REPUBLIC OF)"/>
+        <identification number="10380236940" identificationTypeCode="regnumber" identificationTypeDescription="Registration Number" countryDescription="IRAN (ISLAMIC REPUBLIC OF)"/>
+      </sanctionEntity></export>`),
+    );
+    expect(uk?.payload.identifiers).toEqual([{ type: 'Passport', value: 'D0009871' }]);
+    expect(eu?.payload.identifiers).toEqual([
+      {
+        type: 'Registration Number',
+        value: '10380236940',
+        country: 'IRAN (ISLAMIC REPUBLIC OF)',
+      },
+    ]);
+  });
+
   it('never infers a nationality from an address or a birthplace country', () => {
     const records = [
       byEntryId(parseEu(parseXml(DETAIL_EU_XML)), '601'),
@@ -2035,6 +2070,394 @@ describe('EU — ranges, circa, and the entity designation date (issue #39)', ()
   });
 });
 
+// ─── Designation date and legal basis per list (issues #63, #66) ───────────────
+//
+// An OFAC party has one <SanctionsEntry> per list it is on, each with one
+// <EntryEvent> per legal basis. Its designation date is the earliest event date
+// over the entries on the lists its source publishes — the SDN List for
+// `ofac_sdn`, every other list for `ofac_consolidated` — and its legal basis is
+// every LegalBasisShortRef those events cite, in document order, duplicates
+// collapsed. The programme is read from every entry, as before.
+
+/** One `<EntryEvent>`: a full date and the legal basis it cites. */
+const ofacEvent = (ymd: string, legalBasisId: string) => {
+  const [year, month, day] = ymd.split('-');
+  return `<EntryEvent ID="1" EntryEventTypeID="1" LegalBasisID="${legalBasisId}"><Comment /><Date CalendarTypeID="1"><Year>${year}</Year><Month>${Number(month)}</Month><Day>${Number(day)}</Day></Date></EntryEvent>`;
+};
+
+/** One `<SanctionsEntry>` on `listId`: its events, then its programme measures. */
+const ofacEntry = (profileId: string, listId: string, events: string[], programs: string[]) =>
+  `<SanctionsEntry ID="${profileId}" ProfileID="${profileId}" ListID="${listId}">${events.join('')}${programs.map((p) => `<SanctionsMeasure ID="1" SanctionsTypeID="1"><Comment>${p}</Comment></SanctionsMeasure>`).join('')}</SanctionsEntry>`;
+
+/**
+ * Parties 17022, 34741, 35096, 9640, and 15268 with the entries the 2026-10-02
+ * OFAC publication gives them, in its order (every SDN List entry, then the
+ * other lists). 60001 has an entry whose events disagree and cite only an
+ * `Unknown` and an unpublished legal basis, plus an entry on an unpublished
+ * list; 60002 is on an unpublished list only.
+ */
+const ENTRY_OFAC_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Sanctions>
+  <ReferenceValueSets>
+    <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+    <LegalBasisValues>
+      <LegalBasis ID="1" LegalBasisShortRef="Unknown" LegalBasisTypeID="1" SanctionsProgramID="1">Unknown</LegalBasis>
+      <LegalBasis ID="91262" LegalBasisShortRef="General License 4 Under EO 13224 (Terrorism)" LegalBasisTypeID="1" SanctionsProgramID="1">General License 4 Under EO 13224 (Terrorism)</LegalBasis>
+      <LegalBasis ID="91414" LegalBasisShortRef="CISADA" LegalBasisTypeID="1" SanctionsProgramID="1">CISADA</LegalBasis>
+      <LegalBasis ID="91503" LegalBasisShortRef="Executive Order 13662 (Ukraine)" LegalBasisTypeID="1" SanctionsProgramID="1">Executive Order 13662 (Ukraine)</LegalBasis>
+      <LegalBasis ID="92049" LegalBasisShortRef="Executive Order 14024 (Russia)" LegalBasisTypeID="1" SanctionsProgramID="1">Executive Order 14024 (Russia)</LegalBasis>
+    </LegalBasisValues>
+    <ListValues>
+      <List ID="1550">SDN List</List>
+      <List ID="91243">Non-SDN Palestinian Legislative Council List</List>
+      <List ID="91507">Sectoral Sanctions Identifications List</List>
+      <List ID="91512">Consolidated List</List>
+      <List ID="91763">CAPTA List</List>
+    </ListValues>
+    <PartySubTypeValues><PartySubType ID="3" PartyTypeID="2">Unknown</PartySubType></PartySubTypeValues>
+  </ReferenceValueSets>
+  <DistinctParties>
+    ${['17022', '34741', '35096', '9640', '15268', '60001', '60002'].map((ref) => ofacParty(ref, ref, `PARTY ${ref}`, [])).join('\n')}
+  </DistinctParties>
+  <SanctionsEntries>
+    ${ofacEntry('17022', '1550', [ofacEvent('2025-10-22', '91503'), ofacEvent('2025-10-22', '92049')], ['UKRAINE-EO13662', 'RUSSIA-EO14024'])}
+    ${ofacEntry('34741', '1550', [ofacEvent('2024-02-23', '91503'), ofacEvent('2024-02-23', '92049')], ['RUSSIA-EO14024', 'UKRAINE-EO13662'])}
+    ${ofacEntry('35096', '1550', [ofacEvent('2022-02-25', '92049')], ['RUSSIA-EO14024'])}
+    ${ofacEntry('60001', '1550', [ofacEvent('2019-05-02', '1'), ofacEvent('2018-03-01', '424242')], ['SDGT'])}
+    ${ofacEntry('60001', '777777', [ofacEvent('2001-01-01', '92049')], [])}
+    ${ofacEntry('9640', '91243', [ofacEvent('2006-04-12', '91262')], ['NS-PLC'])}
+    ${ofacEntry('17022', '91507', [ofacEvent('2014-07-16', '91503'), ofacEvent('2014-07-16', '92049')], ['UKRAINE-EO13662', 'RUSSIA-EO14024'])}
+    ${ofacEntry('9640', '91512', [ofacEvent('2014-10-10', '91262')], ['NS-PLC'])}
+    ${ofacEntry('15268', '91512', [ofacEvent('2014-10-10', '91414')], ['561-Related'])}
+    ${ofacEntry('17022', '91512', [ofacEvent('2014-10-10', '91503'), ofacEvent('2014-10-10', '92049')], ['UKRAINE-EO13662', 'RUSSIA-EO14024'])}
+    ${ofacEntry('15268', '91763', [ofacEvent('2019-03-14', '91414')], ['561-Related'])}
+    ${ofacEntry('60002', '777777', [ofacEvent('2020-01-01', '92049')], ['ORPHAN-LIST'])}
+  </SanctionsEntries>
+</Sanctions>`;
+
+describe('OFAC advanced — designation date and legal basis from the source lists (issues #63, #66)', () => {
+  /** `entryId → [designationDate, legalBasis, program]` for one source's parse. */
+  const columns = (source: 'ofac_sdn' | 'ofac_consolidated') =>
+    Object.fromEntries(
+      parseOfac(parseXml(ENTRY_OFAC_XML), source).map((d) => [
+        d.sourceEntryId,
+        [d.designationDate, d.legalBasis, d.program],
+      ]),
+    );
+  const UKRAINE_RUSSIA = 'Executive Order 13662 (Ukraine); Executive Order 14024 (Russia)';
+
+  it('ofac_sdn: the SDN List entry, read across all of its events', () => {
+    expect(columns('ofac_sdn')).toEqual({
+      '17022': ['2025-10-22', UKRAINE_RUSSIA, 'UKRAINE-EO13662, RUSSIA-EO14024'],
+      '34741': ['2024-02-23', UKRAINE_RUSSIA, 'RUSSIA-EO14024, UKRAINE-EO13662'],
+      '35096': ['2022-02-25', 'Executive Order 14024 (Russia)', 'RUSSIA-EO14024'],
+      // Events that disagree give their earliest date; an `Unknown` or unpublished
+      // legal basis is no legal basis, and an entry on an unpublished list adds nothing.
+      '60001': ['2018-03-01', undefined, 'SDGT'],
+      // Published on no SDN List entry: no date and no legal basis, the programme as read.
+      '9640': [undefined, undefined, 'NS-PLC'],
+      '15268': [undefined, undefined, '561-Related'],
+      '60002': [undefined, undefined, 'ORPHAN-LIST'],
+    });
+  });
+
+  it('ofac_consolidated: the earliest entry on any list but the SDN List', () => {
+    expect(columns('ofac_consolidated')).toEqual({
+      '17022': ['2014-07-16', UKRAINE_RUSSIA, 'UKRAINE-EO13662, RUSSIA-EO14024'],
+      '9640': ['2006-04-12', 'General License 4 Under EO 13224 (Terrorism)', 'NS-PLC'],
+      '15268': ['2014-10-10', 'CISADA', '561-Related'],
+      '34741': [undefined, undefined, 'RUSSIA-EO14024, UKRAINE-EO13662'],
+      '35096': [undefined, undefined, 'RUSSIA-EO14024'],
+      '60001': [undefined, undefined, 'SDGT'],
+      '60002': [undefined, undefined, 'ORPHAN-LIST'],
+    });
+  });
+
+  it.each(['ofac_sdn', 'ofac_consolidated'] as const)(
+    '%s: streams the same dates and legal bases at every chunk size',
+    async (source) => {
+      const oracle = parseOfac(parseXml(ENTRY_OFAC_XML), source);
+      expect(oracle.some((d) => d.legalBasis?.includes('; '))).toBe(true);
+      for (const size of CHUNK_SIZES) {
+        const { records, state } = await streamAll(
+          (chunks, s) => streamOfacFromText(chunks, source, s),
+          ENTRY_OFAC_XML,
+          size,
+        );
+        expect(withDeferred(records, state), `chunk size ${size}`).toEqual(oracle);
+      }
+    },
+  );
+});
+
+describe('EU, UK, and UN legal basis (issue #66)', () => {
+  it("EU: each entity-level regulation's numberTitle, verbatim, not a detail's regulationSummary", () => {
+    const [eu, bare] = parseEu(
+      parseXml(`<export>
+        <sanctionEntity designationDate="2014-03-17" euReferenceNumber="EU.3506.3" logicalId="7290">
+          <regulation regulationType="amendment" publicationDate="2023-03-14" numberTitle="2023/571 (OJ L75 I)" programme="UKR" logicalId="172660"/>
+          <subjectType code="person" classificationCode="P"/>
+          <nameAlias wholeName="Vladimir Michailovich DZHABAROV" strong="true">
+            <regulationSummary regulationType="amendment" numberTitle="2020/398 (OJ L78)"/>
+          </nameAlias>
+        </sanctionEntity>
+        <sanctionEntity logicalId="1"><regulation programme="IRQ"/><subjectType code="person"/><nameAlias wholeName="No Number Title" strong="true"/></sanctionEntity>
+      </export>`),
+    );
+    expect(eu?.legalBasis).toBe('2023/571 (OJ L75 I)');
+    expect(eu?.program).toBe('UKR');
+    expect(bare?.legalBasis).toBeUndefined();
+  });
+
+  it('UK: the RegimeName the designation is made under', () => {
+    const [uk] = parseUk(parseXml(DETAIL_UK_XML));
+    expect(uk?.legalBasis).toBe('The Afghanistan (Sanctions) (EU Exit) Regulations 2020');
+    expect(byEntryId(parseUk(parseXml(DETAIL_UK_XML)), 'RUS1000').legalBasis).toBeUndefined();
+  });
+
+  it('UN: publishes no per-designation legal instrument, so none is set', () => {
+    expect(parseUn(parseXml(DETAIL_UN_XML)).map((d) => d.legalBasis)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+});
+
+// ─── Descriptive features (issue #64) ───────────────────────────────────────────
+//
+// Values a list publishes to describe a party rather than identify it land in
+// `features`, typed by the source's own label, in document order, duplicates
+// collapsed: every OFAC feature no other group reads, in each of its four value
+// shapes, and every UK ship detail but the IMO number. Matching never reads them.
+
+/** An OFAC lookup `<Feature>`: its value is a `<DetailReference>` label. */
+const ofacLookup = (typeId: string, referenceId: string) =>
+  `<Feature FeatureTypeID="${typeId}"><FeatureVersion ReliabilityID="1"><Comment /><VersionDetail DetailTypeID="1431" DetailReferenceID="${referenceId}" /></FeatureVersion></Feature>`;
+
+/** An OFAC `<Feature>` whose value is a `<Location>`, beside the empty detail OFAC publishes with it. */
+const ofacLocated = (typeId: string, locationId: string) =>
+  `<Feature FeatureTypeID="${typeId}"><FeatureVersion ReliabilityID="1"><Comment /><VersionDetail DetailTypeID="1433" /><VersionLocation LocationID="${locationId}" /></FeatureVersion></Feature>`;
+
+/**
+ * Vessels 52251 and 4238 and organization 3751 with the features the 2026-10-02
+ * publication gives them, in its order, and 70001 with one feature of each
+ * remaining shape: a country `<Location>`, an approximate date, an unresolved
+ * feature type, an unresolved lookup, an empty value, and a repeated value.
+ */
+const FEATURE_OFAC_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Sanctions>
+  <ReferenceValueSets>
+    <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+    <CountryValues><Country ID="11065" ISO2="CU">Cuba</Country></CountryValues>
+    <DetailReferenceValues>
+      <DetailReference ID="704">General Cargo</DetailReference>
+      <DetailReference ID="705">Tug</DetailReference>
+      <DetailReference ID="91948">Mining of other non-ferrous metal ores</DetailReference>
+      <DetailReference ID="92764">See Section 11 of Executive Order 14024.</DetailReference>
+    </DetailReferenceValues>
+    <FeatureTypeValues>
+      <FeatureType ID="1">Vessel Call Sign</FeatureType>
+      <FeatureType ID="2">VESSEL TYPE</FeatureType>
+      <FeatureType ID="3">Vessel Flag</FeatureType>
+      <FeatureType ID="4">Vessel Owner</FeatureType>
+      <FeatureType ID="6">Vessel Gross Registered Tonnage</FeatureType>
+      <FeatureType ID="25">Location</FeatureType>
+      <FeatureType ID="26">Title</FeatureType>
+      <FeatureType ID="224">Gender</FeatureType>
+      <FeatureType ID="365">Nationality of Registration</FeatureType>
+      <FeatureType ID="504">Secondary sanctions risk:</FeatureType>
+      <FeatureType ID="646">Organization Established Date</FeatureType>
+      <FeatureType ID="647">Organization Type:</FeatureType>
+    </FeatureTypeValues>
+    <LocPartTypeValues><LocPartType ID="1">Unknown</LocPartType><LocPartType ID="1454">CITY</LocPartType></LocPartTypeValues>
+    <PartySubTypeValues>
+      <PartySubType ID="1" PartyTypeID="4">Vessel</PartySubType>
+      <PartySubType ID="3" PartyTypeID="2">Unknown</PartySubType>
+    </PartySubTypeValues>
+  </ReferenceValueSets>
+  <Locations>
+    <Location ID="2237"><LocationCountry CountryID="11065" /><LocationPart LocPartTypeID="1454"><LocationPartValue Primary="true"><Value>Havana</Value></LocationPartValue></LocationPart></Location>
+    <Location ID="186120"><LocationPart LocPartTypeID="1"><LocationPartValue Primary="true"><Value>Korea, North</Value></LocationPartValue></LocationPart></Location>
+  </Locations>
+  <DistinctParties>
+    ${ofacParty('52251', '43843', 'OCEAN 28', [
+      ofacLookup('504', '92764'),
+      ofacLookup('2', '704'),
+      ofacText('1', '3E6850'),
+      ofacText('3', 'Panama'),
+    ])}
+    ${ofacParty('4238', '1663', 'MAR AZUL', [
+      ofacText('1', 'CL2192'),
+      ofacText('3', 'Cuba'),
+      ofacText('4', 'Samir de Navegacion S.A.'),
+      ofacText('6', '212'),
+      ofacLookup('2', '705'),
+      ofacLocated('25', '2237'),
+    ])}
+    ${ofacParty('3751', '4443', 'EXAMPLE MINING ORGANIZATION', [
+      ofacBirthdate(['1994-01-01', '1994-01-01'], ['1994-12-31', '1994-12-31']).replace(
+        'FeatureTypeID="8"',
+        'FeatureTypeID="646"',
+      ),
+      ofacLookup('647', '91948'),
+    ])}
+    ${ofacParty('70001', '70001', 'EVERY OTHER SHAPE', [
+      ofacLocated('365', '186120'),
+      ofacLocated('365', '424242'),
+      ofacBirthdate(['2001-02-03', '2001-02-03'], ['2001-02-03', '2001-02-03'], true).replace(
+        'FeatureTypeID="8"',
+        'FeatureTypeID="646"',
+      ),
+      ofacText('7777', 'UNRESOLVED-TYPE'),
+      ofacLookup('224', '99999999'),
+      '<Feature FeatureTypeID="26"><FeatureVersion><VersionDetail DetailTypeID="1432" /></FeatureVersion></Feature>',
+      ofacText('26', 'Director'),
+      ofacText('26', 'Director'),
+    ])}
+    ${ofacParty('70002', '70002', 'NO FEATURES', [])}
+  </DistinctParties>
+</Sanctions>`;
+
+/** UK ship DPR0075 as published (its owner with a trailing space), and RUS2000 with an IMO number only. */
+const FEATURE_UK_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Designations>
+  <Designation>
+    <UniqueID>DPR0075</UniqueID>
+    <Names><Name><Name6>Petrel 8</Name6><NameType>Primary name</NameType></Name></Names>
+    <RegimeName>The Democratic People's Republic of Korea (Sanctions) (EU Exit) Regulations 2019</RegimeName>
+    <IndividualEntityShip>Ship</IndividualEntityShip>
+    <ShipDetails>
+      <Ship>
+        <IMONumbers><IMONumber>IMO9562233</IMONumber></IMONumbers>
+        <CurrentOwnerOperators><CurrentOwnerOperator>Global United Shipping India </CurrentOwnerOperator></CurrentOwnerOperators>
+        <CurrentBelievedFlagOfShips><CurrentBelievedFlagOfShip>Comoros</CurrentBelievedFlagOfShip></CurrentBelievedFlagOfShips>
+        <PreviousFlags><PreviousFlag>India</PreviousFlag></PreviousFlags>
+        <TypeOfShipDetails><TypeOfShip>Bulk Carrier</TypeOfShip></TypeOfShipDetails>
+        <TonnageOfShipDetails><TonnageOfShip>7078</TonnageOfShip></TonnageOfShipDetails>
+        <LengthOfShipDetails><LengthOfShip>134.5</LengthOfShip></LengthOfShipDetails>
+        <YearsBuilt><YearBuilt>2011</YearBuilt></YearsBuilt>
+        <PreviousOwnerOperators><PreviousOwnerOperator>Example Ship Management</PreviousOwnerOperator><PreviousOwnerOperator>N/A</PreviousOwnerOperator></PreviousOwnerOperators>
+      </Ship>
+    </ShipDetails>
+  </Designation>
+  <Designation>
+    <UniqueID>RUS2000</UniqueID>
+    <Names><Name><Name6>SEA EXAMPLE</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Ship</IndividualEntityShip>
+    <ShipDetails><Ship><IMONumbers><IMONumber>9123456</IMONumber></IMONumbers></Ship></ShipDetails>
+  </Designation>
+</Designations>`;
+
+describe('descriptive features (issue #64)', () => {
+  const ofac = (source: 'ofac_sdn' | 'ofac_consolidated' = 'ofac_sdn') =>
+    parseOfac(parseXml(FEATURE_OFAC_XML), source);
+
+  it('52251: a lookup note, a lookup type, and a text flag, in document order; identifiers unchanged', () => {
+    const vessel = byEntryId(ofac(), '52251');
+    expect(vessel.payload.features).toEqual([
+      { type: 'Secondary sanctions risk:', value: 'See Section 11 of Executive Order 14024.' },
+      { type: 'VESSEL TYPE', value: 'General Cargo' },
+      { type: 'Vessel Flag', value: 'Panama' },
+    ]);
+    expect(vessel.payload.identifiers).toEqual([{ type: 'Vessel Call Sign', value: '3E6850' }]);
+  });
+
+  it('4238: flag, owner, tonnage, and type; its Location feature stays an address', () => {
+    const vessel = byEntryId(ofac(), '4238');
+    expect(vessel.payload.features).toEqual([
+      { type: 'Vessel Flag', value: 'Cuba' },
+      { type: 'Vessel Owner', value: 'Samir de Navegacion S.A.' },
+      { type: 'Vessel Gross Registered Tonnage', value: '212' },
+      { type: 'VESSEL TYPE', value: 'Tug' },
+    ]);
+    expect(vessel.payload.addresses).toEqual([{ full: 'Havana, Cuba', country: 'Cuba' }]);
+    expect(vessel.payload.identifiers).toEqual([{ type: 'Vessel Call Sign', value: 'CL2192' }]);
+  });
+
+  it('3751: a date at its published precision and a lookup type', () => {
+    expect(byEntryId(ofac(), '3751').payload.features).toEqual([
+      { type: 'Organization Established Date', value: '1994' },
+      { type: 'Organization Type:', value: 'Mining of other non-ferrous metal ores' },
+    ]);
+  });
+
+  it('a location and an approximate date; nothing for an unresolved type, lookup, or location, or an empty value; a repeat collapses', () => {
+    expect(byEntryId(ofac(), '70001').payload.features).toEqual([
+      { type: 'Nationality of Registration', value: 'Korea, North' },
+      { type: 'Organization Established Date', value: '2001-02-03', circa: true },
+      { type: 'Title', value: 'Director' },
+    ]);
+    expect(byEntryId(ofac(), '70002').payload.features).toEqual([]);
+  });
+
+  // Addresses are left out: 4238 publishes Cuba as its flag and in its address.
+  it('never puts a feature value in identifiers, nationalities, or names', () => {
+    for (const party of ofac()) {
+      const elsewhere = JSON.stringify({
+        aliases: party.payload.aliases,
+        primaryName: party.primaryName,
+        identifiers: party.payload.identifiers,
+        nationalities: party.payload.nationalities,
+      });
+      for (const feature of party.payload.features ?? []) {
+        expect(elsewhere, `${party.sourceEntryId} ${feature.type}`).not.toContain(feature.value);
+      }
+    }
+  });
+
+  it.each(['ofac_sdn', 'ofac_consolidated'] as const)(
+    '%s: streams the same text, lookup, date, and location features at every chunk size',
+    async (source) => {
+      const oracle = ofac(source);
+      expect(oracle.flatMap((d) => d.payload.features)).toHaveLength(12);
+      for (const size of CHUNK_SIZES) {
+        const { records, state } = await streamAll(
+          (chunks, s) => streamOfacFromText(chunks, source, s),
+          FEATURE_OFAC_XML,
+          size,
+        );
+        expect(withDeferred(records, state), `chunk size ${size}`).toEqual(oracle);
+      }
+    },
+  );
+
+  it('UK DPR0075: every ship detail but the IMO number, typed by element, the IMO number still an identifier', () => {
+    const records = parseUk(parseXml(FEATURE_UK_XML));
+    const ship = byEntryId(records, 'DPR0075');
+    expect(ship.payload.features).toEqual([
+      { type: 'CurrentOwnerOperator', value: 'Global United Shipping India' },
+      { type: 'CurrentBelievedFlagOfShip', value: 'Comoros' },
+      { type: 'PreviousFlag', value: 'India' },
+      { type: 'TypeOfShip', value: 'Bulk Carrier' },
+      { type: 'TonnageOfShip', value: '7078' },
+      { type: 'LengthOfShip', value: '134.5' },
+      { type: 'YearBuilt', value: '2011' },
+      { type: 'PreviousOwnerOperator', value: 'Example Ship Management' },
+    ]);
+    expect(ship.payload.identifiers).toEqual([{ type: 'IMO Number', value: 'IMO9562233' }]);
+    expect(byEntryId(records, 'RUS2000').payload.features).toEqual([]);
+  });
+
+  it('UK: streams the same ship details at every chunk size', async () => {
+    for (const size of CHUNK_SIZES) {
+      const { records } = await streamAll(streamUkFromText, FEATURE_UK_XML, size);
+      expect(records, `chunk size ${size}`).toEqual(parseUk(parseXml(FEATURE_UK_XML)));
+    }
+  });
+
+  it('EU, UN, and the OFAC standard schema publish no features', () => {
+    for (const records of [
+      parseEu(parseXml(DETAIL_EU_XML)),
+      parseUn(parseXml(DETAIL_UN_XML)),
+      parseOfac(parseXml(PAIR_OFAC_STANDARD_XML), 'ofac_sdn'),
+    ]) {
+      expect(records.map((d) => d.payload.features)).toEqual(records.map(() => []));
+    }
+  });
+});
+
 // ─── Sanctions streaming ingest (issue #13) ─────────────────────────────────────
 //
 // Each sanctions source now streams: the document is scanned for complete record
@@ -2049,8 +2472,8 @@ describe('EU — ranges, circa, and the entity designation date (issue #39)', ()
  * sets, the `<Locations>` and `<IDRegDocuments>` blocks the parties cross-
  * reference, parties, relationships, then the programme block. Carries nesting
  * depth (Profile → Identity → Alias → DocumentedName → DocumentedNamePart,
- * repeated at three levels), two dropped siblings, two programme entries for one
- * profile, an orphan entry, several locations per party, a location shared by
+ * repeated at three levels), two dropped siblings, one profile's entries on two
+ * lists, an orphan entry, several locations per party, a location shared by
  * two parties, a dangling `LocationID`, and an orphan document.
  */
 const MULTI_OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
@@ -2078,6 +2501,10 @@ const MULTI_OFAC_ADVANCED_XML = `<?xml version="1.0" encoding="utf-8"?>
       <IDRegDocType ID="1571">Passport</IDRegDocType>
       <IDRegDocType ID="1626">Vessel Registration Identification</IDRegDocType>
     </IDRegDocTypeValues>
+    <ListValues>
+      <List ID="1550">SDN List</List>
+      <List ID="1551">Sectoral Sanctions Identifications List</List>
+    </ListValues>
     <LocPartTypeValues>
       <LocPartType ID="1">Unknown</LocPartType>
       <LocPartType ID="1450">REGION</LocPartType>
@@ -2300,7 +2727,7 @@ async function streamAll(
 /**
  * The streamed OFAC record as the mirror ends up holding it: the party as
  * emitted, plus the programme columns the deferred join applies afterwards.
- * Both columns are nullable, so absence stays absence.
+ * Every column is nullable, so absence stays absence.
  */
 function withDeferred(
   records: NormalizedDesignation[],
@@ -2311,6 +2738,7 @@ function withDeferred(
     return {
       ...record,
       ...(fields?.program ? { program: fields.program } : {}),
+      ...(fields?.legalBasis ? { legalBasis: fields.legalBasis } : {}),
       ...(fields?.designationDate ? { designationDate: fields.designationDate } : {}),
     };
   });
@@ -2322,9 +2750,9 @@ describe('sanctions streaming ingest — equivalence with the buffered parsers',
     const oracle = parseOfac(parseXml(MULTI_OFAC_ADVANCED_XML), 'ofac_sdn', rejections);
     expect(oracle.map((d) => d.sourceEntryId)).toEqual(['2674', '4238']);
     expect(oracle[0]?.program).toBe('SDGT, SDT');
-    // The second entry for profile 2674 publishes only a date, so it overrides
-    // the date and leaves the earlier programme in place.
-    expect(oracle[0]?.designationDate).toBe('2001-09-11');
+    // The second entry for profile 2674 is on another list and publishes only a
+    // date: the SDN List entry dates the party, and the programme stays in place.
+    expect(oracle[0]?.designationDate).toBe('1995-01-23');
     expect(rejections).toEqual({ missingIdentifier: 1, unusableName: 1 });
     // The cross-referenced groups resolve on the oracle, so the equality below
     // compares populated groups rather than two empty ones.
@@ -3393,15 +3821,16 @@ describe('published list reference numbers', () => {
 });
 
 describe('the synthetic fixture uses the identifier labels the parsers emit', () => {
-  it('labels the UK vessel IMO number as the UK parser does', async () => {
+  it('labels the UK vessel IMO number and ship details as the UK parser does', async () => {
     const { FIXTURE_DESIGNATIONS } = await import('@/services/screening/fixtures.js');
     const [ship] = parseUk(
       parseXml(
-        '<Designations><Designation><UniqueID>FX-4004</UniqueID><IndividualEntityShip>Ship</IndividualEntityShip><Names><Name><Name6>MV Phantom Voyager</Name6><NameType>Primary Name</NameType></Name></Names><ShipDetails><Ship><IMONumbers><IMONumber>1234567</IMONumber></IMONumbers></Ship></ShipDetails></Designation></Designations>',
+        '<Designations><Designation><UniqueID>FX-4004</UniqueID><IndividualEntityShip>Ship</IndividualEntityShip><Names><Name><Name6>MV Phantom Voyager</Name6><NameType>Primary Name</NameType></Name></Names><ShipDetails><Ship><IMONumbers><IMONumber>1234567</IMONumber></IMONumbers><CurrentBelievedFlagOfShips><CurrentBelievedFlagOfShip>Testland</CurrentBelievedFlagOfShip></CurrentBelievedFlagOfShips><TypeOfShipDetails><TypeOfShip>Bulk Carrier</TypeOfShip></TypeOfShipDetails></Ship></ShipDetails></Designation></Designations>',
       ),
     );
     const fixture = FIXTURE_DESIGNATIONS.find((d) => d.id === 'uk:FX-4004');
     expect(fixture?.payload.identifiers).toEqual(ship?.payload.identifiers);
+    expect(fixture?.payload.features).toEqual(ship?.payload.features);
   });
 });
 

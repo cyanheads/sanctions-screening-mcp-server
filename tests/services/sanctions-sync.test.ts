@@ -32,8 +32,13 @@ import { freshService, type SeededService } from './_helpers.js';
 const OFAC_REFS = `<ReferenceValueSets>
   <AliasTypeValues><AliasType ID="1403">Name</AliasType><AliasType ID="1400">A.K.A.</AliasType></AliasTypeValues>
   <FeatureTypeValues><FeatureType ID="8">Birthdate</FeatureType></FeatureTypeValues>
+  <LegalBasisValues><LegalBasis ID="92049" LegalBasisShortRef="Executive Order 14024 (Russia)">Executive Order 14024 (Russia)</LegalBasis></LegalBasisValues>
+  <ListValues><List ID="1550">SDN List</List><List ID="91512">Consolidated List</List></ListValues>
   <PartySubTypeValues><PartySubType ID="4" PartyTypeID="1">Unknown</PartySubType></PartySubTypeValues>
 </ReferenceValueSets>`;
+
+/** The `ListID` of the one list each OFAC file's parties are dated from here. */
+const OFAC_LIST_IDS = { SDN: '1550', CONS: '91512' } as const;
 
 function ofacParty(fixedRef: string, name: string): string {
   return `<DistinctParty FixedRef="${fixedRef}"><Profile ID="${fixedRef}" PartySubTypeID="4"><Identity>
@@ -43,9 +48,15 @@ function ofacParty(fixedRef: string, name: string): string {
   </Identity></Profile></DistinctParty>`;
 }
 
-function ofacEntry(profileId: string, program: string, year: string): string {
-  return `<SanctionsEntry ID="${profileId}" ProfileID="${profileId}">
-    <EntryEvent><Date><Year>${year}</Year><Month>3</Month><Day>4</Day></Date></EntryEvent>
+function ofacEntry(
+  profileId: string,
+  program: string,
+  year: string,
+  listId: string = OFAC_LIST_IDS.SDN,
+  legalBasisId = '',
+): string {
+  return `<SanctionsEntry ID="${profileId}" ProfileID="${profileId}" ListID="${listId}">
+    <EntryEvent LegalBasisID="${legalBasisId}"><Date><Year>${year}</Year><Month>3</Month><Day>4</Day></Date></EntryEvent>
     <SanctionsMeasure><Comment>${program}</Comment></SanctionsMeasure>
   </SanctionsEntry>`;
 }
@@ -57,7 +68,7 @@ function ofacDocument(source: 'SDN' | 'CONS'): string {
   <Locations><Location ID="1"><LocationCountry><Country>US</Country></LocationCountry></Location></Locations>
   <DistinctParties>${ofacParty(ref, `OFAC ${source} Person`)}</DistinctParties>
   <ProfileRelationships/>
-  <SanctionsEntries>${ofacEntry(ref, `PROG-${source}`, '1999')}</SanctionsEntries>
+  <SanctionsEntries>${ofacEntry(ref, `PROG-${source}`, '1999', OFAC_LIST_IDS[source])}</SanctionsEntries>
 </Sanctions>`;
 }
 
@@ -889,6 +900,49 @@ describe('OFAC deferred programme join', () => {
       { program: null, designation_date: null },
       { program: null, designation_date: null },
     ]);
+  });
+
+  it('lands the legal basis with the programme fields, and keeps it through a harvest that fails', async () => {
+    /** The 900 row's deferred columns, legal basis included. */
+    async function party(): Promise<Record<string, unknown> | undefined> {
+      const handle = await harness!.service.designations.raw();
+      return handle
+        .prepare<Record<string, unknown>>(
+          `SELECT program, legal_basis, designation_date FROM designation WHERE id = 'ofac_sdn:900'`,
+        )
+        .get();
+    }
+    const complete = `<Sanctions>${OFAC_REFS}
+      <DistinctParties>${ofacParty('900', 'Party With Basis')}</DistinctParties>
+      <SanctionsEntries>
+        ${ofacEntry('900', 'RUSSIA-EO14024', '2022', OFAC_LIST_IDS.SDN, '92049')}
+        ${ofacEntry('900', 'RUSSIA-EO14024', '2014', OFAC_LIST_IDS.CONS, '92049')}
+      </SanctionsEntries>
+    </Sanctions>`;
+    const bodies = new Map(SOURCE_BODIES);
+    bodies.set(DEFAULT_SOURCE_URLS.ofacSdn, complete);
+    await syncAndRead(bodies);
+    const landed = {
+      program: 'RUSSIA-EO14024',
+      legal_basis: 'Executive Order 14024 (Russia)',
+      // The SDN file dates the party from its SDN List entry, not the earlier
+      // Consolidated List one.
+      designation_date: '2022-03-04',
+    };
+    expect(await party()).toEqual(landed);
+
+    bodies.set(
+      DEFAULT_SOURCE_URLS.ofacSdn,
+      complete.slice(0, complete.indexOf('<SanctionsEntries>')),
+    );
+    stubSourceFetch(bodies);
+    await expect(
+      harness!.service.designations.runSync({
+        mode: 'refresh',
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toThrow(/ofac_sdn/);
+    expect(await party()).toEqual(landed);
   });
 });
 

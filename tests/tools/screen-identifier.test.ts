@@ -11,8 +11,10 @@ import { type ErrorContract, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/err
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
+import { parseUk } from '@/services/screening/sanctions-ingest.js';
 import { IDENTIFIER_TABLE } from '@/services/screening/schema.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
+import { parseXml } from '@/services/screening/xml.js';
 import {
   emptyGlobalService,
   type SeededService,
@@ -32,6 +34,7 @@ interface Hit {
   primaryName: string;
   source: string;
   sourceEntryId: string;
+  sources: string[];
 }
 
 interface Screened {
@@ -128,6 +131,41 @@ describe('sanctions_screen_identifier (seeded)', () => {
     expect(result.ids).toEqual(['eu:927', 'uk:AQD0239']);
   });
 
+  it('returns an OFAC party both OFAC lists publish as one hit naming both lists (issue #61)', async () => {
+    const copy = (source: 'ofac_sdn' | 'ofac_consolidated'): NormalizedDesignation => ({
+      id: `${source}:GRP-17`,
+      source,
+      sourceEntryId: 'GRP-17',
+      entityType: 'organization',
+      primaryName: 'Grouped Petroleum Holding',
+      program: 'RUSSIA-EO14024',
+      payload: {
+        aliases: [],
+        identifiers: [{ type: 'Tax ID No.', value: '7706999990', country: 'Russia' }],
+        addresses: [],
+        datesOfBirth: [],
+        nationalities: [],
+      },
+    });
+    await seeded.service.ingestDesignations([copy('ofac_sdn'), copy('ofac_consolidated')]);
+
+    const both = await screen({ value: '7706999990' });
+    expect(both.hits.map((hit) => [hit.source, hit.sources])).toEqual([
+      ['ofac_sdn', ['ofac_sdn', 'ofac_consolidated']],
+    ]);
+    expect(both.totalCount).toBe(1);
+    expect(both.text).toContain('1 designation(s) publish a matching identifier');
+    expect(both.text).toContain(
+      '**List:** OFAC Specially Designated Nationals (SDN) List (`ofac_sdn`) | **Also listed on:** OFAC Consolidated Sanctions List (`ofac_consolidated`) | **Entry ID:** GRP-17',
+    );
+
+    const one = await screen({ value: '7706999990', sources: ['ofac_consolidated'] });
+    expect(one.hits.map((hit) => [hit.source, hit.sources])).toEqual([
+      ['ofac_consolidated', ['ofac_consolidated']],
+    ]);
+    expect(one.text).not.toContain('Also listed on');
+  });
+
   it('matches a SWIFT/BIC published with a space, from either list that publishes it', async () => {
     expect((await screen({ value: 'dcbkkppy' })).ids).toEqual(['ofac_sdn:16085', 'eu:107842']);
     expect((await screen({ value: 'DCBK-KPPY', type: 'swift_bic' })).ids).toEqual([
@@ -216,6 +254,28 @@ describe('sanctions_screen_identifier (seeded)', () => {
     ).rejects.toMatchObject({ data: { reason: 'identifier_not_searchable' } });
   });
 
+  it('never matches a "not available" placeholder a list printed as an identifier (issue #67)', async () => {
+    await seeded.service.ingestDesignations(
+      parseUk(
+        parseXml(`<Designations><Designation><UniqueID>CTI0008</UniqueID>
+          <Names><Name><Name6>PLACEHOLDER PASSPORT PERSON</Name6><NameType>Primary Name</NameType></Name></Names>
+          <IndividualEntityShip>Individual</IndividualEntityShip>
+          <IndividualDetails><Individual><PassportDetails>
+            <Passport><PassportNumber>N/A</PassportNumber></Passport>
+            <Passport><PassportNumber>K8801234</PassportNumber></Passport>
+          </PassportDetails></Individual></IndividualDetails>
+        </Designation></Designations>`),
+      ),
+    );
+    for (const value of ['n.a.', 'N/A', 'NA']) {
+      expect((await screen({ value })).hits, value).toEqual([]);
+      expect((await screen({ value, type: 'passport' })).hits, value).toEqual([]);
+    }
+    const real = await screen({ value: 'K8801234', type: 'passport' });
+    expect(real.ids).toEqual(['uk:CTI0008']);
+    expect(real.hits[0]?.matchedIdentifiers).toEqual([{ type: 'Passport', value: 'K8801234' }]);
+  });
+
   it('rejects an empty value at the schema', async () => {
     const result = await runToolContract(screenIdentifierTool, { value: '' });
     expect(result.isError).toBe(true);
@@ -268,6 +328,39 @@ describe('sanctions_screen_identifier (seeded)', () => {
       result.text.indexOf('**Entry ID:** 10 '),
     );
   });
+
+  // Numeric collation calls `RUS0251` and `RUS251` equal; without a final key their
+  // order would be whichever the identifier rows were stored in.
+  it.each([
+    ['RUS251', 'RUS0251'],
+    ['RUS0251', 'RUS251'],
+  ])(
+    'orders entry IDs numeric collation equates the same way, stored %s first',
+    async (first, second) => {
+      const entry = (sourceEntryId: string): NormalizedDesignation => ({
+        id: `uk:${sourceEntryId}`,
+        source: 'uk',
+        sourceEntryId,
+        entityType: 'person',
+        primaryName: `Holder ${sourceEntryId}`,
+        payload: {
+          aliases: [],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+          identifiers: [{ type: 'Passport', value: 'PAD 0251' }],
+        },
+      });
+      await seeded.service.ingestDesignations([entry(first), entry(second)]);
+
+      const result = await screen({ value: 'PAD0251', type: 'passport' });
+      expect(result.ids).toEqual(['uk:RUS0251', 'uk:RUS251']);
+      expect(result.text.indexOf('**Entry ID:** RUS0251 ')).toBeGreaterThan(-1);
+      expect(result.text.indexOf('**Entry ID:** RUS0251 ')).toBeLessThan(
+        result.text.indexOf('**Entry ID:** RUS251 '),
+      );
+    },
+  );
 });
 
 describe('sanctions_screen_identifier over a synced mirror', () => {

@@ -7,7 +7,9 @@
  * `ContentDate` as the checkpoint `mirror:refresh` applies deltas from. Each
  * entity is written with its legal, other, and transliterated names, and the
  * load's commit records the GLEIF name index as built — the step that gives a
- * mirror an earlier release wrote its alternate-name resolution.
+ * mirror an earlier release wrote its alternate-name resolution. Last, it builds
+ * the exact-name index strict resolution reads first (one pass over the names;
+ * a no-op once built).
  * Hours-long and safe to re-run: an interrupted run starts over, and a re-run
  * over a populated mirror removes what each list no longer publishes, as a
  * refresh does. Never run on the request path. Set
@@ -64,6 +66,8 @@ async function main(): Promise<void> {
       checkpoint: gleif.checkpoint,
     }),
   );
+  log.info('mirror:init — building the GLEIF exact-name index', ctx);
+  await service.indexLeiExactNames();
   log.info('mirror:init — complete', ctx);
   await service.close();
 }

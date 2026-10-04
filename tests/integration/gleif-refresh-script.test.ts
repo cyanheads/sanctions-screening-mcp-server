@@ -253,6 +253,7 @@ async function readBack() {
       gap: await parents(GAP_CHILD),
       k: await parents(K_CHILD),
       sanctionsReady: await svc.sanctionsReady(),
+      exactNamesIndexed: await svc.leiExactNamesIndexed(),
     };
   } finally {
     await svc.close();
@@ -282,6 +283,8 @@ describe('mirror:refresh — the GLEIF leg', () => {
     expect(standIn.requested).not.toContain('/files/lei2-LastMonth.xml');
     expect(standIn.requested).not.toContain('/files/rr-LastMonth.xml');
     expect(after.sanctionsReady).toBe(true);
+    // The run builds the exact-name index strict resolution reads first (#9).
+    expect(after.exactNamesIndexed).toBe(true);
   }, 60_000);
 
   it('loads the exceptions golden copy when no load of it is recorded', async () => {
@@ -333,6 +336,7 @@ describe('mirror:refresh — the GLEIF leg', () => {
       expect(standIn.requested.filter((path) => path.endsWith('-full.xml'))).toEqual([]);
       // The sanctions lists refreshed first regardless.
       expect(after.sanctionsReady).toBe(true);
+      expect(after.exactNamesIndexed).toBe(false);
     },
     60_000,
   );

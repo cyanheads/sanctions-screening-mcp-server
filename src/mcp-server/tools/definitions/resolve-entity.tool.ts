@@ -9,9 +9,12 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getScreeningService } from '@/services/screening/screening-service.js';
+import {
+  getScreeningService,
+  LEI_STRICT_SCAN_BOUND,
+} from '@/services/screening/screening-service.js';
 import { fold, tokenize } from '@/services/screening/text-matching.js';
-import { MAX_NAME_CHARS, MAX_NAME_WORDS } from './_shared.js';
+import { gleifNameTypeText, MAX_NAME_CHARS, MAX_NAME_WORDS } from './_shared.js';
 
 export const resolveEntityTool = tool('sanctions_resolve_entity', {
   title: 'sanctions-screening-mcp-server: resolve entity',
@@ -140,15 +143,19 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     totalCount: z.number().describe('Number of LEI candidates returned in this page.'),
     totalAvailable: z
       .number()
-      .describe('LEI candidates available across all pages, before limit and offset were applied.'),
+      .describe(
+        'LEI candidates in the result set across all pages, before limit and offset were applied — every one is reachable by paging.',
+      ),
     totalAvailableBasis: z
       .enum(['exact', 'lower_bound'])
       .describe(
-        'How to read totalAvailable: exact = the complete strict candidate set; lower_bound = a bounded scan produced it (every fuzzy pass, and any strict pass that hit the raw-row scan cap), so more may exist.',
+        `How to read totalAvailable: exact = the complete strict candidate set; lower_bound = a fuzzy pass ran, which scores only the candidates blocking pooled, or the strict scan stopped at its ${LEI_STRICT_SCAN_BOUND.toLocaleString('en-US')}-name bound, so more candidates may exist beyond the result set.`,
       ),
     hasMore: z
       .boolean()
-      .describe('True when LEI candidates remain beyond this page — re-call with nextOffset.'),
+      .describe(
+        'True when the result set holds candidates beyond this page — re-call with nextOffset. It describes pages only: false on the last page, whatever totalAvailableBasis says.',
+      ),
     nextOffset: z
       .number()
       .optional()
@@ -157,7 +164,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       .string()
       .optional()
       .describe(
-        "Guidance when no LEI matched and how to broaden, when the requested offset sits past the end of the result set, or when the mirror has not indexed GLEIF's other and transliterated names yet, so only legal names were searched.",
+        "Guidance when no LEI matched and how to broaden, when the requested offset sits past the end of the result set, when a bound cut the candidate set and how to narrow the name, or when the mirror has not indexed GLEIF's other and transliterated names yet, so only legal names were searched.",
       ),
   },
   errors: [
@@ -187,22 +194,17 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
   async handler(input, ctx) {
     const words = tokenize(fold(input.name)).length;
     if (words === 0) {
-      throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.', {
-        ...ctx.recoveryFor('name_not_searchable'),
-      });
+      throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.');
     }
     if (words > MAX_NAME_WORDS || input.name.length > MAX_NAME_CHARS) {
       throw ctx.fail(
         'name_too_long',
         `The name is past the ${MAX_NAME_WORDS}-word / ${MAX_NAME_CHARS}-character bound (words: ${words}, characters: ${input.name.length}).`,
-        { ...ctx.recoveryFor('name_too_long') },
       );
     }
     const svc = getScreeningService();
     if (!(await svc.leiReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.', {
-        ...ctx.recoveryFor('mirror_not_ready'),
-      });
+      throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.');
     }
 
     const jurisdiction = input.jurisdiction ? input.jurisdiction.toUpperCase() : undefined;
@@ -245,7 +247,17 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       );
     } else if (result.matches.length === 0) {
       notices.push(
-        `Offset ${input.offset} is past the end of this result set — ${result.totalAvailable} LEI candidate(s) are available. Re-request from offset 0 and page forward with nextOffset.`,
+        `Offset ${input.offset} is past the end of this result set, which holds ${result.totalAvailable} LEI candidate(s)${result.totalAvailableBasis === 'lower_bound' ? ' — a lower bound: more may exist beyond it' : ''}. Re-request from offset 0 and page forward with nextOffset.`,
+      );
+    }
+    if (result.strictScanBounded) {
+      notices.push(
+        `The strict scan stopped at its ${LEI_STRICT_SCAN_BOUND.toLocaleString('en-US')}-name bound, so more candidates holding these words may exist beyond this result set. Narrow with another word from the name${jurisdiction ? '' : ' or a jurisdiction'}.`,
+      );
+    }
+    if (result.poolBounded) {
+      notices.push(
+        'The fuzzy pass reached its candidate bound, so not every name sharing a word with the query was scored, and more candidates may exist. Narrow with a more distinctive word from the name.',
       );
     }
     if (!result.alternateNamesIndexed) {
@@ -279,7 +291,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
       lines.push(`### ${m.legalName} — ${m.matchType}${scoreStr}${coverStr}`);
       lines.push(`**LEI:** \`${m.lei}\``);
-      lines.push(`**Matched on:** "${m.matchedName}" (${m.matchedNameType})`);
+      lines.push(`**Matched on:** "${m.matchedName}" (${gleifNameTypeText(m.matchedNameType)})`);
       const meta = [
         m.jurisdiction ? `Jurisdiction: ${m.jurisdiction}` : null,
         m.status ? `Status: ${m.status}` : null,

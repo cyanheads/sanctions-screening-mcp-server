@@ -124,10 +124,15 @@ const ALL_CATEGORIES: readonly IdentifierCategory[] = [...IDENTIFIER_TYPES, 'oth
 /**
  * The probes a caller's value runs as: one per category it may match, each
  * keyed under that category's rule. `any` probes every category, including the
- * labels the table does not map. Empty when the value normalizes to nothing
- * under every rule it runs as.
+ * labels the table does not map; `other` probes those labels alone — the
+ * non-document identifiers (registration, tax, and legal-entity numbers, …),
+ * never a passport, national ID, IMO number, SWIFT/BIC code, or wallet. Empty
+ * when the value normalizes to nothing under every rule it runs as.
  */
-export function identifierProbes(value: string, type: IdentifierType | 'any'): IdentifierProbe[] {
+export function identifierProbes(
+  value: string,
+  type: IdentifierCategory | 'any',
+): IdentifierProbe[] {
   const categories = type === 'any' ? ALL_CATEGORIES : [type];
   return categories
     .map((category) => ({ category, key: identifierKey(category, value) }))

@@ -5,9 +5,14 @@
  * way 0.2.0 built one — schema version 1, the store's own tables plus the `name`
  * index and nothing else, rows written through the store's generic upsert — and
  * then opened by the current service, which must serve every existing tool from
- * it unchanged. The GLEIF mirror 0.3.0 wrote records no checkpoint and no
- * reporting exceptions: the current service must degrade on it — parent status
- * `unknown`, a refresh that asks for `mirror:init` — never break.
+ * it unchanged. The upgraded file must stay readable by the release that wrote
+ * it: after a rollback, that release's strict query sees the `name_fts` it
+ * built, and the names it writes reach fuzzy blocking once the current service
+ * opens the file again. The GLEIF mirror 0.3.0 wrote records no checkpoint and
+ * no reporting exceptions: the current service must degrade on it — parent
+ * status `unknown`, a refresh that asks for `mirror:init` — never break. A GLEIF
+ * mirror 0.3.0 or 0.4.0 wrote loses the status index no query reads on first
+ * open, a fresh one never builds it, and the release that wrote it still opens it.
  * @module tests/integration/mirror-upgrade.test
  */
 
@@ -32,16 +37,20 @@ import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity
 import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
-import { FIXTURE_DESIGNATIONS } from '@/services/screening/fixtures.js';
+import { FIXTURE_DESIGNATIONS, FIXTURE_LEI_ENTITIES } from '@/services/screening/fixtures.js';
 import { loadGleifGoldenCopies, refreshGleif } from '@/services/screening/gleif-sync.js';
-import { IDENTIFIER_TABLE, REFERENCE_NUMBER_INDEX } from '@/services/screening/schema.js';
+import {
+  IDENTIFIER_TABLE,
+  LEI_STATUS_INDEX,
+  REFERENCE_NUMBER_INDEX,
+} from '@/services/screening/schema.js';
 import {
   buildScreeningService,
   getScreeningService,
   initScreeningService,
   resetScreeningService,
 } from '@/services/screening/screening-service.js';
-import { doubleMetaphone, fold } from '@/services/screening/text-matching.js';
+import { buildFtsMatch, doubleMetaphone, fold } from '@/services/screening/text-matching.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
 import {
   type GleifStandIn,
@@ -115,6 +124,17 @@ async function writeV1Mirror(path: string, designations: NormalizedDesignation[]
   );
   const handle = await store.raw();
   handle.exec(V1_AUX_DDL);
+  writeReleasedNames(handle, designations);
+  await store.writeState({
+    status: 'complete',
+    completedAt: '2026-09-24T04:00:00.000Z',
+    total: designations.length,
+  });
+  await store.close();
+}
+
+/** Index designations' names the way every release before the current one writes them. */
+function writeReleasedNames(handle: SqliteHandle, designations: NormalizedDesignation[]): void {
   const insertName = handle.prepare(
     'INSERT INTO name (designation_id, name, normalized, phonetic, name_type) VALUES (?, ?, ?, ?, ?)',
   );
@@ -128,12 +148,20 @@ async function writeV1Mirror(path: string, designations: NormalizedDesignation[]
       }
     }
   });
-  await store.writeState({
-    status: 'complete',
-    completedAt: '2026-09-24T04:00:00.000Z',
-    total: designations.length,
-  });
-  await store.close();
+}
+
+/**
+ * The strict query every release before the current one runs: each query token
+ * in any column `name_fts` holds. The matched names, as `id · name`, sorted.
+ */
+function releasedStrictHits(handle: SqliteHandle, query: string): string[] {
+  return handle
+    .prepare<{ id: string; name: string }>(
+      'SELECT n.designation_id AS id, n.name FROM name_fts f JOIN name n ON n.rowid = f.rowid WHERE name_fts MATCH ?',
+    )
+    .all(buildFtsMatch(query))
+    .map((row) => `${row.id} · ${row.name}`)
+    .sort();
 }
 
 const ctxFor = <const E extends readonly ErrorContract[] | undefined>(errors: E) =>
@@ -162,7 +190,7 @@ afterEach(async () => {
 });
 
 describe('a 0.2.0 mirror opened by the current service', () => {
-  it('serves sanctions_screen_name hits with the fields 0.2.0 returned', async () => {
+  it('serves sanctions_screen_name hits with the fields 0.2.0 returned, plus sources', async () => {
     const result = await screenNameTool.handler(
       screenNameTool.input.parse({ name: 'Ivan Testovich Volkov' }),
       ctxFor(screenNameTool.errors),
@@ -171,6 +199,7 @@ describe('a 0.2.0 mirror opened by the current service', () => {
       source: 'ofac_sdn',
       sourceLabel: 'OFAC Specially Designated Nationals (SDN) List',
       sourceEntryId: 'FX-1001',
+      sources: ['ofac_sdn'],
       entityType: 'person',
       primaryName: 'Ivan Testovich Volkov',
       matchedName: 'Ivan Testovich Volkov',
@@ -244,6 +273,35 @@ async function screenIdentifier(value: string, type = 'any') {
   return (
     result.structuredContent as { hits: { source: string; sourceEntryId: string }[] }
   ).hits.map((hit) => `${hit.source}:${hit.sourceEntryId}`);
+}
+
+/** A designation whose lists also publish a Han name, reached only past its leading characters. */
+const LIMBACH: NormalizedDesignation = {
+  id: 'eu:171379',
+  source: 'eu',
+  sourceEntryId: '171379',
+  entityType: 'organization',
+  primaryName: 'Xiamen Limbach Aviation Engine Co., Ltd',
+  payload: {
+    aliases: [{ name: '厦门林巴贺航空发动机股份有限公司', nameType: 'aka' }],
+    identifiers: [],
+    addresses: [],
+    datesOfBirth: [],
+    nationalities: [],
+  },
+};
+
+/** Point a fresh, unopened service at a 0.2.0 mirror of `designations` written at `mirrorPath`. */
+async function switchToV1Mirror(
+  mirrorPath: string,
+  designations: NormalizedDesignation[],
+): Promise<void> {
+  await getScreeningService().close();
+  resetScreeningService();
+  await writeV1Mirror(mirrorPath, designations);
+  process.env.SANCTIONS_MIRROR_PATH = mirrorPath;
+  resetServerConfig();
+  initScreeningService();
 }
 
 describe('the upgrade itself', () => {
@@ -334,6 +392,147 @@ describe('the upgrade itself', () => {
     expect(await screenIdentifier('X1234567')).toEqual(['ofac_sdn:FX-1001']);
   });
 
+  it('rebuilds the name index in the current shape on first open, before a fuzzy screen reads it', async () => {
+    const designations = [...FIXTURE_DESIGNATIONS, LIMBACH];
+    await switchToV1Mirror(join(dir, 'han.db'), designations);
+
+    // The first call after the upgrade is a fuzzy screen.
+    const result = await runToolContract(screenNameTool, {
+      name: '林巴贺航空发动机股份有限公司',
+      matchMode: 'fuzzy',
+    } as never);
+    expect(result.isError).toBeFalsy();
+    expect(
+      (result.structuredContent as { hits: { source: string; sourceEntryId: string }[] }).hits[0],
+    ).toMatchObject({ source: 'eu', sourceEntryId: '171379' });
+
+    const handle = await getScreeningService().designations.raw();
+    const columns = (table: string) =>
+      handle
+        .prepare<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`)
+        .all()
+        .map((column) => column.name);
+    // `name_fts` keeps the shape every release reads; fuzzy blocking has its own index.
+    expect(columns('name_fts')).toEqual(['normalized']);
+    expect(columns('name_blocking_fts')).toEqual(['normalized', 'suffix_terms', 'phonetic']);
+    expect(columns('name')).toContain('suffix_terms');
+    // Rebuilt from `designation`: every name 0.2.0 indexed, each with its terms.
+    const nameRows = (where = '') =>
+      handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM name ${where}`).get()?.n;
+    expect(nameRows()).toBe(
+      designations.reduce(
+        (n, d) => n + [d.primaryName, ...d.payload.aliases.map((a) => a.name)].filter(fold).length,
+        0,
+      ),
+    );
+    expect(
+      handle
+        .prepare<{ terms: string }>(
+          "SELECT suffix_terms AS terms FROM name WHERE designation_id = 'eu:171379' AND suffix_terms != ''",
+        )
+        .get()?.terms,
+    ).toContain('林巴贺航空发动机股份有限公司');
+
+    // A second process opening the upgraded file keeps the index it finds there.
+    handle.prepare("DELETE FROM name WHERE designation_id = 'ofac_sdn:FX-1001'").run();
+    const second = buildScreeningService();
+    try {
+      await second.sourceCounts();
+    } finally {
+      await second.close();
+    }
+    expect(nameRows("WHERE designation_id = 'ofac_sdn:FX-1001'")).toBe(0);
+  });
+
+  it('gives a release before this one the strict hits on the upgraded file it gets on its own', async () => {
+    const hanPath = join(dir, 'han.db');
+    await switchToV1Mirror(hanPath, [...FIXTURE_DESIGNATIONS, LIMBACH]);
+    // A word's phonetic key, a Han name's tail, a common short token, and names as listed.
+    const queries = [
+      'k0rn ptrf',
+      '巴贺航空发动机股份有限公司',
+      'al',
+      'Catherine Pyotrov',
+      'Xiamen Limbach',
+      'Volkov Ivan',
+    ];
+    const released = sqliteMirrorStore({ path: hanPath, ...V1_SPEC });
+    const releasedHandle = await released.raw();
+    const before = Object.fromEntries(
+      queries.map((q) => [q, releasedStrictHits(releasedHandle, q)]),
+    );
+    await released.close();
+
+    await getScreeningService().sourceCounts(); // the first open upgrades the file
+    const upgraded = await getScreeningService().designations.raw();
+    expect(Object.fromEntries(queries.map((q) => [q, releasedStrictHits(upgraded, q)]))).toEqual(
+      before,
+    );
+    expect(before['k0rn ptrf']).toEqual([]);
+    expect(before['巴贺航空发动机股份有限公司']).toEqual([]);
+    expect(before['Catherine Pyotrov']).toContain('un:FX-7007 · Catherine Pyotrov');
+  });
+
+  it('makes the names a release before this one wrote reachable by fuzzy blocking at the next open', async () => {
+    await getScreeningService().sourceCounts(); // upgraded
+    await getScreeningService().close();
+    resetScreeningService();
+
+    // Rolled back: the earlier release writes a designation and its names, which
+    // carry no suffix terms, and records its run.
+    const catic: NormalizedDesignation = {
+      id: 'un:RB-2',
+      source: 'un',
+      sourceEntryId: 'RB-2',
+      entityType: 'organization',
+      primaryName: 'China National Aero-Technology Import and Export Corporation',
+      payload: {
+        aliases: [{ name: '中航技进出口有限责任公司', nameType: 'aka' }],
+        identifiers: [],
+        addresses: [],
+        datesOfBirth: [],
+        nationalities: [],
+      },
+    };
+    const rolledBack = sqliteMirrorStore({ path, ...V1_SPEC });
+    await rolledBack.applyBatch(
+      [
+        {
+          id: catic.id,
+          source: catic.source,
+          source_entry_id: catic.sourceEntryId,
+          entity_type: catic.entityType,
+          primary_name: catic.primaryName,
+          normalized_name: fold(catic.primaryName),
+          program: null,
+          legal_basis: null,
+          designation_date: null,
+          payload: JSON.stringify(catic.payload),
+        },
+      ],
+      [],
+    );
+    writeReleasedNames(await rolledBack.raw(), [catic]);
+    await rolledBack.writeState({
+      status: 'complete',
+      startedAt: '2026-09-26T04:00:00.000Z',
+      completedAt: '2026-09-26T04:00:09.000Z',
+      total: 28,
+    });
+    await rolledBack.close();
+
+    // Upgraded again: the Han name is reached past its leading characters.
+    initScreeningService();
+    const result = await runToolContract(screenNameTool, {
+      name: '技进出口有限责任公司',
+      matchMode: 'fuzzy',
+    } as never);
+    expect(result.isError).toBeFalsy();
+    expect(
+      (result.structuredContent as { hits: { source: string; sourceEntryId: string }[] }).hits[0],
+    ).toMatchObject({ source: 'un', sourceEntryId: 'RB-2' });
+  });
+
   it('gains reference numbers after one sanctions refresh, and resolves them', async () => {
     const lookup = (source: 'un' | 'uk', entryId: string) =>
       getDesignationTool.handler(
@@ -386,7 +585,7 @@ describe('a mirror created by the current service', () => {
   });
 });
 
-/** The GLEIF entity store as 0.3.0 declared it. */
+/** The GLEIF entity store as 0.3.0 and 0.4.0 declared it. */
 const V030_LEI_SPEC: Omit<SchemaSpec, 'path'> = {
   table: 'lei_entity',
   primaryKey: 'lei',
@@ -473,6 +672,73 @@ async function writeV030Gleif(gleifPath: string): Promise<void> {
     total: 3,
   });
   await store.close();
+}
+
+/**
+ * Write a ready 0.4.0-shaped GLEIF mirror at the configured mirror's GLEIF path:
+ * the fixture entities with their name index built. 0.4.0 declared the 0.3.0
+ * entity store and the current auxiliary tables, so a file the current service
+ * writes differs from one 0.4.0 wrote only in what that store adds on open: the
+ * status index, at schema version 1.
+ */
+async function writeV040Gleif(): Promise<void> {
+  const writer = buildScreeningService();
+  await writer.ingestLeiEntities(FIXTURE_LEI_ENTITIES);
+  await writer.markLeiReady(FIXTURE_LEI_ENTITIES.length, undefined, { namesIndexed: true });
+  await writer.close();
+  const store = sqliteMirrorStore({ path: join(dir, 'sanctions.gleif.db'), ...V030_LEI_SPEC });
+  (await store.raw()).exec('UPDATE schema_version SET version = 1');
+  await store.close();
+}
+
+/** The GLEIF entity table's declared indexes and triggers, its legal-name FTS, and the schema version. */
+function gleifSchemaFacts(handle: SqliteHandle) {
+  const objects = (type: 'index' | 'trigger') =>
+    handle
+      .prepare<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = ? AND tbl_name = 'lei_entity' AND sql IS NOT NULL ORDER BY name",
+      )
+      .all(type)
+      .map((row) => row.name);
+  return {
+    version: handle.prepare<{ v: number }>('SELECT MAX(version) AS v FROM schema_version').get()?.v,
+    indexes: objects('index'),
+    legalNameFts:
+      handle
+        .prepare<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'lei_entity_fts'",
+        )
+        .get()?.n ?? 0,
+    triggers: objects('trigger'),
+  };
+}
+
+/** What schema version 2 leaves on every GLEIF mirror: the jurisdiction index and the legal-name FTS, no status index. */
+const GLEIF_V2_FACTS = {
+  version: 2,
+  indexes: ['lei_entity_jurisdiction_idx'],
+  legalNameFts: 1,
+  triggers: ['lei_entity_ad', 'lei_entity_ai', 'lei_entity_au'],
+};
+
+/** The same file as the release that wrote it left it: the status index beside the jurisdiction index. */
+const GLEIF_V1_FACTS = {
+  ...GLEIF_V2_FACTS,
+  version: 1,
+  indexes: ['lei_entity_jurisdiction_idx', LEI_STATUS_INDEX],
+};
+
+/**
+ * Open the GLEIF file as 0.3.0 and 0.4.0 open it — through their entity store,
+ * whose open builds every index it declares — and read its schema facts.
+ */
+async function openedByEarlierRelease(): Promise<ReturnType<typeof gleifSchemaFacts>> {
+  const store = sqliteMirrorStore({ path: join(dir, 'sanctions.gleif.db'), ...V030_LEI_SPEC });
+  try {
+    return gleifSchemaFacts(await store.raw());
+  } finally {
+    await store.close();
+  }
 }
 
 describe('a 0.3.0 GLEIF mirror opened by the current service', () => {
@@ -590,6 +856,44 @@ describe('a 0.3.0 GLEIF mirror opened by the current service', () => {
     expect(retired.result.matches[0]).toMatchObject({ lei: LONE, status: 'RETIRED' });
   });
 
+  it('drops the status index no query reads on first open, keeping the legal-name FTS (#52)', async () => {
+    expect(await openedByEarlierRelease()).toEqual(GLEIF_V1_FACTS);
+
+    // The first GLEIF read opens the store, which upgrades the file.
+    const { result } = await resolveWith({ name: 'Fictional Trading Company LLC' });
+    expect(result.matches[0]).toMatchObject({ lei: CHILD, matchType: 'exact' });
+    expect(gleifSchemaFacts(await getScreeningService().leiEntities.raw())).toEqual(GLEIF_V2_FACTS);
+  });
+
+  it('stays openable by the release that wrote it, which rebuilds its status index (#52)', async () => {
+    const before = (await resolveWith({ name: 'Testland Holdings PLC' })).result; // upgraded
+    await getScreeningService().close();
+    resetScreeningService();
+
+    // Rolled back: that release's store builds the index again and leaves the
+    // version where the migration set it. Its strict query reads the legal-name FTS.
+    const released = sqliteMirrorStore({ path: join(dir, 'sanctions.gleif.db'), ...V030_LEI_SPEC });
+    const releasedHandle = await released.raw();
+    const releasedFacts = gleifSchemaFacts(releasedHandle);
+    const legalNameHits = releasedHandle
+      .prepare<{ lei: string }>(
+        'SELECT e.lei FROM lei_entity_fts f JOIN lei_entity e ON e.rowid = f.rowid WHERE lei_entity_fts MATCH ?',
+      )
+      .all(buildFtsMatch('Testland Holdings PLC'))
+      .map((row) => row.lei);
+    await released.close();
+    initScreeningService(); // upgraded again
+    expect(releasedFacts).toEqual({ ...GLEIF_V1_FACTS, version: 2 });
+    expect(legalNameHits).toEqual([PARENT]);
+
+    // The migration is recorded as applied and does not run again, so the rebuilt
+    // index stays, unread — and resolution answers as it did.
+    expect((await resolveWith({ name: 'Testland Holdings PLC' })).result).toEqual(before);
+    expect(gleifSchemaFacts(await getScreeningService().leiEntities.raw()).indexes).toContain(
+      LEI_STATUS_INDEX,
+    );
+  });
+
   it('serves a record 0.3.0 wrote in the current shape, its bare other names typed unknown', async () => {
     const tool = await getEntityTool.handler(
       getEntityTool.input.parse({ lei: CHILD }),
@@ -672,5 +976,48 @@ describe('a 0.3.0 GLEIF mirror opened by the current service', () => {
       initScreeningService();
       expect((await resolveWith({ name: 'Qorlane Brands' })).notice).toBeUndefined();
     });
+  });
+});
+
+describe('a 0.4.0 GLEIF mirror opened by the current service', () => {
+  beforeEach(async () => {
+    await getScreeningService().close();
+    resetScreeningService();
+    await writeV040Gleif();
+    initScreeningService();
+  });
+
+  it('drops the status index on first open and resolves from the name index as before (#52)', async () => {
+    expect(await openedByEarlierRelease()).toEqual(GLEIF_V1_FACTS);
+
+    const ctx = ctxFor(resolveEntityTool.errors);
+    const result = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'PAO NK Zorneft' }),
+      ctx,
+    );
+    expect(result.matches[0]).toMatchObject({
+      lei: '253400ZORNEFTPAO0042',
+      matchedName: 'PAO NK ZORNEFT',
+      matchedNameType: 'PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME',
+      matchType: 'exact',
+    });
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+    expect(gleifSchemaFacts(await getScreeningService().leiEntities.raw())).toEqual(GLEIF_V2_FACTS);
+  });
+});
+
+describe('a GLEIF mirror created by the current service', () => {
+  it('never builds the status index, however often it is reopened (#52)', async () => {
+    process.env.SANCTIONS_MIRROR_PATH = join(dir, 'fresh.db');
+    resetServerConfig();
+    for (let open = 0; open < 3; open++) {
+      const service = buildScreeningService();
+      try {
+        if (open === 0) await service.ingestLeiEntities(FIXTURE_LEI_ENTITIES);
+        expect(gleifSchemaFacts(await service.leiEntities.raw())).toEqual(GLEIF_V2_FACTS);
+      } finally {
+        await service.close();
+      }
+    }
   });
 });

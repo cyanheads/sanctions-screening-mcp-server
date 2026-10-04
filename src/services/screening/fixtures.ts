@@ -100,6 +100,11 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
       addresses: [],
       datesOfBirth: [],
       nationalities: [],
+      // Ship details describe the vessel; only its IMO number identifies it.
+      features: [
+        { type: 'CurrentBelievedFlagOfShip', value: 'Testland' },
+        { type: 'TypeOfShip', value: 'Bulk Carrier' },
+      ],
     },
   },
   {

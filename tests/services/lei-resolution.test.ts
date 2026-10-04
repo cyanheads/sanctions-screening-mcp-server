@@ -2,22 +2,26 @@
  * @fileoverview LEI resolution over the GLEIF name index: every published name
  * — legal, other, and transliterated — reaches strict and fuzzy retrieval and is
  * reported with its type (#24); blocking and strict lookups are index lookups
- * with the jurisdiction resolved inside them (#33, #36); and the status filter
- * matches exactly the registration state it names (#23).
+ * with the jurisdiction resolved inside them (#33, #36); the status filter
+ * matches exactly the registration state it names (#23); and no plan or page on
+ * either path depends on the status index earlier releases built (#52).
  * @module tests/services/lei-resolution.test
  */
 
-import type { SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
+import { openSqliteHandle, type SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { FUZZY_POOL_BUDGET } from '@/services/screening/candidate-pool.js';
 import { FIXTURE_LEI_ENTITIES } from '@/services/screening/fixtures.js';
-import type {
-  ResolveEntityOptions,
-  ScreeningService,
+import { LEI_NAME_NORMALIZED_INDEX, LEI_STATUS_INDEX } from '@/services/screening/schema.js';
+import {
+  LEGACY_LEI_FUZZY_PREFIX_SCANS,
+  type ResolveEntityOptions,
+  type ScreeningService,
 } from '@/services/screening/screening-service.js';
 import { fold, jaroWinkler, tokenCoverage, tokenize } from '@/services/screening/text-matching.js';
 import type { NormalizedLeiEntity } from '@/services/screening/types.js';
-import { type SeededService, seededService } from './_helpers.js';
+import { freshService, type SeededService, seededService } from './_helpers.js';
 
 let seeded: SeededService;
 let svc: ScreeningService;
@@ -614,9 +618,9 @@ function planOf(handle: SqliteHandle, statement: Captured): string[] {
     .map((row) => row.detail);
 }
 
-/** The statements that read the entity or name tables — the resolution queries. */
+/** The statements that read the entity or name tables or the name index — the resolution queries. */
 const resolutionQueries = (captured: Captured[]) =>
-  captured.filter((c) => /\blei_(entity|name)\b/.test(c.sql) && /^\s*SELECT/i.test(c.sql));
+  captured.filter((c) => /\blei_(entity|name|name_fts)\b/.test(c.sql) && /^\s*SELECT/i.test(c.sql));
 
 /** The FTS prefix terms bound across the blocking lookups, in order. */
 const blockedPrefixes = (captured: Captured[]) =>
@@ -663,6 +667,95 @@ describe('index-only LEI lookups (#33, #23, #36)', () => {
     }
   });
 
+  /**
+   * Plans and pages of every probe query on both resolution paths: the name-index
+   * path, then the legal-name path an earlier release's write leaves — a
+   * completion the name index did not follow. The plans come from a connection of
+   * their own: bun:sqlite leaves an `EXPLAIN` statement active, and an active
+   * statement on the service's connection would lock the schema against the
+   * index change between observations.
+   */
+  async function observeBothPaths(opts: Partial<ResolveEntityOptions>) {
+    const handle = await svc.leiEntities.raw();
+    const seen = new Map<string, { pages: unknown[]; statements: Captured[] }>();
+    for (const path of ['name index', 'legal name'] as const) {
+      if (path === 'name index') {
+        await svc.markLeiReady(1, undefined, { namesIndexed: true });
+      } else {
+        await svc.leiEntities.store.writeState({
+          status: 'complete',
+          completedAt: '2027-01-01T00:00:00.000Z',
+          total: 1,
+        });
+      }
+      for (const query of ['Apple Inc', 'Landover Holdings', 'Landovr Holdngs Zzqx']) {
+        const pages: unknown[] = [];
+        const statements = resolutionQueries(
+          await captureStatements(handle, async () => {
+            for (const offset of [0, 2]) {
+              pages.push(await resolve({ query, ...opts, limit: 2, offset }));
+            }
+          }),
+        );
+        seen.set(`${path} · ${query}`, { pages, statements });
+      }
+    }
+    const file = handle
+      .prepare<{ file: string }>("SELECT file FROM pragma_database_list WHERE name = 'main'")
+      .get()?.file;
+    const planner = await openSqliteHandle(String(file));
+    try {
+      return new Map(
+        [...seen].map(([key, { pages, statements }]) => [
+          key,
+          {
+            pages,
+            plans: statements.map((s) => ({ plan: planOf(planner, s), sql: s.sql })),
+          },
+        ]),
+      );
+    } finally {
+      planner.close();
+    }
+  }
+
+  it.each(cases)(
+    'plans and pages %s alike with and without the status index earlier releases built, on both paths (#52)',
+    async (_label, opts) => {
+      const handle = await svc.leiEntities.raw();
+      handle.exec(`CREATE INDEX IF NOT EXISTS ${LEI_STATUS_INDEX} ON lei_entity(status)`);
+      const withIndex = await observeBothPaths(opts);
+      handle.exec(`DROP INDEX ${LEI_STATUS_INDEX}`);
+      expect(await observeBothPaths(opts)).toEqual(withIndex);
+
+      // Each path ran its own statements: the name index, then the legal-name FTS.
+      const statementsOn = (path: string) =>
+        [...withIndex]
+          .filter(([key]) => key.startsWith(path))
+          .flatMap(([, { plans }]) => plans.map((p) => p.sql))
+          .join('\n');
+      expect(statementsOn('name index')).toMatch(/\blei_name\b/);
+      expect(statementsOn('legal name')).toMatch(/\blei_entity_fts\b/);
+      expect(statementsOn('legal name')).not.toMatch(/\blei_name\b/);
+
+      for (const [key, { plans }] of withIndex) {
+        expect(plans.length, key).toBeGreaterThan(0);
+        for (const { plan, sql } of plans) {
+          const detail = `${key}\n${sql}\n${plan.join('\n')}`;
+          expect(plan.join('\n'), detail).not.toContain(LEI_STATUS_INDEX);
+          // The legal-name path's fuzzy pass reads legal names with LIKE, as 0.3.0
+          // did: a table scan unless a jurisdiction narrows it through its index.
+          const legalNameScan =
+            key.startsWith('legal name') && /\bLIKE\b/.test(sql) && !opts.jurisdiction;
+          expect(
+            plan.filter((line) => /^SCAN /.test(line) && !/VIRTUAL TABLE/.test(line)),
+            detail,
+          ).toEqual(legalNameScan ? ['SCAN e'] : []);
+        }
+      }
+    },
+  );
+
   it('blocks a 64-word query whose words match nothing by index lookups only', async () => {
     const letters = 'qxzjvkw';
     const words: string[] = [];
@@ -697,12 +790,272 @@ describe('index-only LEI lookups (#33, #23, #36)', () => {
     }
   });
 
+  it('measures each fuzzy block in the name index alone, one name past the budget, before joining a row', async () => {
+    const handle = await svc.leiEntities.raw();
+    const opts = {
+      query: 'Landovr Holdngs',
+      jurisdiction: 'GB',
+      status: 'issued',
+      matchMode: 'fuzzy',
+    } as const;
+    let statuses: (string | undefined)[] = [];
+    const captured = await captureStatements(handle, async () => {
+      statuses = (await resolve(opts)).matches.map((m) => m.status);
+    });
+    const blocks = captured.filter((c) =>
+      String(c.params[0]).includes('{normalized suffix_terms}'),
+    );
+    expect(blocks.map((c) => String(c.params[0]))).toEqual([
+      '({normalized suffix_terms} : "lan"*) AND jurisdiction_terms : "jcgb"',
+      '({normalized suffix_terms} : "hol"*) AND jurisdiction_terms : "jcgb"',
+    ]);
+    for (const block of blocks) {
+      expect(block.sql).not.toMatch(/\bJOIN\b|\blei_entity\b|\bstatus\b/i);
+      expect(block.params[1]).toBe(FUZZY_POOL_BUDGET + 1);
+    }
+    // Rows are joined only by the rowids a lookup returned, never by a MATCH.
+    const joins = captured.filter((c) => /\bJOIN\b/.test(c.sql) && /json_each/.test(c.sql));
+    expect(joins.length).toBeGreaterThan(0);
+    for (const join of joins) expect(join.sql).not.toMatch(/\bMATCH\b/);
+    // The status filter still holds: it applies where the rows are joined.
+    expect(new Set(statuses)).toEqual(new Set(['ISSUED']));
+  });
+
   it('blocks two-code-point prefixes through the index', async () => {
     const handle = await svc.leiEntities.raw();
     const captured = await captureStatements(handle, () =>
-      resolve({ query: 'Fictionall Tradng Co X', matchMode: 'fuzzy' }),
+      resolve({ query: 'Fictionall Tradng Xu X', matchMode: 'fuzzy' }),
     );
-    expect(blockedPrefixes(captured)).toEqual(['fic', 'tra', 'co']);
+    expect(blockedPrefixes(captured)).toEqual(['fic', 'tra', 'xu']);
     expect(captured.some((c) => /\bLIKE\b/.test(c.sql))).toBe(false);
+  });
+});
+
+// ─── #9: strict resolution takes exact names first, under its bound ──────────
+
+describe('strict resolution — exact names first, under the scan bound (#9)', () => {
+  /** `count` entities in `jurisdiction` whose names hold `Quorvane` and one more word. */
+  const crowd = (count: number, jurisdiction = 'US'): NormalizedLeiEntity[] =>
+    Array.from({ length: count }, (_unused, i) => ({
+      lei: lei(`QCROWD${String(i).padStart(5, '0')}X`),
+      legalName: `Quorvane Zx${i}`,
+      otherNames: [],
+      jurisdiction,
+      status: 'ISSUED',
+    }));
+  /** An entity named exactly `Quorvane`. */
+  const exactly = (tag: string, jurisdiction: string, status = 'ISSUED'): NormalizedLeiEntity => ({
+    lei: lei(tag),
+    legalName: 'Quorvane',
+    otherNames: [],
+    jurisdiction,
+    status,
+  });
+  const EXACT_STATEMENT = /\bnormalized = \?/;
+
+  it('returns every exact name ahead of the strong matches when the bound binds', async () => {
+    // Written after 2,100 strong names, so no exact name is among the first 2,000 the scan reads.
+    await svc.ingestLeiEntities([
+      ...crowd(2100),
+      exactly('QEXACTUS', 'US'),
+      exactly('QEXACTDE', 'DE'),
+      exactly('QEXACTLAPSED', 'DE', 'LAPSED'),
+    ]);
+    const res = await resolve({ query: 'Quorvane', status: 'issued', limit: 5 });
+    expect(res.matches.slice(0, 2)).toEqual([
+      expect.objectContaining({ lei: lei('QEXACTDE'), matchType: 'exact' }),
+      expect.objectContaining({ lei: lei('QEXACTUS'), matchType: 'exact' }),
+    ]);
+    expect(res.matches.slice(2).every((match) => match.matchType === 'strong')).toBe(true);
+    expect(res).toMatchObject({ totalAvailableBasis: 'lower_bound', strictScanBounded: true });
+
+    // Under the bound the count is the whole strict set, and nothing is flagged.
+    const narrow = await resolve({ query: 'Quorvane Zx7' });
+    expect(narrow).toMatchObject({
+      totalAvailable: 1,
+      totalAvailableBasis: 'exact',
+      strictScanBounded: false,
+    });
+  });
+
+  it('applies the jurisdiction and status filters to the exact-name lookup', async () => {
+    await svc.ingestLeiEntities([
+      ...crowd(2100, 'DE'),
+      exactly('QEXACTDE', 'DE'),
+      exactly('QEXACTLAPSED', 'DE', 'LAPSED'),
+      exactly('QEXACTUS', 'US'),
+      exactly('QEXACTUSCA', 'US-CA'),
+    ]);
+    const inGermany = await resolve({ query: 'Quorvane', jurisdiction: 'DE', status: 'issued' });
+    expect(inGermany.matches[0]).toMatchObject({ lei: lei('QEXACTDE'), matchType: 'exact' });
+    expect(inGermany.matches.slice(1).every((match) => match.matchType === 'strong')).toBe(true);
+
+    const inUs = await resolve({ query: 'Quorvane', jurisdiction: 'US' });
+    expect(inUs.matches.map((match) => match.lei)).toEqual([lei('QEXACTUS'), lei('QEXACTUSCA')]);
+    expect(inUs).toMatchObject({ totalAvailable: 2, totalAvailableBasis: 'exact' });
+
+    const inCalifornia = await resolve({ query: 'Quorvane', jurisdiction: 'US-CA' });
+    expect(inCalifornia.matches.map((match) => match.lei)).toEqual([lei('QEXACTUSCA')]);
+  });
+
+  it('looks the exact name up through its index once the bound binds, and never otherwise', async () => {
+    await svc.ingestLeiEntities([...crowd(2100), exactly('QEXACTUS', 'US')]);
+    const handle = await svc.leiEntities.raw();
+    const exactStatements = async (opts: Partial<ResolveEntityOptions> & { query: string }) =>
+      (await captureStatements(handle, () => resolve(opts))).filter((c) =>
+        EXACT_STATEMENT.test(c.sql),
+      );
+
+    const scopes: Partial<ResolveEntityOptions>[] = [
+      {},
+      { jurisdiction: 'US' },
+      { jurisdiction: 'US', status: 'issued' },
+    ];
+    for (const opts of scopes) {
+      const exact = await exactStatements({ query: 'Quorvane', ...opts });
+      expect(exact).toHaveLength(1);
+      const plan = planOf(handle, exact[0]!);
+      expect(plan.join('\n')).toMatch(
+        new RegExp(`SEARCH n USING INDEX ${LEI_NAME_NORMALIZED_INDEX} \\(normalized=\\?\\)`),
+      );
+      expect(plan.filter((line) => /^SCAN /.test(line))).toEqual([]);
+    }
+    // Under the bound the scan read every exact name already.
+    expect(await exactStatements({ query: 'Quorvane Zx7' })).toEqual([]);
+  });
+
+  it('keeps the bounded scan on a mirror without the exact-name index, and never looks the name up', async () => {
+    const handle = await svc.leiEntities.raw();
+    handle.exec(`DROP INDEX IF EXISTS ${LEI_NAME_NORMALIZED_INDEX}`);
+    await svc.ingestLeiEntities([...crowd(2100), exactly('QEXACTUS', 'US')]);
+
+    const captured = await captureStatements(handle, async () => {
+      const res = await resolve({ query: 'Quorvane', limit: 50 });
+      expect(res.matches.map((match) => match.lei)).not.toContain(lei('QEXACTUS'));
+      expect(res).toMatchObject({ totalAvailableBasis: 'lower_bound', strictScanBounded: true });
+    });
+    expect(captured.some((c) => EXACT_STATEMENT.test(c.sql))).toBe(false);
+  });
+
+  it('is built by the mirror scripts, never on open or by a resolution', async () => {
+    const fresh = await freshService();
+    try {
+      await fresh.service.ingestLeiEntities([exactly('QEXACTUS', 'US')]);
+      await fresh.service.markLeiReady(1, undefined, { namesIndexed: true });
+      await fresh.service.resolveEntity(
+        { query: 'Quorvane', matchMode: 'strict', status: 'any', limit: 10 },
+        ctx,
+      );
+      expect(await fresh.service.leiExactNamesIndexed()).toBe(false);
+
+      await fresh.service.indexLeiExactNames();
+      await fresh.service.indexLeiExactNames();
+      expect(await fresh.service.leiExactNamesIndexed()).toBe(true);
+    } finally {
+      await fresh.cleanup();
+    }
+  });
+});
+
+// ─── #71: the pre-index fuzzy pass runs a bounded number of scans ────────────
+
+describe('pre-index fuzzy pass — a bounded number of LIKE scans (#71)', () => {
+  const VEXMORA = lei('VEXMORA');
+
+  beforeEach(async () => {
+    await svc.ingestLeiEntities([
+      {
+        lei: VEXMORA,
+        legalName: 'Vexmora Quindle Jarnwick Holdings Ltd',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+      {
+        lei: lei('OSWYND'),
+        legalName: 'Oswynd Pyxtal Trading Ltd',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+    ]);
+    // What an earlier release's write leaves: a completion the name index did not follow.
+    await svc.leiEntities.store.writeState({
+      status: 'complete',
+      completedAt: '2027-01-01T00:00:00.000Z',
+      total: 1,
+    });
+  });
+
+  /** A fuzzy resolution and the `LIKE` patterns its legal-name pass bound, in the order it ran them. */
+  async function fuzzyScans(query: string) {
+    const handle = await svc.leiEntities.raw();
+    let res: Awaited<ReturnType<typeof resolve>> | undefined;
+    const captured = await captureStatements(handle, async () => {
+      res = await resolve({ query, matchMode: 'fuzzy' });
+    });
+    if (!res) throw new Error('resolution did not run');
+    expect(res.alternateNamesIndexed).toBe(false);
+    return { res, scans: captured.filter((c) => /\bLIKE\b/.test(c.sql)).map((c) => c.params[0]) };
+  }
+
+  it('scans every distinctive prefix of a query within the cap and pools as before', async () => {
+    const { res, scans } = await fuzzyScans('Vexmira Quindel Jarnwik');
+    expect(scans).toEqual(['%vex%', '%qui%', '%jar%']);
+    expect(res.poolBounded).toBe(false);
+    expect(res.matches).toEqual([
+      {
+        lei: VEXMORA,
+        legalName: 'Vexmora Quindle Jarnwick Holdings Ltd',
+        matchedName: 'Vexmora Quindle Jarnwick Holdings Ltd',
+        matchedNameType: 'LEGAL_NAME',
+        matchType: 'approximate',
+        score: 0.975,
+        queryTokenCoverage: { covered: 3, total: 3 },
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+    ]);
+  });
+
+  it('still reports the bound when a scan within the cap reaches its row limit', async () => {
+    await svc.ingestLeiEntities(
+      Array.from({ length: 200 }, (_unused, i) => ({
+        lei: lei(`VEXCROWD${String(i).padStart(3, '0')}`),
+        legalName: `Vexmora Shipping ${i}`,
+        otherNames: [],
+      })),
+    );
+    const { res, scans } = await fuzzyScans('Vexmira');
+    expect(scans).toEqual(['%vex%']);
+    expect(res.poolBounded).toBe(true);
+  });
+
+  it('scans only its first distinctive prefixes, in query order, past the cap, and reports the bound', async () => {
+    const over = await fuzzyScans('Vexmira Quindel Jarnwik Oswynd Pyxtal');
+    expect(over.scans).toEqual(['%vex%', '%qui%', '%jar%']);
+    expect(over.scans).toHaveLength(LEGACY_LEI_FUZZY_PREFIX_SCANS);
+    expect(over.res).toMatchObject({ poolBounded: true, totalAvailableBasis: 'lower_bound' });
+
+    // The same words in another order scan another first three.
+    const reordered = await fuzzyScans('Oswynd Pyxtal Vexmira Quindel Jarnwik');
+    expect(reordered.scans).toEqual(['%osw%', '%pyx%', '%vex%']);
+    expect(reordered.res.poolBounded).toBe(true);
+  });
+
+  it('counts scans, not words: words sharing a prefix take one scan', async () => {
+    const shared = await fuzzyScans('Vexmira Vexmora Quindel Jarnwik');
+    expect(shared.scans).toEqual(['%vex%', '%qui%', '%jar%']);
+    expect(shared.res.poolBounded).toBe(false);
+
+    // 64 words, 26 distinct prefixes (`zqa` … `zqz`), none matching a name.
+    const letter = (n: number) => String.fromCharCode(97 + n);
+    const words = Array.from(
+      { length: 64 },
+      (_unused, i) => `zq${letter(i % 26)}${letter(i >> 5)}x`,
+    );
+    const long = await fuzzyScans(words.join(' '));
+    expect(long.scans).toHaveLength(LEGACY_LEI_FUZZY_PREFIX_SCANS);
+    expect(long.res.poolBounded).toBe(true);
   });
 });

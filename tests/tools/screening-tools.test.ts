@@ -12,6 +12,7 @@ import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designati
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity.tool.js';
+import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 import { parseEu, parseOfac, parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
@@ -29,6 +30,27 @@ import {
  */
 const ctxFor = <const E extends readonly ErrorContract[] | undefined>(errors: E) =>
   createMockContext({ errors });
+
+/**
+ * Assert a name tool rejects `name` with `reason` on the wire. Driven through
+ * `runToolContract`, where the framework fills the declared recovery hint as
+ * production does — a direct handler call returns the throw without it.
+ */
+async function expectNameRejected(
+  tool: typeof screenNameTool | typeof resolveEntityTool,
+  name: string,
+  reason: string,
+  hint: RegExp,
+): Promise<void> {
+  const result = await runToolContract(tool, { name });
+  expect(result.isError, tool.name).toBe(true);
+  expect(result.structuredContent, tool.name).toMatchObject({
+    error: {
+      code: JsonRpcErrorCode.InvalidParams,
+      data: { reason, recovery: { hint: expect.stringMatching(hint) } },
+    },
+  });
+}
 
 describe('screening tools (seeded)', () => {
   let seeded: SeededService;
@@ -130,7 +152,8 @@ describe('screening tools (seeded)', () => {
   });
 
   it('trace_ownership throws not-found for an unknown root LEI', async () => {
-    const input = traceOwnershipTool.input.parse({ lei: '00000000000000000000' });
+    // Check digits valid, so the miss reads as not found rather than a typo (#62).
+    const input = traceOwnershipTool.input.parse({ lei: '529900UNKNOWNLEI0009' });
     await expect(
       traceOwnershipTool.handler(input, ctxFor(traceOwnershipTool.errors)),
     ).rejects.toMatchObject({ data: { reason: 'lei_not_found' } });
@@ -350,33 +373,14 @@ describe('names with no searchable token (issue #20)', () => {
   it.each(unsearchable)(
     'screen_name rejects %j with the declared reason and recovery',
     async (name) => {
-      await expect(
-        screenNameTool.handler(screenNameTool.input.parse({ name }), ctxFor(screenNameTool.errors)),
-      ).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: {
-          reason: 'name_not_searchable',
-          recovery: { hint: expect.stringMatching(/letter or digit/) },
-        },
-      });
+      await expectNameRejected(screenNameTool, name, 'name_not_searchable', /letter or digit/);
     },
   );
 
   it.each(unsearchable)(
     'resolve_entity rejects %j with the declared reason and recovery',
     async (name) => {
-      await expect(
-        resolveEntityTool.handler(
-          resolveEntityTool.input.parse({ name }),
-          ctxFor(resolveEntityTool.errors),
-        ),
-      ).rejects.toMatchObject({
-        code: JsonRpcErrorCode.InvalidParams,
-        data: {
-          reason: 'name_not_searchable',
-          recovery: { hint: expect.stringMatching(/letter or digit/) },
-        },
-      });
+      await expectNameRejected(resolveEntityTool, name, 'name_not_searchable', /letter or digit/);
     },
   );
 
@@ -469,29 +473,17 @@ describe('names past the matching bound', () => {
     ['65 words', words(65)],
     ['1,025 characters', 'a'.repeat(1025)],
   ];
-  const tooLongError = {
-    code: JsonRpcErrorCode.InvalidParams,
-    data: { reason: 'name_too_long', recovery: { hint: expect.stringMatching(/64 words/) } },
-  };
-
   it.each(tooLong)(
     'screen_name rejects %s with the declared reason and recovery',
     async (_l, name) => {
-      await expect(
-        screenNameTool.handler(screenNameTool.input.parse({ name }), ctxFor(screenNameTool.errors)),
-      ).rejects.toMatchObject(tooLongError);
+      await expectNameRejected(screenNameTool, name, 'name_too_long', /64 words/);
     },
   );
 
   it.each(tooLong)(
     'resolve_entity rejects %s with the declared reason and recovery',
     async (_l, name) => {
-      await expect(
-        resolveEntityTool.handler(
-          resolveEntityTool.input.parse({ name }),
-          ctxFor(resolveEntityTool.errors),
-        ),
-      ).rejects.toMatchObject(tooLongError);
+      await expectNameRejected(resolveEntityTool, name, 'name_too_long', /64 words/);
     },
   );
 
@@ -1004,6 +996,310 @@ describe('published precision and feature identifiers on both surfaces (issues #
     await expect(getDesignation('uk', 'RUS9999')).rejects.toMatchObject({
       data: { reason: 'designation_not_found' },
     });
+  });
+});
+
+describe('legal basis and per-list OFAC designation dates on both surfaces (issues #63, #66)', () => {
+  let seeded: SeededService;
+  /** Party 17022 as both OFAC files publish it: entries on the SDN, SSI, and Consolidated lists. */
+  const OFAC_17022 = `<Sanctions>
+    <ReferenceValueSets>
+      <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+      <LegalBasisValues>
+        <LegalBasis ID="91503" LegalBasisShortRef="Executive Order 13662 (Ukraine)">Executive Order 13662 (Ukraine)</LegalBasis>
+        <LegalBasis ID="92049" LegalBasisShortRef="Executive Order 14024 (Russia)">Executive Order 14024 (Russia)</LegalBasis>
+      </LegalBasisValues>
+      <ListValues>
+        <List ID="1550">SDN List</List><List ID="91507">Sectoral Sanctions Identifications List</List><List ID="91512">Consolidated List</List>
+      </ListValues>
+    </ReferenceValueSets>
+    <DistinctParties><DistinctParty FixedRef="17022"><Profile ID="17022"><Identity ID="1">
+      <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>GAZPROM NEFT EXAMPLE</NamePartValue></DocumentedNamePart></DocumentedName></Alias>
+    </Identity></Profile></DistinctParty></DistinctParties>
+    <SanctionsEntries>${[
+      ['1550', '2025'],
+      ['91507', '2014'],
+      ['91512', '2015'],
+    ]
+      .map(
+        ([list, year]) =>
+          `<SanctionsEntry ProfileID="17022" ListID="${list}">${['91503', '92049']
+            .map(
+              (basis) =>
+                `<EntryEvent LegalBasisID="${basis}"><Date><Year>${year}</Year><Month>10</Month><Day>22</Day></Date></EntryEvent>`,
+            )
+            .join(
+              '',
+            )}<SanctionsMeasure><Comment>UKRAINE-EO13662</Comment></SanctionsMeasure><SanctionsMeasure><Comment>RUSSIA-EO14024</Comment></SanctionsMeasure></SanctionsEntry>`,
+      )
+      .join('')}</SanctionsEntries>
+  </Sanctions>`;
+
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+    await seeded.service.ingestDesignations([
+      ...parseOfac(parseXml(OFAC_17022), 'ofac_sdn'),
+      ...parseOfac(parseXml(OFAC_17022), 'ofac_consolidated'),
+      ...parseEu(
+        parseXml(`<export><sanctionEntity designationDate="2014-03-17" logicalId="7290">
+          <regulation regulationType="amendment" numberTitle="2015/2043 (OJ L 300, p. 1)" programme="UKR"/>
+          <subjectType code="person"/><nameAlias wholeName="Example EU Person 7290" strong="true"/>
+        </sanctionEntity></export>`),
+      ),
+      ...parseUk(
+        parseXml(`<Designations><Designation><UniqueID>RUS0001</UniqueID>
+          <RegimeName>The Russia (Sanctions) (EU Exit) Regulations 2019</RegimeName>
+          <Names><Name><Name6>EXAMPLE UK ENTITY</Name6><NameType>Primary Name</NameType></Name></Names>
+          <IndividualEntityShip>Entity</IndividualEntityShip>
+        </Designation></Designations>`),
+      ),
+    ]);
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  it.each([
+    [
+      'ofac_sdn',
+      '17022',
+      '2025-10-22',
+      'Executive Order 13662 (Ukraine); Executive Order 14024 (Russia)',
+    ],
+    [
+      'ofac_consolidated',
+      '17022',
+      '2014-10-22',
+      'Executive Order 13662 (Ukraine); Executive Order 14024 (Russia)',
+    ],
+    ['eu', '7290', '2014-03-17', '2015/2043 (OJ L 300, p. 1)'],
+    ['uk', 'RUS0001', undefined, 'The Russia (Sanctions) (EU Exit) Regulations 2019'],
+  ] as const)(
+    '%s/%s: designated %s under %s, through the output schema and format()',
+    async (source, entryId, date, legalBasis) => {
+      const result = await runToolContract(getDesignationTool, { source, entryId });
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured.legalBasis).toBe(legalBasis);
+      expect(structured.designationDate).toBe(date);
+      const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+      expect(text).toContain(`**Legal basis:** ${legalBasis}`);
+      if (date) expect(text).toContain(`**Designated:** ${date}`);
+    },
+  );
+
+  it('screens the party both OFAC files publish as one hit, dated from its SDN record (issue #61)', async () => {
+    const result = await runToolContract(screenNameTool, { name: 'Gazprom Neft Example' });
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      hits: Record<string, unknown>[];
+      totalAvailable: number;
+    };
+    expect(structured.hits).toHaveLength(1);
+    expect(structured.hits[0]).toMatchObject({
+      source: 'ofac_sdn',
+      sourceLabel: 'OFAC Specially Designated Nationals (SDN) List',
+      sourceEntryId: '17022',
+      sources: ['ofac_sdn', 'ofac_consolidated'],
+      designationDate: '2025-10-22',
+    });
+    expect(structured.totalAvailable).toBe(1);
+    const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(text).toContain('**1 potential match(es)**');
+    expect(text).toContain(
+      '**List:** OFAC Specially Designated Nationals (SDN) List (`ofac_sdn`) | **Also listed on:** OFAC Consolidated Sanctions List (`ofac_consolidated`) | **Entry ID:** 17022',
+    );
+    expect(text).toContain('**Designated:** 2025-10-22 (the `ofac_sdn` record)');
+  });
+
+  it('carries no legal basis for a UN designation', async () => {
+    await seeded.service.ingestDesignations(
+      parseUn(
+        parseXml(`<CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL>
+          <DATAID>6908457</DATAID><FIRST_NAME>NO</FIRST_NAME><SECOND_NAME>INSTRUMENT</SECOND_NAME>
+          <UN_LIST_TYPE>DRC</UN_LIST_TYPE><LISTED_ON>2015-07-01</LISTED_ON>
+        </INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>`),
+      ),
+    );
+    const result = await runToolContract(getDesignationTool, { source: 'un', entryId: '6908457' });
+    expect(result.structuredContent).not.toHaveProperty('legalBasis');
+    const text = result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(text).not.toContain('Legal basis');
+  });
+});
+
+describe('descriptive features on both surfaces (issue #64)', () => {
+  let seeded: SeededService;
+  /** Vessel 52251 as the 2026-10-02 publication gives it, and an aircraft with a date and a location feature. */
+  const OFAC_FEATURES = `<Sanctions>
+    <ReferenceValueSets>
+      <AliasTypeValues><AliasType ID="1403">Name</AliasType></AliasTypeValues>
+      <DetailReferenceValues>
+        <DetailReference ID="704">General Cargo</DetailReference>
+        <DetailReference ID="92764">See Section 11 of Executive Order 14024.</DetailReference>
+      </DetailReferenceValues>
+      <FeatureTypeValues>
+        <FeatureType ID="1">Vessel Call Sign</FeatureType><FeatureType ID="2">VESSEL TYPE</FeatureType>
+        <FeatureType ID="3">Vessel Flag</FeatureType><FeatureType ID="504">Secondary sanctions risk:</FeatureType>
+        <FeatureType ID="125">Aircraft Manufacture Date</FeatureType><FeatureType ID="135">Registration Country</FeatureType>
+      </FeatureTypeValues>
+      <LocPartTypeValues><LocPartType ID="1">Unknown</LocPartType></LocPartTypeValues>
+    </ReferenceValueSets>
+    <Locations>
+      <Location ID="186190"><LocationPart LocPartTypeID="1"><LocationPartValue Primary="true"><Value>Iran</Value></LocationPartValue></LocationPart></Location>
+    </Locations>
+    <DistinctParties>
+      <DistinctParty FixedRef="52251"><Profile ID="52251"><Identity ID="43843">
+        <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>OCEAN 28</NamePartValue></DocumentedNamePart></DocumentedName></Alias></Identity>
+        <Feature FeatureTypeID="504"><FeatureVersion><VersionDetail DetailTypeID="1431" DetailReferenceID="92764" /></FeatureVersion></Feature>
+        <Feature FeatureTypeID="2"><FeatureVersion><VersionDetail DetailTypeID="1431" DetailReferenceID="704" /></FeatureVersion></Feature>
+        <Feature FeatureTypeID="1"><FeatureVersion><VersionDetail DetailTypeID="1432">3E6850</VersionDetail></FeatureVersion></Feature>
+        <Feature FeatureTypeID="3"><FeatureVersion><VersionDetail DetailTypeID="1432">Panama</VersionDetail></FeatureVersion></Feature>
+      </Profile></DistinctParty>
+      <DistinctParty FixedRef="70010"><Profile ID="70010"><Identity ID="70010">
+        <Alias AliasTypeID="1403" Primary="true"><DocumentedName><DocumentedNamePart><NamePartValue>EXAMPLE AIRCRAFT</NamePartValue></DocumentedNamePart></DocumentedName></Alias></Identity>
+        <Feature FeatureTypeID="125"><FeatureVersion><DatePeriod CalendarTypeID="1">
+          <Start Approximate="true"><From><Year>1990</Year><Month>1</Month><Day>1</Day></From><To><Year>1990</Year><Month>1</Month><Day>1</Day></To></Start>
+          <End Approximate="true"><From><Year>1990</Year><Month>12</Month><Day>31</Day></From><To><Year>1990</Year><Month>12</Month><Day>31</Day></To></End>
+        </DatePeriod></FeatureVersion></Feature>
+        <Feature FeatureTypeID="135"><FeatureVersion><VersionDetail DetailTypeID="1433" /><VersionLocation LocationID="186190" /></FeatureVersion></Feature>
+      </Profile></DistinctParty>
+    </DistinctParties>
+  </Sanctions>`;
+
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+    await seeded.service.ingestDesignations([
+      ...parseOfac(parseXml(OFAC_FEATURES), 'ofac_sdn'),
+      ...parseUk(
+        parseXml(`<Designations><Designation><UniqueID>DPR0075</UniqueID>
+          <Names><Name><Name6>Petrel 8</Name6><NameType>Primary name</NameType></Name></Names>
+          <IndividualEntityShip>Ship</IndividualEntityShip>
+          <ShipDetails><Ship>
+            <IMONumbers><IMONumber>IMO9562233</IMONumber></IMONumbers>
+            <CurrentOwnerOperators><CurrentOwnerOperator>Global United Shipping India </CurrentOwnerOperator></CurrentOwnerOperators>
+            <CurrentBelievedFlagOfShips><CurrentBelievedFlagOfShip>Comoros</CurrentBelievedFlagOfShip></CurrentBelievedFlagOfShips>
+            <TypeOfShipDetails><TypeOfShip>Bulk Carrier</TypeOfShip></TypeOfShipDetails>
+          </Ship></ShipDetails>
+        </Designation></Designations>`),
+      ),
+      // The payload an earlier release stored: every group but features.
+      {
+        id: 'un:STORED-1',
+        source: 'un',
+        sourceEntryId: 'STORED-1',
+        entityType: 'person',
+        primaryName: 'Stored Before Features',
+        payload: {
+          aliases: [],
+          identifiers: [],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+        },
+      },
+    ]);
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+    result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+
+  it.each([
+    [
+      'ofac_sdn',
+      '52251',
+      [
+        { type: 'Secondary sanctions risk:', value: 'See Section 11 of Executive Order 14024.' },
+        { type: 'VESSEL TYPE', value: 'General Cargo' },
+        { type: 'Vessel Flag', value: 'Panama' },
+      ],
+      [
+        '- **Secondary sanctions risk:** See Section 11 of Executive Order 14024.',
+        '- **VESSEL TYPE:** General Cargo',
+        '- **Vessel Flag:** Panama',
+      ],
+    ],
+    [
+      'ofac_sdn',
+      '70010',
+      [
+        { type: 'Aircraft Manufacture Date', value: '1990', circa: true },
+        { type: 'Registration Country', value: 'Iran' },
+      ],
+      ['- **Aircraft Manufacture Date:** circa 1990', '- **Registration Country:** Iran'],
+    ],
+    [
+      'uk',
+      'DPR0075',
+      [
+        { type: 'CurrentOwnerOperator', value: 'Global United Shipping India' },
+        { type: 'CurrentBelievedFlagOfShip', value: 'Comoros' },
+        { type: 'TypeOfShip', value: 'Bulk Carrier' },
+      ],
+      [
+        '- **CurrentOwnerOperator:** Global United Shipping India',
+        '- **CurrentBelievedFlagOfShip:** Comoros',
+        '- **TypeOfShip:** Bulk Carrier',
+      ],
+    ],
+  ] as const)(
+    '%s/%s: features through the output schema and format()',
+    async (source, entryId, features, lines) => {
+      const result = await runToolContract(getDesignationTool, { source, entryId });
+      expect(result.isError).toBeFalsy();
+      expect((result.structuredContent as { features: unknown }).features).toEqual(features);
+      const text = textOf(result).split('\n');
+      expect(text).toContain('## Features');
+      for (const line of lines) expect(text).toContain(line);
+    },
+  );
+
+  it('leaves the identifiers as they were: the call sign and the IMO number, nothing descriptive', async () => {
+    const vessel = await runToolContract(getDesignationTool, {
+      source: 'ofac_sdn',
+      entryId: '52251',
+    });
+    expect((vessel.structuredContent as { identifiers: unknown }).identifiers).toEqual([
+      { type: 'Vessel Call Sign', value: '3E6850' },
+    ]);
+    const ship = await runToolContract(getDesignationTool, { source: 'uk', entryId: 'DPR0075' });
+    expect((ship.structuredContent as { identifiers: unknown }).identifiers).toEqual([
+      { type: 'IMO Number', value: 'IMO9562233' },
+    ]);
+  });
+
+  it('returns no features, and passes output validation, for a record stored before the group existed', async () => {
+    const result = await runToolContract(getDesignationTool, { source: 'un', entryId: 'STORED-1' });
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { features: unknown }).features).toEqual([]);
+    expect(textOf(result)).not.toContain('## Features');
+  });
+
+  it('never matches a feature value: neither screen_identifier nor screen_name finds one', async () => {
+    const lookup = (value: string) =>
+      screenIdentifierTool.handler(
+        screenIdentifierTool.input.parse({ value }),
+        ctxFor(screenIdentifierTool.errors),
+      );
+    // The call sign and the IMO number are identifiers; the values beside them are not.
+    expect((await lookup('3E6850')).hits.map((h) => h.sourceEntryId)).toEqual(['52251']);
+    expect((await lookup('IMO9562233')).hits.map((h) => h.sourceEntryId)).toEqual(['DPR0075']);
+    for (const value of ['General Cargo', 'Panama', 'Comoros', 'Bulk Carrier', '1990']) {
+      expect((await lookup(value)).hits, value).toEqual([]);
+    }
+    for (const name of ['Global United Shipping India', 'General Cargo']) {
+      const result = await screenNameTool.handler(
+        screenNameTool.input.parse({ name, sources: ['ofac_sdn', 'uk'] }),
+        ctxFor(screenNameTool.errors),
+      );
+      expect(
+        result.hits.filter((h) => ['52251', 'DPR0075'].includes(h.sourceEntryId)),
+        name,
+      ).toEqual([]);
+    }
   });
 });
 

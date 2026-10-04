@@ -13,17 +13,30 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { fold, tokenize } from '@/services/screening/text-matching.js';
 import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
-import { MAX_NAME_CHARS, MAX_NAME_WORDS, SCREENING_CAVEAT } from './_shared.js';
+import {
+  alsoListedText,
+  HitSourcesSchema,
+  MAX_NAME_CHARS,
+  MAX_NAME_WORDS,
+  SCREENING_CAVEAT,
+} from './_shared.js';
 
 const SOURCE_ENUM = z.enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un']);
 
+/** The query words a completion candidate need not cover — `FUZZY_STOPLIST` in words. */
+const UNCOUNTED_WORDS =
+  'legal forms, articles and other function words, and the jurisdiction codes uk, usa, uae, and rf';
+
 const HitSchema = z
   .object({
-    source: SOURCE_ENUM.describe('Which watchlist this candidate is on — its provenance.'),
+    source: SOURCE_ENUM.describe(
+      "The watchlist whose record this hit's fields come from — its provenance. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched better; sources names every list.",
+    ),
     sourceLabel: z.string().describe('Human-readable name of the source list.'),
     sourceEntryId: z
       .string()
       .describe("The list's own entry ID — pass to sanctions_get_designation for the full record."),
+    sources: HitSourcesSchema,
     referenceNumber: z
       .string()
       .optional()
@@ -70,14 +83,15 @@ const HitSchema = z
     designationDate: z
       .string()
       .optional()
-      .describe("The source's own designation date as YYYY-MM-DD; absent when unpublished."),
+      .describe(
+        "The source's own designation date as YYYY-MM-DD; absent when unpublished. For an OFAC party both OFAC lists publish, the date of the source record: each OFAC file dates the party from its own lists, so the two often differ, and sanctions_get_designation under the other list returns that record's date.",
+      ),
   })
   .describe('One potential match — a candidate to verify, never a determination.');
 
 export const screenNameTool = tool('sanctions_screen_name', {
   title: 'sanctions-screening-mcp-server: screen name',
-  description:
-    'Screen a name (person, company, vessel, aircraft) against all loaded sanctions watchlists at once — OFAC SDN + Consolidated, EU, UK, and UN — alias- and fuzzy-aware. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias. Strict mode (default) matches exact-normalized then all-tokens-present; fuzzy mode (or auto when strict is empty) adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."',
+  description: `Screen a name (person, company, vessel, aircraft) against all loaded sanctions watchlists at once — OFAC SDN + Consolidated, EU, UK, and UN — alias- and fuzzy-aware. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias; an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists. Strict mode (default) matches exact-normalized then all-tokens-present, then runs a fuzzy pass over each selected list strict finds nothing on: a full pass when strict finds nothing on any list, otherwise one that adds only candidates covering every word of the name other than ${UNCOUNTED_WORDS}, ranked after the strict hits. Fuzzy mode runs the fuzzy pass over every selected list. It adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score; fuzzySources names the lists it searched. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z
@@ -94,7 +108,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .enum(['strict', 'fuzzy'])
       .default('strict')
       .describe(
-        'strict (default): exact-normalized then all-tokens-present. fuzzy: also scored Jaro-Winkler + phonetic. Strict auto-falls-back to fuzzy when it finds nothing.',
+        `strict (default): exact-normalized then all-tokens-present, then a fuzzy pass over each selected list strict finds nothing on — a full pass when strict finds nothing on any list, otherwise adding only candidates that cover every word of the name other than ${UNCOUNTED_WORDS}. fuzzy: a scored Jaro-Winkler + phonetic pass over every selected list.`,
       ),
     minScore: z
       .number()
@@ -102,7 +116,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .max(1)
       .optional()
       .describe(
-        "Score floor for fuzzy hits (0–1), applied uniformly to every fuzzy candidate regardless of how it was matched (Jaro-Winkler, token, or phonetic). No hit below this score is returned. Applies to fuzzy mode only; defaults to the server's configured floor.",
+        "Score floor for approximate hits (0–1), applied uniformly to every fuzzy candidate regardless of how it was matched (Jaro-Winkler, token, or phonetic); a query token counts toward queryTokenCoverage only when its match clears it too. It governs every fuzzy pass: fuzzy mode, and in strict mode the pass over the lists strict found nothing on, so raising it can remove approximate hits from a strict screen as well. Exact and strong hits are unaffected. Defaults to the server's configured floor.",
       ),
     sources: z
       .array(SOURCE_ENUM)
@@ -128,7 +142,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
     hits: z
       .array(HitSchema)
       .describe(
-        'Potential matches, ranked by match type, then score, then how much of the query each candidate explains.',
+        'Potential matches, ranked by match type, then score, then how much of the query each candidate explains. Candidates tied on all three are ordered by source list, then entry ID — not by relevance.',
       ),
     caveat: z
       .string()
@@ -140,21 +154,31 @@ export const screenNameTool = tool('sanctions_screen_name', {
     normalizedQuery: z.string().describe('The name as the server folded it for matching.'),
     matchModeUsed: z
       .string()
-      .describe('The match mode actually applied (strict may auto-upgrade to fuzzy on empty).'),
+      .describe(
+        'fuzzy when every selected list was fuzzy-searched (fuzzy mode, or a strict screen that found nothing on any list); strict otherwise, including a strict screen whose strict-empty lists were completed by a fuzzy pass.',
+      ),
+    fuzzySources: z
+      .array(SOURCE_ENUM)
+      .optional()
+      .describe(
+        `The selected lists the fuzzy pass searched, in list order; absent when no fuzzy pass ran. Beside strict hits these are the lists strict found nothing on, and only their candidates covering every word of the name other than ${UNCOUNTED_WORDS} were added.`,
+      ),
     totalCount: z.number().describe('Number of potential matches returned in this page.'),
     totalAvailable: z
       .number()
       .describe(
-        'Potential matches available across all pages, before limit and offset were applied.',
+        'Potential matches in the result set across all pages, before limit and offset were applied — every one is reachable by paging. An OFAC party both OFAC lists publish counts once.',
       ),
     totalAvailableBasis: z
       .enum(['exact', 'lower_bound'])
       .describe(
-        'How to read totalAvailable: exact = the complete strict match set; lower_bound = a bounded scan produced it (every fuzzy pass, and any strict pass that hit the raw-row scan cap), so more may exist.',
+        'How to read totalAvailable: exact = the complete strict match set, strict having found a match on every selected list; lower_bound = a fuzzy pass ran (fuzzySources is present), which scores only the candidates blocking pooled, so more matches may exist beyond the result set.',
       ),
     hasMore: z
       .boolean()
-      .describe('True when potential matches remain beyond this page — re-call with nextOffset.'),
+      .describe(
+        'True when the result set holds matches beyond this page — re-call with nextOffset. It describes pages only: false on the last page, whatever totalAvailableBasis says.',
+      ),
     nextOffset: z
       .number()
       .optional()
@@ -163,8 +187,11 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .string()
       .optional()
       .describe(
-        'Guidance when no candidate matched — how to broaden, and what an empty result does NOT mean — or when the requested offset sits past the end of the result set.',
+        'Guidance when no candidate matched — how to broaden, and what an empty result does NOT mean — when the requested offset sits past the end of the result set, or when the fuzzy pass reached its candidate bound and a more distinctive word would narrow it.',
       ),
+  },
+  enrichmentTrailer: {
+    fuzzySources: { render: (sources) => `**fuzzySources:** ${(sources ?? []).join(', ')}` },
   },
   errors: [
     {
@@ -193,22 +220,17 @@ export const screenNameTool = tool('sanctions_screen_name', {
   async handler(input, ctx) {
     const words = tokenize(fold(input.name)).length;
     if (words === 0) {
-      throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.', {
-        ...ctx.recoveryFor('name_not_searchable'),
-      });
+      throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.');
     }
     if (words > MAX_NAME_WORDS || input.name.length > MAX_NAME_CHARS) {
       throw ctx.fail(
         'name_too_long',
         `The name is past the ${MAX_NAME_WORDS}-word / ${MAX_NAME_CHARS}-character bound (words: ${words}, characters: ${input.name.length}).`,
-        { ...ctx.recoveryFor('name_too_long') },
       );
     }
     const svc = getScreeningService();
     if (!(await svc.sanctionsReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.', {
-        ...ctx.recoveryFor('mirror_not_ready'),
-      });
+      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.');
     }
 
     const sources = input.sources && input.sources.length > 0 ? input.sources : [...SOURCE_CODES];
@@ -229,6 +251,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
     ctx.enrich({
       normalizedQuery: result.normalizedQuery,
       matchModeUsed: result.modeUsed,
+      ...(result.fuzzySources ? { fuzzySources: result.fuzzySources } : {}),
       totalAvailable: result.totalAvailable,
       totalAvailableBasis: result.totalAvailableBasis,
       hasMore,
@@ -239,23 +262,31 @@ export const screenNameTool = tool('sanctions_screen_name', {
     // hide an out-of-range offset or read a paging artifact as "nothing is listed".
     // An empty result always follows a fuzzy pass (an empty strict pass falls
     // back), so the notice never suggests one.
+    const notices: string[] = [];
     if (result.totalAvailable === 0) {
-      ctx.enrich.notice(
+      notices.push(
         `No potential match for "${input.name}" across the selected lists (mode: ${result.modeUsed}). ` +
           'This is NOT a clearance — the entity may be listed under a name variant the mirror does not index, ' +
           'or under a transliteration. Try a broader name, or verify directly against the official source.',
       );
     } else if (result.hits.length === 0) {
-      ctx.enrich.notice(
-        `Offset ${input.offset} is past the end of this result set — ${result.totalAvailable} potential match(es) are available. Re-request from offset 0 and page forward with nextOffset.`,
+      notices.push(
+        `Offset ${input.offset} is past the end of this result set, which holds ${result.totalAvailable} potential match(es)${result.totalAvailableBasis === 'lower_bound' ? ' — a lower bound: more may exist beyond it' : ''}. Re-request from offset 0 and page forward with nextOffset.`,
       );
     }
+    if (result.poolBounded) {
+      notices.push(
+        'The fuzzy pass reached its candidate bound, so not every name sharing a common word with the query was scored, and more matches may exist. Narrow with a more distinctive word from the name.',
+      );
+    }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       hits: result.hits.map((h) => ({
         source: h.source,
         sourceLabel: SOURCE_LABELS[h.source],
         sourceEntryId: h.sourceEntryId,
+        sources: h.sources,
         ...(h.referenceNumber ? { referenceNumber: h.referenceNumber } : {}),
         entityType: h.entityType,
         primaryName: h.primaryName,
@@ -283,13 +314,18 @@ export const screenNameTool = tool('sanctions_screen_name', {
         const scoreStr = h.score !== undefined ? ` · score ${h.score.toFixed(3)}` : '';
         const cov = h.queryTokenCoverage;
         const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
+        const also = alsoListedText(h.source, h.sources);
         lines.push(`### ${h.primaryName} — ${h.matchType}${scoreStr}${coverStr}`);
         lines.push(
-          `**List:** ${h.sourceLabel} (\`${h.source}\`) | **Entry ID:** ${h.sourceEntryId}${h.referenceNumber ? ` | **Reference:** ${h.referenceNumber}` : ''} | **Type:** ${h.entityType}`,
+          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${h.sourceEntryId}${h.referenceNumber ? ` | **Reference:** ${h.referenceNumber}` : ''} | **Type:** ${h.entityType}`,
         );
         lines.push(`**Matched on:** "${h.matchedName}" (${h.matchedNameType})`);
         if (h.program) lines.push(`**Program:** ${h.program}`);
-        if (h.designationDate) lines.push(`**Designated:** ${h.designationDate}`);
+        if (h.designationDate) {
+          lines.push(
+            `**Designated:** ${h.designationDate}${also ? ` (the \`${h.source}\` record)` : ''}`,
+          );
+        }
         lines.push('');
       }
     }
