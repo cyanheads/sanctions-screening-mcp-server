@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-03 · ⚠️ Breaking
+
+sanctions_screen_name pages every match it counts, pools fuzzy candidates per list, and returns an OFAC party both OFAC lists publish as one hit; sanctions_get_entity and trace nodes also screen other names and look up the LEI and registration number. Existing mirrors need mirror:refresh for the data fixes.
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-25 · ⚠️ Breaking
 
 GLEIF refresh applies the delta window its checkpoint calls for, deletions included, and now runs on the HTTP cron; sanctions_resolve_entity searches every name GLEIF publishes; ownership traces report each node's parent status from GLEIF reporting exceptions. Existing mirrors need one mirror:init.
