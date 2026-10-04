@@ -313,9 +313,9 @@ export interface ScreeningHit {
   source: SourceCode;
   sourceEntryId: string;
   /**
-   * Every selected list whose record of this entry the screen reached, in
-   * {@link SOURCE_CODES} order: `[source]`, or `ofac_sdn` and `ofac_consolidated`
-   * when one OFAC entry's two records are grouped into this hit.
+   * Every selected list the hit's party is on, in {@link SOURCE_CODES} order:
+   * `[source]`, or `ofac_sdn` and `ofac_consolidated` for an OFAC entry both
+   * OFAC lists store, whether the screen reached one of its records or both.
    */
   sources: SourceCode[];
 }

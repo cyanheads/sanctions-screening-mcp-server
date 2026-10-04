@@ -58,7 +58,7 @@ export interface CrossReferenceHit {
    */
   source: SourceCode;
   sourceEntryId: string;
-  /** Every list whose record of this entry an input reached — see `ScreeningHit.sources`. */
+  /** Every list the hit's party is on — see `ScreeningHit.sources`. */
   sources: SourceCode[];
 }
 

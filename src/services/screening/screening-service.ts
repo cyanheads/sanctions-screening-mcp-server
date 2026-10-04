@@ -251,7 +251,7 @@ export interface IdentifierHit {
   /** The list whose record every other field describes. */
   source: SourceCode;
   sourceEntryId: string;
-  /** Every selected list whose record matched — see {@link ScreeningHit.sources}. */
+  /** Every selected list the hit's party is on — see {@link ScreeningHit.sources}. */
   sources: SourceCode[];
 }
 
@@ -1069,10 +1069,7 @@ export class ScreeningService {
     // The pass pools each list on its own (see runFuzzy), so a list's candidates
     // never depend on which other lists were selected. The internal
     // cross-reference screens (autoFallback false) search none.
-    const selected =
-      opts.sources.length > 0
-        ? SOURCE_CODES.filter((code) => opts.sources.includes(code))
-        : [...SOURCE_CODES];
+    const selected = selectedSources(opts.sources);
     const strictLists = new Set(strictHits.map((hit) => hit.source));
     const fuzzySources =
       queryTokens.length === 0
@@ -1103,7 +1100,8 @@ export class ScreeningService {
 
     // Strict hits (deterministic, unscored) ahead of fuzzy, one per designation,
     // and one per OFAC entry. This is the whole ordered match set: it is counted
-    // and paged as one, so every hit it holds is reachable by offset.
+    // and paged as one, so every hit it holds is reachable by offset. Counting and
+    // paging never read `sources`, so only the returned page's are completed.
     const ranked = groupOfacCopies(fuzzy ? this.mergeHits(strictHits, fuzzy.hits) : strictHits);
     ctx.log.debug(fuzzy ? 'Fuzzy screening complete' : 'Strict screening complete', {
       normalizedQuery,
@@ -1113,7 +1111,7 @@ export class ScreeningService {
         : {}),
     });
     return {
-      hits: ranked.slice(offset, offset + opts.limit),
+      hits: completeOfacSources(handle, ranked.slice(offset, offset + opts.limit), selected),
       modeUsed: fuzzy && !completion ? 'fuzzy' : 'strict',
       normalizedQuery,
       fuzzyFallbackTriggered: fuzzy !== undefined && opts.matchMode === 'strict' && !completion,
@@ -1495,8 +1493,10 @@ export class ScreeningService {
    * normalization — per category, as {@link identifierProbes} keys it — one hit
    * per designation carrying every stored identifier that matched, ordered by
    * source then entry ID, with an OFAC entry's SDN and Consolidated records one
-   * hit ({@link groupOfacCopies}). Joined to `designation`, so a designation a sync removed
-   * never surfaces, even before the post-sync rebuild drops its identifier rows.
+   * hit ({@link groupOfacCopies}) naming every selected list that publishes the
+   * entry, whichever records matched ({@link completeOfacSources}). Joined to
+   * `designation`, so a designation a sync removed never surfaces, even before
+   * the post-sync rebuild drops its identifier rows.
    */
   async screenIdentifier(opts: ScreenIdentifierOptions): Promise<IdentifierHit[]> {
     const probes = identifierProbes(opts.value, opts.type);
@@ -1535,7 +1535,11 @@ export class ScreeningService {
         sources: [row.source as SourceCode],
       });
     }
-    return groupOfacCopies([...byDesignation.values()].sort(compareDesignationIdentity));
+    return completeOfacSources(
+      handle,
+      groupOfacCopies([...byDesignation.values()].sort(compareDesignationIdentity)),
+      selectedSources(opts.sources),
+    );
   }
 
   // ─── LEI resolution ──────────────────────────────────────────────────────
@@ -2488,6 +2492,60 @@ export function groupOfacCopies<
     grouped[group.at] = group.kept;
   }
   return grouped;
+}
+
+/** The other OFAC list, for an OFAC list; undefined for any other list. */
+function otherOfacList(source: SourceCode): SourceCode | undefined {
+  if (source === 'ofac_sdn') return 'ofac_consolidated';
+  if (source === 'ofac_consolidated') return 'ofac_sdn';
+  return undefined;
+}
+
+/**
+ * Add the other OFAC list to each hit's `sources` when that list is selected and
+ * stores the hit's entry, so `sources` names every selected list the party is
+ * on. {@link groupOfacCopies} folds only the records a pass reached, and a pass
+ * can reach one record of a party and not the other: the strict completion
+ * fuzzy-searches only the lists strict found nothing on, a list's pool budget
+ * can keep one record and leave the other, and the two files can publish
+ * different names or identifiers for the party. One query covers every hit;
+ * `source` and every other field stay the reached record's.
+ */
+function completeOfacSources<T extends Pick<ScreeningHit, 'source' | 'sourceEntryId' | 'sources'>>(
+  handle: SqliteHandle,
+  hits: T[],
+  selected: readonly SourceCode[],
+): T[] {
+  const missing = new Map<T, SourceCode>();
+  for (const hit of hits) {
+    const other = otherOfacList(hit.source);
+    if (other && selected.includes(other) && !hit.sources.includes(other)) missing.set(hit, other);
+  }
+  if (missing.size === 0) return hits;
+  const stored = new Set(
+    handle
+      .prepare<{ id: string }>(
+        `SELECT id FROM designation WHERE id IN (SELECT value FROM json_each(?))`,
+      )
+      .all(JSON.stringify([...missing].map(([hit, other]) => `${other}:${hit.sourceEntryId}`)))
+      .map((row) => row.id),
+  );
+  return hits.map((hit) => {
+    const other = missing.get(hit);
+    return other && stored.has(`${other}:${hit.sourceEntryId}`)
+      ? {
+          ...hit,
+          sources: SOURCE_CODES.filter((code) => code === other || hit.sources.includes(code)),
+        }
+      : hit;
+  });
+}
+
+/** The selected lists in {@link SOURCE_CODES} order, each once; every list when none is named. */
+function selectedSources(sources: readonly SourceCode[]): SourceCode[] {
+  return sources.length > 0
+    ? SOURCE_CODES.filter((code) => sources.includes(code))
+    : [...SOURCE_CODES];
 }
 
 /**

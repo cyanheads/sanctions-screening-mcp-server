@@ -30,7 +30,7 @@ const UNCOUNTED_WORDS =
 const HitSchema = z
   .object({
     source: SOURCE_ENUM.describe(
-      "The watchlist whose record this hit's fields come from — its provenance. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched better; sources names every list.",
+      "The watchlist whose record this hit's fields come from — its provenance. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched alone or better; sources names every list.",
     ),
     sourceLabel: z.string().describe('Human-readable name of the source list.'),
     sourceEntryId: z

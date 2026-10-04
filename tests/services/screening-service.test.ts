@@ -1955,6 +1955,39 @@ describe('OFAC SDN + Consolidated grouping (issue #61)', () => {
       ['ofac_consolidated', ['ofac_consolidated']],
     ]);
   });
+
+  it('names both OFAC lists on a hit whose screen reached one record of the party', async () => {
+    await svc.ingestDesignations([
+      // A strict hit on ofac_sdn, so the completion searches ofac_consolidated and not ofac_sdn.
+      listed('ofac_sdn', 'GPN-AERO', 'Gazpromneft Aero Joint Stock Company', 'organization'),
+      ...ofacPair('GPN-1', 'Public Joint Stock Company Gazprom Neft'),
+    ]);
+    const res = await screen('Gazpromneft Joint Stock Company');
+    expect(res.hits.map((hit) => [hit.designationId, hit.matchType, hit.sources])).toEqual([
+      ['ofac_sdn:GPN-AERO', 'strong', ['ofac_sdn']],
+      ['ofac_consolidated:GPN-1', 'approximate', ['ofac_sdn', 'ofac_consolidated']],
+    ]);
+    const unselected = await screen('Gazpromneft Joint Stock Company', {
+      sources: ['ofac_consolidated', 'eu'],
+    });
+    expect(unselected.hits.map((hit) => [hit.designationId, hit.sources])).toEqual([
+      ['ofac_consolidated:GPN-1', ['ofac_consolidated']],
+    ]);
+  });
+
+  it('names both OFAC lists on an identifier one record of the party publishes', async () => {
+    await svc.ingestDesignations(
+      ofacPair('GRP-21', 'Diverging Identifier Holding', { sdn: withIdentifier('7706999991') }),
+    );
+    const lookUp = (sources: SourceCode[]) =>
+      svc.screenIdentifier({ value: '7706999991', type: 'any', sources });
+    expect((await lookUp([...SOURCE_CODES])).map((hit) => [hit.source, hit.sources])).toEqual([
+      ['ofac_sdn', ['ofac_sdn', 'ofac_consolidated']],
+    ]);
+    expect((await lookUp(['ofac_sdn', 'eu'])).map((hit) => [hit.source, hit.sources])).toEqual([
+      ['ofac_sdn', ['ofac_sdn']],
+    ]);
+  });
 });
 
 describe('per-list strict→fuzzy completion (issue #59)', () => {

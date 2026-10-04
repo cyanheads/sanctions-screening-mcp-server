@@ -417,7 +417,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
                     source: z
                       .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])
                       .describe(
-                        'Watchlist whose record this hit is attributed to: primaryName comes from it. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched better, and matchedName, matchedIdentifiers, and matchedOn cover what either record matched; sources names every list.',
+                        'Watchlist whose record this hit is attributed to: primaryName comes from it. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched alone or better, and matchedName, matchedIdentifiers, and matchedOn cover what either record matched; sources names every list.',
                       ),
                     sourceLabel: z.string().describe('Human-readable source list name.'),
                     sourceEntryId: z
