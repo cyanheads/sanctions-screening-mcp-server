@@ -35,9 +35,10 @@ export interface SourceDownloadOptions {
  * Fetch a source download whose body the caller streams. The response headers
  * must arrive within the headers bound, or the download fails as a `Timeout`
  * naming the source. Once they arrive the bound is spent: the body drains until
- * it ends or `signal` aborts it, and the read then rejects with the framework's
- * `RequestCancelled`. An abort of `signal` during the headers wait is likewise a
- * cancellation, and a non-2xx answer keeps the framework's status mapping.
+ * it ends or `signal` aborts it. An abort of `signal`, in the headers wait or the
+ * body read, fails as the framework classifies it: `Timeout` when its reason is a
+ * `TimeoutError` (a run's time bound), `RequestCancelled` otherwise. A non-2xx
+ * answer keeps the framework's status mapping.
  */
 export async function fetchSourceDownload(
   url: string,
@@ -52,8 +53,8 @@ export async function fetchSourceDownload(
       signal: AbortSignal.any([signal, headers.signal]),
     });
   } catch (err) {
-    // The framework reports any abort of the signal it was given as a
-    // cancellation; the headers timer's abort is this bound expiring instead.
+    // The headers timer aborts with the default reason, which the framework
+    // reports as a cancellation; its abort is this bound expiring instead.
     if (headers.signal.aborted && !signal.aborted) {
       throw timeout(
         `${source} sent no response headers within ${headersTimeoutMs / 1000} s.`,

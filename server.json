@@ -18,18 +18,8 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/sanctions-screening-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.4.0",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:stdio"
-        }
-      ],
       "environmentVariables": [
         {
           "name": "MCP_LOG_LEVEL",
@@ -51,13 +41,6 @@
           "format": "string",
           "isRequired": false,
           "default": "0.85"
-        },
-        {
-          "name": "SANCTIONS_FUZZY_MAX_RESULTS",
-          "description": "Hard cap on fuzzy candidates scored per query, to bound work on short queries.",
-          "format": "string",
-          "isRequired": false,
-          "default": "50"
         }
       ],
       "transport": {
@@ -68,19 +51,15 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/sanctions-screening-mcp-server",
-      "runtimeHint": "node",
+      "runtimeHint": "npx",
       "version": "0.4.0",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:http"
-        }
-      ],
       "environmentVariables": [
+        {
+          "name": "MCP_TRANSPORT_TYPE",
+          "description": "Selects the HTTP transport.",
+          "format": "string",
+          "value": "http"
+        },
         {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",
@@ -142,13 +121,6 @@
           "format": "string",
           "isRequired": false,
           "default": "0.85"
-        },
-        {
-          "name": "SANCTIONS_FUZZY_MAX_RESULTS",
-          "description": "Hard cap on fuzzy candidates scored per query, to bound work on short queries.",
-          "format": "string",
-          "isRequired": false,
-          "default": "50"
         }
       ],
       "transport": {
