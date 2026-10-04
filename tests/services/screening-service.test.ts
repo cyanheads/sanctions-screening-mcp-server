@@ -495,6 +495,48 @@ describe('screenName — filters', () => {
   });
 });
 
+describe('source filter — a repeated list counts once (issue #73)', () => {
+  /** As many entries as there are lists, every one the same list. */
+  const repeated = (source: SourceCode): SourceCode[] => SOURCE_CODES.map(() => source);
+
+  beforeEach(async () => {
+    await svc.ingestDesignations(
+      (['eu', 'uk'] as const).map((source) => ({
+        ...listed(source, 'REP-73', 'Repeated Filter Holding', 'organization'),
+        payload: {
+          aliases: [],
+          identifiers: [{ type: 'Tax ID No.', value: '7706000073', country: 'Russia' }],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+        },
+      })),
+    );
+  });
+
+  it.each(['strict', 'fuzzy'] as const)(
+    'screens a name on the named list alone: %s',
+    async (matchMode) => {
+      const res = await svc.screenName(
+        { ...screenDefaults, matchMode, query: 'Repeated Filter Holding', sources: repeated('eu') },
+        ctx,
+      );
+      expect(res.hits.map((hit) => hit.designationId)).toEqual(['eu:REP-73']);
+      expect(res.totalAvailable).toBe(1);
+      if (matchMode === 'fuzzy') expect(res.fuzzySources).toEqual(['eu']);
+    },
+  );
+
+  it('looks an identifier up on the named list alone', async () => {
+    const hits = await svc.screenIdentifier({
+      value: '7706000073',
+      type: 'any',
+      sources: repeated('eu'),
+    });
+    expect(hits.map((hit) => [hit.source, hit.sources])).toEqual([['eu', ['eu']]]);
+  });
+});
+
 describe('screenName — offset pagination and overflow disclosure (issue #9)', () => {
   /** Six designations sharing a name stem, so one strict screen matches all six. */
   const pageDesignations = Array.from({ length: 6 }, (_, index) => ({

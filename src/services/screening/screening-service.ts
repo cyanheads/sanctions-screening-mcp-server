@@ -1051,7 +1051,8 @@ export class ScreeningService {
     const handle = await this.designationHandle();
     const offset = opts.offset ?? 0;
 
-    const sourceFilter = this.sourceFilterClause(opts.sources);
+    const selected = selectedSources(opts.sources);
+    const sourceFilter = this.sourceFilterClause(selected);
     // entityType is enum-constrained at the tool boundary; escape at the SQL sink
     // anyway so the service stays injection-safe for any future caller that
     // reaches it without re-validating (matches the jurisdiction handling below).
@@ -1069,7 +1070,6 @@ export class ScreeningService {
     // The pass pools each list on its own (see runFuzzy), so a list's candidates
     // never depend on which other lists were selected. The internal
     // cross-reference screens (autoFallback false) search none.
-    const selected = selectedSources(opts.sources);
     const strictLists = new Set(strictHits.map((hit) => hit.source));
     const fuzzySources =
       queryTokens.length === 0
@@ -1125,11 +1125,16 @@ export class ScreeningService {
     };
   }
 
-  private sourceFilterClause(sources: SourceCode[]): string {
-    if (sources.length === 0 || sources.length === SOURCE_CODES.length) return '';
+  /**
+   * The SQL predicate restricting a read to `lists`, or none when `lists` is every
+   * list. `lists` holds each list once ({@link selectedSources}): a repeated list
+   * would otherwise count toward "every list".
+   */
+  private sourceFilterClause(lists: readonly SourceCode[]): string {
+    if (lists.length === SOURCE_CODES.length) return '';
     // Source codes are enum-constrained upstream; escape at the sink regardless
     // so the IN-list stays injection-safe independent of the caller.
-    const list = sources.map((s) => `'${this.escapeLiteral(s)}'`).join(', ');
+    const list = lists.map((s) => `'${this.escapeLiteral(s)}'`).join(', ');
     return ` AND d.source IN (${list})`;
   }
 
@@ -1502,13 +1507,14 @@ export class ScreeningService {
     const probes = identifierProbes(opts.value, opts.type);
     if (probes.length === 0) return [];
     const handle = await this.designationHandle();
+    const selected = selectedSources(opts.sources);
     const rows = handle
       .prepare<IdentifierJoinRow>(
         `SELECT i.designation_id, i.type, i.value, i.country,
                 d.source, d.source_entry_id, d.entity_type, d.primary_name, d.program
          FROM ${IDENTIFIER_TABLE} i
          JOIN designation d ON d.id = i.designation_id
-         WHERE (${probes.map(() => '(i.key = ? AND i.category = ?)').join(' OR ')})${this.sourceFilterClause(opts.sources)}
+         WHERE (${probes.map(() => '(i.key = ? AND i.category = ?)').join(' OR ')})${this.sourceFilterClause(selected)}
          ORDER BY i.rowid`,
       )
       .all(...probes.flatMap((probe) => [probe.key, probe.category]));
@@ -1538,7 +1544,7 @@ export class ScreeningService {
     return completeOfacSources(
       handle,
       groupOfacCopies([...byDesignation.values()].sort(compareDesignationIdentity)),
-      selectedSources(opts.sources),
+      selected,
     );
   }
 
