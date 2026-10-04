@@ -2,9 +2,9 @@
 
 **Server:** sanctions-screening-mcp-server
 **Version:** 0.4.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.7`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.11`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.0.0 (via the framework)
+**MCP SDK:** `@modelcontextprotocol/server` ^2.2.0 (via the framework)
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -19,7 +19,7 @@ Entity screening and resolution over the world's open sanctions data plus the gl
 
 **The data path is a local mirror, not a live API.** All five sources are bulk, keyless, and clear for redistribution. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys) and a per-identifier `designation_identifier` index, and a GLEIF `lei_entity` mirror with a per-name `lei_name` index (legal, other, and transliterated names, typed) and a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
 
-**Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in or auto-on-empty. Surface only real signal: `matchType` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains. Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
+**Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in, or runs on its own over each selected list a strict screen found nothing on (all of them when strict found nothing anywhere). Surface only real signal: `matchType` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains. Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
 
 ---
 
@@ -39,7 +39,7 @@ Entity screening and resolution over the world's open sanctions data plus the gl
 
 ### Tool
 
-Real example: `sanctions_screen_name` (trimmed). Note the typed error contract (`ctx.fail` + `ctx.recoveryFor`), the load-bearing caveat in the output, and the `enrichment` block for non-result metadata (normalized query, mode used, empty-result notice).
+Real example: `sanctions_screen_name` (trimmed). Note the typed error contract (`errors[]` + `ctx.fail`), the load-bearing caveat in the output, and the `enrichment` block for non-result metadata (normalized query, mode used, empty-result notice).
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
@@ -64,7 +64,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
   }),
   enrichment: {
     normalizedQuery: z.string().describe('The name as the server folded it for matching.'),
-    matchModeUsed: z.string().describe('The match mode actually applied (strict may auto-upgrade to fuzzy on empty).'),
+    matchModeUsed: z.string().describe('fuzzy when every selected list was fuzzy-searched; strict otherwise, including a strict screen whose strict-empty lists were completed.'),
     totalCount: z.number().describe('Number of potential matches returned.'),
     notice: z.string().optional().describe('Guidance when no candidate matched.'),
   },
@@ -77,7 +77,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
   async handler(input, ctx) {
     const svc = getScreeningService();
     if (!(await svc.sanctionsReady())) {
-      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.', { ...ctx.recoveryFor('mirror_not_ready') });
+      throw ctx.fail('mirror_not_ready', 'The local sanctions mirror is not yet populated.');
     }
     const sources = input.sources?.length ? input.sources : [...SOURCE_CODES];
     const result = await svc.screenName({ query: input.name, matchMode: input.matchMode, sources, limit: input.limit }, ctx);
@@ -116,7 +116,7 @@ export const entityResource = resource('sanctions://entity/{lei}', {
   ],
   async handler(params, ctx) {
     const entity = await getScreeningService().getLeiEntity(params.lei);
-    if (!entity) throw ctx.fail('lei_not_found', `No GLEIF entity with LEI "${params.lei}".`, { ...ctx.recoveryFor('lei_not_found') });
+    if (!entity) throw ctx.fail('lei_not_found', `No GLEIF entity with LEI "${params.lei}".`);
     return entity;
   },
 });
@@ -147,7 +147,7 @@ export const vetCounterpartyPrompt = prompt('sanctions_vet_counterparty', {
 ```ts
 // src/config/server-config.ts — lazy-parsed, separate from framework config.
 // All sources are keyless; there are no secret values here. Every field is
-// optional with a default — the mirror path, fuzzy-match tuning, the refresh
+// optional with a default — the mirror path, the fuzzy score floor, the refresh
 // cron, and per-source URL overrides.
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
@@ -156,7 +156,6 @@ const ServerConfigSchema = z.object({
   mirrorPath: z.string().default('./data/sanctions.db').describe('Filesystem path for the SQLite mirror.'),
   refreshCron: z.string().default('0 4 * * *').describe('Cron for the scheduled refresh (HTTP only).'),
   fuzzyMinScore: z.coerce.number().min(0).max(1).default(0.85).describe('Default Jaro-Winkler floor for fuzzy matches.'),
-  fuzzyMaxResults: z.coerce.number().int().min(1).default(50).describe('Hard cap on fuzzy candidates scored per query.'),
   // … per-source URL overrides (ofacSdnUrl, euFsfUrl, ukSanctionsUrl, unScUrl, gleifGoldenCopyBaseUrl)
 });
 
@@ -166,7 +165,6 @@ export function getServerConfig() {
     mirrorPath: 'SANCTIONS_MIRROR_PATH',
     refreshCron: 'SANCTIONS_REFRESH_CRON',
     fuzzyMinScore: 'SANCTIONS_FUZZY_MIN_SCORE',
-    fuzzyMaxResults: 'SANCTIONS_FUZZY_MAX_RESULTS',
     // … OFAC_SDN_URL, EU_FSF_URL, UK_SANCTIONS_URL, UN_SC_URL, GLEIF_GOLDEN_COPY_BASE_URL
   });
   return _config;
@@ -221,12 +219,13 @@ Handlers receive a unified `ctx` object. Key properties:
 | Property | Description |
 |:---------|:------------|
 | `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
-| `ctx.fail` / `ctx.recoveryFor` | Typed error contract — `ctx.fail(reason, msg, …)` against the tool's `errors[]` union; `ctx.recoveryFor(reason)` pulls the declared recovery metadata. Used by every read tool to throw `mirror_not_ready` / `*_not_found`. |
+| `ctx.fail` | Typed error contract — `ctx.fail(reason, msg, …)` against the definition's `errors[]` union; the framework puts the declared `recovery` on the wire. Used by every read tool to throw `mirror_not_ready` / `*_not_found`. |
 | `ctx.enrich` | Attach non-result metadata to the response — `ctx.enrich({ … })`, `ctx.enrich.total(n)`, `ctx.enrich.notice(text)`. Used by `screen_name` / `resolve_entity` for the normalized query, the mode actually applied, and the empty-result guidance. |
-| `ctx.requestInput` / `ctx.inputs` | Suspend and ask the caller for more input — `return ctx.requestInput(...)`, then read `ctx.inputs.accepted(key, schema)` on re-entry. Unused here; every read is answered from the mirror. |
+| `ctx.requestInput` / `ctx.inputs` | Suspend and ask the caller for more input — `return ctx.requestInput(...)`, then read `ctx.inputs.accepted(key, schema)` on re-entry; `ctx.inputs` holds only responses the client's declared capabilities cover. Unused here; every read is answered from the mirror. |
+| `ctx.clientCapabilities` | What the client declared for this request, `undefined` when no view exists. Decides whether to ask for optional context; never a reason to skip a consent prompt. Unused here. |
 | `ctx.content` | Non-text content blocks — `.image(data, mimeType)`, `.audio(data, mimeType)`. Prepended to `content[]` after `format()`; never enters `structuredContent`. |
 | `ctx.signal` | `AbortSignal` for cancellation (propagated into the mirror sync on the refresh path). |
-| `ctx.requestId` | Unique request ID. |
+| `ctx.requestId` | Request ID — the one every log record of the call carries and its error envelope returns as `data.requestId`. |
 | `ctx.tenantId` | Tenant ID from JWT; `'default'` for stdio or HTTP with auth off. |
 
 This server's persistence is the local SQLite mirror, owned by the screening service and reached via `getScreeningService()` — not `ctx.state`. The data is a shared global corpus, not tenant-scoped KV, so the service-accessor pattern replaces `ctx.state` here.
@@ -237,7 +236,7 @@ This server's persistence is the local SQLite mirror, owned by the screening ser
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. Pass `ctx.recoveryFor('reason')` as the throw's data to put it on the wire (`data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim); override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Forwarding it is lint-enforced per throw site (`error-contract-recovery-unforwarded`). Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 ```ts
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -249,7 +248,7 @@ errors: [
 ],
 async handler(input, ctx) {
   const item = await db.find(input.id);
-  if (!item) throw ctx.fail('no_match', `No item ${input.id}`, ctx.recoveryFor('no_match'));
+  if (!item) throw ctx.fail('no_match', `No item ${input.id}`);
   return item;
 }
 ```
@@ -287,12 +286,16 @@ src/
   services/
     screening/
       screening-service.ts              # Owns the local mirrors + matching engine (init/accessor pattern)
-      schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_name/lei_relationship schema + MirrorService defs + the v2 migration
+      schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_name/lei_relationship schema + MirrorService defs + each spec's v2 migration
       sanctions-ingest.ts               # OFAC/EU/UK/UN streaming ingesters (record-at-a-time XML → normalized designations)
       gleif-ingest.ts                   # GLEIF files — publication index, header-first streaming of L1/L2/reporting-exception files, deletion markers
       gleif-sync.ts                     # GLEIF lifecycles — golden-copy load + checkpointed delta refresh (window per dataset, one commit)
       ingest-validation.ts              # Shared drop predicate + per-source rejection tally — no source identity or no usable name means no row
-      text-matching.ts                  # Fold/tokenize, Jaro-Winkler, Double-Metaphone
+      text-matching.ts                  # Fold/tokenize, Jaro-Winkler, Double-Metaphone, the fuzzy-admission stoplist (FUZZY_STOPLIST)
+      candidate-pool.ts                 # Fuzzy blocking pool — whole blocks, smallest first, under one budget, then pair lookups
+      cross-reference.ts                # get_entity / trace_ownership cross-reference — strict name screens + LEI and registration-number lookups, merged per designation
+      country-codes.ts                  # Published country names → ISO 3166-1 alpha-2 (the registration-number country gate)
+      lei-checksum.ts                   # ISO 17442 check digits — invalid_lei_checksum on a mirror miss
       identifier-matching.ts            # Identifier label → category table + per-category exact-match keys (IMO, BIC8, wallet case by shape)
       types.ts                          # Source codes, labels, domain types
       fixtures.ts                       # Synthetic fixture for mirror:seed / tests
