@@ -151,8 +151,10 @@ type Side = keyof typeof SIDES;
  * bounded by `depth`. A flagged leaf is never walked, so it is probed the same
  * way on the side that reached it: a leaf whose own direct parent (or child) the
  * graph does not show leaves it a partial view at any depth. A probed row the
- * graph already shows (the cycle case) is not truncation, and neither is an
- * ultimate row.
+ * graph already shows (the cycle case) is not truncation. An ultimate row is
+ * truncation only when it leads to an entity the graph does not return, which
+ * one more hop would add as a flagged leaf; one leading to a returned node is a
+ * shortcut to an entity already shown.
  */
 async function traverse(
   svc: ScreeningService,
@@ -238,8 +240,13 @@ async function traverse(
 
   let truncated = false;
   for (const { lei, side } of probes) {
+    const { far } = SIDES[side];
     const rels = await readSide(lei, side);
-    if (rels.some((rel) => rel.relationshipType !== ULTIMATE_TYPE && !shown(rel))) {
+    if (
+      rels.some(
+        (rel) => !shown(rel) && (rel.relationshipType !== ULTIMATE_TYPE || !nodes.has(far(rel))),
+      )
+    ) {
       truncated = true;
       break;
     }
@@ -492,7 +499,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     truncated: z
       .boolean()
       .describe(
-        'True when the loaded relationships hold ownership links on the walked side that this graph does not show: past the requested depth (re-run with a higher depth to see them), or the parents (or, on the children side, children) of a node flagged reachedVia: ultimate, which is never walked. An ultimate-parent edge never counts. False means neither: every chain the walk followed ends within the depth. Siblings and co-parents are never walked and never count.',
+        'True when the loaded relationships hold ownership links on the walked side that this graph does not show: past the requested depth (re-run with a higher depth to see them), or the parents (or, on the children side, children) of a node flagged reachedVia: ultimate, which is never walked. An ultimate-parent edge counts only when it leads to an entity this graph does not return. False means neither: every chain the walk followed ends within the depth. Siblings and co-parents are never walked and never count.',
       ),
     reportingExceptionsLoaded: z
       .boolean()

@@ -621,6 +621,51 @@ describe('sanctions_trace_ownership walk sides and ultimate edges (issues #38, #
     }
   });
 
+  it("reports a boundary node's ultimate row to an entity the graph does not return as truncation", async () => {
+    // The parent's direct chain is broken: only its ultimate row links it on.
+    const START = lei('EDGEROOT');
+    const MIDDLE = lei('EDGEPARENT');
+    const TOP = lei('EDGEULTIMATE');
+    await seed({ [START]: 'Edge Root', [MIDDLE]: 'Edge Parent', [TOP]: 'Edge Ultimate' }, [
+      relationship(START, MIDDLE),
+      relationship(MIDDLE, TOP, ULT),
+    ]);
+
+    const one = await trace({ lei: START, direction: 'parents', depth: 1 });
+    expect(placement(one)).toEqual({ [START]: 'root 0', [MIDDLE]: 'parent 1' });
+    expect(one).toMatchObject({ complete: false, truncated: true, missingEntityLeis: [] });
+
+    // One hop more returns that entity, as a flagged leaf.
+    const two = await trace({ lei: START, direction: 'parents', depth: 2 });
+    expect(placement(two)).toEqual({
+      [START]: 'root 0',
+      [MIDDLE]: 'parent 1',
+      [TOP]: 'parent 2 ultimate',
+    });
+    expectEdgesJoinNodes(two);
+    expect(two).toMatchObject({ complete: true, truncated: false });
+  });
+
+  it("reads a boundary node's ultimate row to a returned node as no truncation", async () => {
+    // The root's ultimate parent is shown already, so the parent's row to it adds no entity.
+    const START = lei('SHORTROOT');
+    const MIDDLE = lei('SHORTPARENT');
+    const TOP = lei('SHORTULTIMATE');
+    await seed({ [START]: 'Short Root', [MIDDLE]: 'Short Parent', [TOP]: 'Short Ultimate' }, [
+      relationship(START, MIDDLE),
+      relationship(START, TOP, ULT),
+      relationship(MIDDLE, TOP, ULT),
+    ]);
+
+    const one = await trace({ lei: START, direction: 'parents', depth: 1 });
+    expect(placement(one)).toEqual({
+      [START]: 'root 0',
+      [MIDDLE]: 'parent 1',
+      [TOP]: 'parent 1 ultimate',
+    });
+    expect(one).toMatchObject({ complete: true, truncated: false });
+  });
+
   it("reports a flagged parent's unwalked direct parent as truncation, at every depth", async () => {
     // JLT-shaped: the root's direct chain is broken (no direct-parent row), and
     // its ultimate parent has a direct parent of its own the walk never takes.
