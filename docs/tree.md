@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-10-04 01:17:37
+Generated on: 2026-10-20 07:29:43
 
 ```text
 sanctions-screening-mcp-server/
@@ -180,6 +180,8 @@ sanctions-screening-mcp-server/
 │   │       ├── lei-checksum.ts
 │   │       ├── sanctions-ingest.ts
 │   │       ├── sanctions-refresh.ts
+│   │       ├── scheduled-refresh-job.ts
+│   │       ├── scheduled-refresh-process.ts
 │   │       ├── schema.ts
 │   │       ├── screening-service.ts
 │   │       ├── source-fetch.ts
@@ -193,10 +195,13 @@ sanctions-screening-mcp-server/
 │   │   ├── definition-surface.fuzz.test.ts
 │   │   └── ingest-and-matcher.fuzz.test.ts
 │   ├── integration/
+│   │   ├── fixtures/
+│   │   │   └── refresh-child.mjs
 │   │   ├── gleif-refresh-script.test.ts
 │   │   ├── matching-correctness.test.ts
 │   │   ├── mirror-upgrade.test.ts
 │   │   ├── ownership-correctness.test.ts
+│   │   ├── refresh-process.test.ts
 │   │   ├── refresh-pruning.test.ts
 │   │   ├── scheduled-refresh.test.ts
 │   │   ├── sdk-v2-contracts.test.ts
