@@ -1,7 +1,7 @@
 /**
  * @fileoverview The mirror refresh — the sanctions lists, then the GLEIF delta
- * windows — that the HTTP server runs on a schedule and `mirror:refresh` runs by
- * hand, and the long-run time bound both share with `mirror:init`. Every run goes
+ * windows — run in a scheduled HTTP child or by hand via `mirror:refresh` —
+ * and the long-run time bound both share with `mirror:init`. Every run goes
  * through {@link refreshMirrors} under a {@link longRunSignal}, so a run that
  * stalls ends as a failure instead of holding the job open.
  * @module services/screening/sanctions-refresh
@@ -16,10 +16,8 @@ import {
 } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { type GleifRefreshOutcome, refreshGleif } from '@/services/screening/gleif-sync.js';
-import {
-  getScreeningService,
-  type ScreeningService,
-} from '@/services/screening/screening-service.js';
+import { scheduledRefreshProcess } from '@/services/screening/scheduled-refresh-process.js';
+import type { ScreeningService } from '@/services/screening/screening-service.js';
 
 /** The scheduler job id of the HTTP server's mirror refresh. */
 export const SANCTIONS_REFRESH_JOB = 'sanctions-mirror-refresh';
@@ -55,7 +53,7 @@ export interface RefreshMirrorsOptions {
   context: RequestContext;
   /**
    * Load the reporting-exceptions golden copy when no load of it is recorded.
-   * `mirror:refresh` does; the schedule never loads a golden copy in-process.
+   * `mirror:refresh` does; the schedule never loads a golden copy.
    */
   loadMissingExceptions: boolean;
 }
@@ -115,8 +113,8 @@ export async function refreshMirrors(
 
 /**
  * Register and start the mirror refresh on `SANCTIONS_REFRESH_CRON`. Each run is
- * one {@link refreshMirrors} — the sanctions lists, then the GLEIF deltas only
- * (never a golden copy) — under a fresh time bound, so a run that stalls ends as a
+ * a supervised compiled child running {@link refreshMirrors}: sanctions lists,
+ * then GLEIF deltas only (never a golden copy), under a fresh time bound. A stall ends as a
  * failure the scheduler logs at error level, and the next tick starts a new run
  * rather than being skipped as an overlap. A failure to register is logged, not
  * thrown: the server keeps serving the mirror it has.
@@ -126,6 +124,8 @@ export async function refreshMirrors(
  */
 export async function scheduleSanctionsRefresh(
   runSignal: () => AbortSignal = () => longRunSignal(REFRESH_HOURS),
+  run: (signal: AbortSignal, context: RequestContext) => Promise<void> = (signal, context) =>
+    scheduledRefreshProcess.run(signal, context),
 ): Promise<void> {
   try {
     await schedulerService.schedule(
@@ -133,10 +133,7 @@ export async function scheduleSanctionsRefresh(
       getServerConfig().refreshCron,
       async (ctx) => {
         logger.info('Starting scheduled mirror refresh', ctx);
-        await refreshMirrors(getScreeningService(), runSignal(), {
-          context: ctx,
-          loadMissingExceptions: false,
-        });
+        await run(runSignal(), ctx);
         logger.info('Scheduled mirror refresh complete', ctx);
       },
       'Refreshes the sanctions watchlists, then applies the GLEIF deltas.',
@@ -149,4 +146,12 @@ export async function scheduleSanctionsRefresh(
       requestContextService.createRequestContext({ operation: 'scheduleSanctionsRefresh' }),
     );
   }
+}
+
+/** Stop the HTTP refresh writer before the serving mirrors close. */
+export async function stopSanctionsRefresh(): Promise<void> {
+  /** Core disposes the scheduler after teardown; stop ticks before reaping the writer. */
+  const job = schedulerService.listJobs().find((item) => item.id === SANCTIONS_REFRESH_JOB);
+  if (job) await job.task.stop();
+  await scheduledRefreshProcess.stop();
 }

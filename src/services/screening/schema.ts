@@ -33,6 +33,8 @@ export const NAME_TABLE = 'name';
 export const NAME_FTS_TABLE = 'name_fts';
 /** FTS5 external-content index over `name`'s fold tokens, suffix terms, and phonetic keys, for fuzzy blocking. */
 export const NAME_BLOCKING_FTS_TABLE = 'name_blocking_fts';
+/** Fuzzy-only romanized comparison forms and typo signatures; strict FTS never reads it. */
+export const NAME_SUPPLEMENT_FTS_TABLE = 'name_supplement_fts';
 /** One row: the sync-state stamp of the designation data the name index was last built from. */
 export const NAME_INDEX_STAMP_TABLE = 'name_index_stamp';
 /** Per-identifier exact-lookup index, projected from `designation.payload.identifiers`. */
@@ -55,6 +57,10 @@ export const LEI_NAME_FTS_TABLE = 'lei_name_fts';
 export const LEI_NAME_STAMP_TABLE = 'lei_name_stamp';
 /** B-tree on `lei_name(normalized)` that strict resolution reads exact names through; built by the mirror scripts. */
 export const LEI_NAME_NORMALIZED_INDEX = 'lei_name_normalized_idx';
+/** Out-of-band-built GLEIF deletion-signature projection and its completion stamp. */
+export const LEI_SIGNATURE_TABLE = 'lei_name_signature';
+export const LEI_SIGNATURE_FTS_TABLE = 'lei_name_signature_fts';
+export const LEI_SIGNATURE_STAMP_TABLE = 'lei_name_signature_stamp';
 
 /**
  * `sqliteMirrorStore` spec for the sanctions designation mirror. Columns mirror
@@ -155,7 +161,7 @@ export const leiStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
 
 /**
  * Create the designation mirror's auxiliary objects: the per-alias `name` index
- * (one row per published name/alias) with two FTS indexes over it, kept in
+ * (one row per published name/alias) with three FTS indexes over it, kept in
  * lockstep by triggers, and the one-row stamp of the sync run it was built
  * from; and the per-identifier `designation_identifier` index (one row per
  * published identifier, keyed by its category's normalized form, with the label
@@ -181,7 +187,10 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
       normalized     TEXT NOT NULL,
       phonetic       TEXT NOT NULL,
       name_type      TEXT NOT NULL,
-      suffix_terms   TEXT NOT NULL DEFAULT ''
+      suffix_terms   TEXT NOT NULL DEFAULT '',
+      comparison_normalized TEXT NOT NULL DEFAULT '',
+      comparison_phonetic TEXT NOT NULL DEFAULT '',
+      signatures TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_name_designation ON ${NAME_TABLE}(designation_id);
     CREATE INDEX IF NOT EXISTS idx_name_normalized ON ${NAME_TABLE}(normalized);
@@ -216,6 +225,19 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
       stamp TEXT NOT NULL
     );
 
+    CREATE VIRTUAL TABLE IF NOT EXISTS ${NAME_SUPPLEMENT_FTS_TABLE}
+      USING fts5(comparison_normalized, comparison_phonetic, signatures,
+                 content='${NAME_TABLE}', content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2');
+    CREATE TRIGGER IF NOT EXISTS ${NAME_TABLE}_supplement_ai AFTER INSERT ON ${NAME_TABLE} BEGIN
+      INSERT INTO ${NAME_SUPPLEMENT_FTS_TABLE}(rowid, comparison_normalized, comparison_phonetic, signatures)
+        VALUES (new.rowid, new.comparison_normalized, new.comparison_phonetic, new.signatures);
+    END;
+    CREATE TRIGGER IF NOT EXISTS ${NAME_TABLE}_supplement_ad AFTER DELETE ON ${NAME_TABLE} BEGIN
+      INSERT INTO ${NAME_SUPPLEMENT_FTS_TABLE}(${NAME_SUPPLEMENT_FTS_TABLE}, rowid, comparison_normalized, comparison_phonetic, signatures)
+        VALUES ('delete', old.rowid, old.comparison_normalized, old.comparison_phonetic, old.signatures);
+    END;
+
     CREATE TABLE IF NOT EXISTS ${IDENTIFIER_TABLE} (
       designation_id TEXT NOT NULL,
       category       TEXT NOT NULL,
@@ -235,14 +257,14 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
 }
 
 /**
- * Drop the name index, both its FTS indexes, and their triggers, for
+ * Drop the name index, its FTS indexes, and their triggers, for
  * {@link ensureDesignationAuxSchema} to recreate. `CREATE … IF NOT EXISTS` never
  * alters an existing table, so a name index in another shape — one an earlier
  * release wrote, without `suffix_terms` — is rebuilt from scratch.
  */
 export function dropNameIndex(handle: SqliteHandle): void {
   handle.exec(
-    `DROP TABLE IF EXISTS ${NAME_BLOCKING_FTS_TABLE}; DROP TABLE IF EXISTS ${NAME_FTS_TABLE}; DROP TABLE IF EXISTS ${NAME_TABLE};`,
+    `DROP TABLE IF EXISTS ${NAME_SUPPLEMENT_FTS_TABLE}; DROP TABLE IF EXISTS ${NAME_BLOCKING_FTS_TABLE}; DROP TABLE IF EXISTS ${NAME_FTS_TABLE}; DROP TABLE IF EXISTS ${NAME_TABLE};`,
   );
 }
 
@@ -315,6 +337,29 @@ export function ensureLeiAuxSchema(handle: SqliteHandle): void {
     CREATE TABLE IF NOT EXISTS ${LEI_NAME_STAMP_TABLE} (
       id    INTEGER PRIMARY KEY CHECK (id = 1),
       stamp TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ${LEI_SIGNATURE_TABLE} (
+      rowid INTEGER PRIMARY KEY,
+      signatures TEXT NOT NULL,
+      jurisdiction_terms TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS ${LEI_SIGNATURE_FTS_TABLE}
+      USING fts5(signatures, jurisdiction_terms, content='${LEI_SIGNATURE_TABLE}', content_rowid='rowid',
+                 tokenize = 'unicode61 remove_diacritics 2');
+    CREATE TRIGGER IF NOT EXISTS ${LEI_SIGNATURE_TABLE}_ai AFTER INSERT ON ${LEI_SIGNATURE_TABLE} BEGIN
+      INSERT INTO ${LEI_SIGNATURE_FTS_TABLE}(rowid, signatures, jurisdiction_terms)
+        VALUES (new.rowid, new.signatures, new.jurisdiction_terms);
+    END;
+    CREATE TRIGGER IF NOT EXISTS ${LEI_SIGNATURE_TABLE}_ad AFTER DELETE ON ${LEI_SIGNATURE_TABLE} BEGIN
+      INSERT INTO ${LEI_SIGNATURE_FTS_TABLE}(${LEI_SIGNATURE_FTS_TABLE}, rowid, signatures, jurisdiction_terms)
+        VALUES ('delete', old.rowid, old.signatures, old.jurisdiction_terms);
+    END;
+    CREATE TRIGGER IF NOT EXISTS ${LEI_NAME_TABLE}_remove_signature AFTER DELETE ON ${LEI_NAME_TABLE} BEGIN
+      DELETE FROM ${LEI_SIGNATURE_TABLE} WHERE rowid = old.rowid;
+    END;
+    CREATE TABLE IF NOT EXISTS ${LEI_SIGNATURE_STAMP_TABLE} (
+      id INTEGER PRIMARY KEY CHECK (id = 1), stamp TEXT NOT NULL
     );
   `);
 }

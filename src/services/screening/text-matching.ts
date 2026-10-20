@@ -62,6 +62,69 @@ export function tokenize(folded: string): string[] {
   return folded.split(/\s+/).filter(Boolean);
 }
 
+/** Russian-alphabet comparison mapping; unknown characters survive unchanged. */
+const RUSSIAN_LATIN: Readonly<Record<string, string>> = Object.freeze({
+  а: 'a',
+  б: 'b',
+  в: 'v',
+  г: 'g',
+  д: 'd',
+  е: 'e',
+  ё: 'yo',
+  ж: 'zh',
+  з: 'z',
+  и: 'i',
+  й: 'y',
+  к: 'k',
+  л: 'l',
+  м: 'm',
+  н: 'n',
+  о: 'o',
+  п: 'p',
+  р: 'r',
+  с: 's',
+  т: 't',
+  у: 'u',
+  ф: 'f',
+  х: 'kh',
+  ц: 'ts',
+  ч: 'ch',
+  ш: 'sh',
+  щ: 'shch',
+  ъ: '',
+  ы: 'y',
+  ь: '',
+  э: 'e',
+  ю: 'yu',
+  я: 'ya',
+});
+
+/** Native fold first, then a distinct Russian romanization folded only after mapping. */
+export function comparisonForms(raw: string): string[] {
+  const native = fold(raw);
+  if (!/[А-Яа-яЁё]/u.test(raw)) return [native];
+  const romanized = fold(
+    [...raw.toLowerCase()].map((letter) => RUSSIAN_LATIN[letter] ?? letter).join(''),
+  );
+  return !romanized || native === romanized ? [native] : [native, romanized];
+}
+
+/** Distinct first-four-code-point prefixes and their one-deletion signatures, at least two points long. */
+export function deletionSignatures(tokens: readonly string[]): string[] {
+  const signatures = new Set<string>();
+  for (const token of tokens) {
+    const prefix = [...token].slice(0, 4);
+    if (prefix.length < 2) continue;
+    signatures.add(prefix.join(''));
+    if (prefix.length > 2) {
+      for (let i = 0; i < prefix.length; i++) {
+        signatures.add([...prefix.slice(0, i), ...prefix.slice(i + 1)].join(''));
+      }
+    }
+  }
+  return [...signatures];
+}
+
 /**
  * Build an FTS5 `MATCH` expression requiring every query token to be present
  * (AND of tokens). Each token is double-quoted so FTS5 treats it as a literal

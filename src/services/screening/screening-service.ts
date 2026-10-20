@@ -57,14 +57,20 @@ import {
   LEI_NAME_STAMP_TABLE,
   LEI_NAME_TABLE,
   LEI_RELATIONSHIP_TABLE,
+  LEI_SIGNATURE_FTS_TABLE,
+  LEI_SIGNATURE_STAMP_TABLE,
+  LEI_SIGNATURE_TABLE,
   leiStoreSpec,
   NAME_BLOCKING_FTS_TABLE,
   NAME_FTS_TABLE,
   NAME_INDEX_STAMP_TABLE,
+  NAME_SUPPLEMENT_FTS_TABLE,
   NAME_TABLE,
 } from '@/services/screening/schema.js';
 import {
   buildFtsMatch,
+  comparisonForms,
+  deletionSignatures,
   doubleMetaphone,
   fold,
   jaroWinkler,
@@ -490,7 +496,7 @@ export class ScreeningService {
    * release and later ones write. An earlier release reads `name_fts` alone and
    * writes names without the suffix terms fuzzy blocking reads, so a mirror it
    * wrote, or wrote to after a rollback, carries no stamp or a stale one, and the
-   * first open rebuilds the whole name index — both FTS indexes — from the stored
+   * first open rebuilds the whole name index and its FTS indexes from the stored
    * designations, in one transaction with creating any part of it that is
    * missing, before any screen reads it.
    */
@@ -502,7 +508,10 @@ export class ScreeningService {
       const namesRebuilt = raw.transaction(() => {
         ensureDesignationAuxSchema(raw);
         const built = nameIndexStamp(raw);
-        if (built !== undefined && (built === stamp || state.status === 'in_progress')) {
+        if (
+          built?.startsWith('v2:') &&
+          (built === `v2:${stamp}` || state.status === 'in_progress')
+        ) {
           return false;
         }
         rebuildNameIndex(raw, stamp);
@@ -541,7 +550,9 @@ export class ScreeningService {
       ensureLeiAuxSchema(raw);
       const empty = !raw.prepare(`SELECT 1 FROM ${leiStoreSpec.table} LIMIT 1`).get();
       if (empty && leiNameStamp(raw) === undefined) {
-        writeLeiNameStamp(raw, leiStateStamp(await this.leiMirror.store.readState()));
+        const stamp = leiStateStamp(await this.leiMirror.store.readState());
+        writeLeiNameStamp(raw, stamp);
+        writeLeiSignatureStamp(raw, stamp);
       }
       this.leiAuxReady = true;
     }
@@ -754,6 +765,14 @@ export class ScreeningService {
     const handle = await this.designationHandle();
     const stamp = syncStamp(await this.designationMirror.store.readState());
     handle.transaction(() => {
+      /**
+       * A full projection is cheaper as one FTS build than individual deletion
+       * and insertion postings. Restore triggers before publishing the replacement;
+       * concurrent readers keep the old index until this transaction commits.
+       */
+      handle.exec(
+        `DROP TRIGGER ${NAME_TABLE}_supplement_ai; DROP TRIGGER ${NAME_TABLE}_supplement_ad;`,
+      );
       handle.exec(`DELETE FROM ${NAME_TABLE}; DELETE FROM ${IDENTIFIER_TABLE};`);
       const insertName = prepareNameInsert(handle);
       const insertIdentifier = prepareIdentifierInsert(handle);
@@ -761,6 +780,10 @@ export class ScreeningService {
         writeNames(insertName, row.id, row.primary_name, payload.aliases);
         writeIdentifiers(insertIdentifier, row.id, payload.identifiers);
       });
+      handle.exec(
+        `INSERT INTO ${NAME_SUPPLEMENT_FTS_TABLE}(${NAME_SUPPLEMENT_FTS_TABLE}) VALUES ('rebuild');`,
+      );
+      ensureDesignationAuxSchema(handle);
       writeIdentifierStamp(handle, stamp);
       writeNameIndexStamp(handle, stamp);
     });
@@ -799,6 +822,9 @@ export class ScreeningService {
            (lei, name, normalized, name_type, suffix_terms, jurisdiction_terms)
          VALUES (?, ?, ?, ?, ?, ?)`,
       );
+      const insertSignature = handle.prepare(
+        `INSERT INTO ${LEI_SIGNATURE_TABLE}(rowid, signatures, jurisdiction_terms) VALUES (?, ?, ?)`,
+      );
       for (const e of entities) {
         upsert.run(
           e.lei,
@@ -815,7 +841,7 @@ export class ScreeningService {
           JSON.stringify(e),
         );
         deleteNames.run(e.lei);
-        writeLeiNames(insertName, e);
+        writeLeiNames(insertName, e, insertSignature);
       }
     });
   }
@@ -967,6 +993,7 @@ export class ScreeningService {
     // rewrote every entity (a golden-copy load). The stamp follows the state write:
     // a crash between the two reads as unbuilt, the safe direction.
     const indexed = options.namesIndexed === true || (await this.leiNamesIndexed());
+    const signaturesIndexed = leiSignaturesIndexed(await this.leiHandle());
     const completedAt = new Date().toISOString();
     await this.leiMirror.store.writeState({
       status: 'complete',
@@ -974,7 +1001,10 @@ export class ScreeningService {
       total,
       ...(Object.keys(kept).length > 0 ? { checkpoint: JSON.stringify(kept) } : {}),
     });
-    if (indexed) writeLeiNameStamp(await this.leiHandle(), completedAt);
+    if (indexed) {
+      writeLeiNameStamp(await this.leiHandle(), completedAt);
+      if (signaturesIndexed) writeLeiSignatureStamp(await this.leiHandle(), completedAt);
+    }
   }
 
   /**
@@ -996,6 +1026,41 @@ export class ScreeningService {
    */
   async indexLeiExactNames(): Promise<void> {
     createLeiNameNormalizedIndex(await this.leiHandle());
+  }
+
+  /** Build typed GLEIF deletion signatures in bounded slices, out of band; commit the stamp atomically. */
+  async indexLeiFuzzyNames(): Promise<void> {
+    const handle = await this.leiHandle();
+    const stamp = leiNameStamp(handle);
+    if (stamp === undefined || !(await this.leiNamesIndexed()) || leiSignaturesIndexed(handle))
+      return;
+    handle.transaction(() => {
+      handle.exec(`DELETE FROM ${LEI_SIGNATURE_TABLE}; DELETE FROM ${LEI_SIGNATURE_STAMP_TABLE};`);
+      const read = handle.prepare<{
+        rowid: number;
+        normalized: string;
+        jurisdiction_terms: string;
+      }>(
+        `SELECT rowid, normalized, jurisdiction_terms FROM ${LEI_NAME_TABLE} WHERE rowid > ? ORDER BY rowid LIMIT ${DESIGNATION_READ_SLICE}`,
+      );
+      const insert = handle.prepare(
+        `INSERT INTO ${LEI_SIGNATURE_TABLE}(rowid, signatures, jurisdiction_terms) VALUES (?, ?, ?)`,
+      );
+      let cursor = 0;
+      for (;;) {
+        const rows = read.all(cursor);
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          insert.run(
+            row.rowid,
+            deletionSignatures(tokenize(row.normalized)).join(' '),
+            row.jurisdiction_terms,
+          );
+          cursor = row.rowid;
+        }
+      }
+      writeLeiSignatureStamp(handle, stamp);
+    });
   }
 
   /** True when the exact-name index {@link indexLeiExactNames} builds exists. */
@@ -1033,6 +1098,7 @@ export class ScreeningService {
     await this.ingestLeiRelationships(fixtures.leiRelationships);
     await this.ingestReportingExceptions(fixtures.reportingExceptions);
     await this.indexLeiExactNames();
+    await this.indexLeiFuzzyNames();
     await this.markSanctionsReady(fixtures.designations.length);
     await this.markLeiReady(fixtures.leiEntities.length, { repex: new Date().toISOString() });
   }
@@ -1091,7 +1157,7 @@ export class ScreeningService {
     const fuzzy =
       fuzzySources.length > 0
         ? this.runFuzzy(handle, {
-            normalizedQuery,
+            rawQuery: opts.query,
             queryTokens,
             sources: fuzzySources,
             typeFilter,
@@ -1211,9 +1277,9 @@ export class ScreeningService {
   private runFuzzy(
     handle: SqliteHandle,
     args: {
+      rawQuery: string;
       fullCoverage: boolean;
       minScore: number;
-      normalizedQuery: string;
       queryTokens: string[];
       sources: SourceCode[];
       typeFilter: string;
@@ -1228,6 +1294,20 @@ export class ScreeningService {
         .map((key) => `phonetic : "${key}"`),
     ];
     const partners = blockingPrefixes(stoplisted).map(prefixKey);
+    const queryForms = comparisonForms(args.rawQuery);
+    const supplementaryTokens = queryForms.flatMap(
+      (form) => splitOnStoplist(tokenize(form)).distinctive,
+    );
+    const supplementKeys = [
+      ...blockingPrefixes(supplementaryTokens).map(
+        (prefix) => `comparison_normalized : "${prefix}"*`,
+      ),
+      ...doubleMetaphone(supplementaryTokens.join(' '))
+        .split(' ')
+        .filter(Boolean)
+        .map((key) => `comparison_phonetic : "${key}"`),
+      ...deletionSignatures(supplementaryTokens).map(signatureKey),
+    ];
     // One read per key, or pair of keys, serves every list: the names it matches
     // on the selected lists, each joined to its designation — in that order, so
     // the read's cost follows the names that match, never the table — split by
@@ -1240,6 +1320,14 @@ export class ScreeningService {
        WHERE ${NAME_BLOCKING_FTS_TABLE} MATCH ?${this.sourceFilterClause(args.sources)}${args.typeFilter}`,
     );
     const reads = new Map<string, Map<SourceCode, { rowid: number }[]>>();
+    const supplementRead = handle.prepare<{ rowid: number; source: SourceCode }>(
+      `SELECT f.rowid AS rowid, d.source AS source
+       FROM ${NAME_SUPPLEMENT_FTS_TABLE} f
+       CROSS JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
+       CROSS JOIN designation d ON d.id = n.designation_id
+       WHERE ${NAME_SUPPLEMENT_FTS_TABLE} MATCH ?${this.sourceFilterClause(args.sources)}${args.typeFilter}`,
+    );
+    const supplementReads = new Map<string, Map<SourceCode, { rowid: number }[]>>();
     const pooled = new Set<number>();
     let poolBounded = false;
     for (const source of args.sources) {
@@ -1257,8 +1345,23 @@ export class ScreeningService {
         },
         partners,
       );
-      for (const id of pool.ids) pooled.add(id);
-      poolBounded ||= pool.bounded;
+      const supplemented = poolCandidates(
+        supplementKeys,
+        (keys, limit) => {
+          const expression = keys.map((key) => `(${key})`).join(' AND ');
+          let bySource = supplementReads.get(expression);
+          if (!bySource) {
+            bySource = Map.groupBy(supplementRead.all(expression), (row) => row.source);
+            supplementReads.set(expression, bySource);
+          }
+          const block = bySource.get(source) ?? [];
+          return block.length > limit ? undefined : block.map((row) => row.rowid);
+        },
+        [],
+        pool.ids,
+      );
+      for (const id of supplemented.ids) pooled.add(id);
+      poolBounded ||= pool.bounded || supplemented.bounded;
     }
     if (pooled.size === 0) return { hits: [], poolBounded };
     // In rowid order, a designation's names come in the order they were written,
@@ -1286,37 +1389,56 @@ export class ScreeningService {
     // variants (their significant tokens each score high) and word-order swaps (all
     // tokens present) stay admitted; a high explicit `minScore` still suppresses
     // uniformly; single-token queries are unchanged (the floor alone governs).
-    const required = requiredCoverage(args.queryTokens.length, distinctive.length);
-    const query = scoringQuery(args.queryTokens);
+    const queries = queryForms.map((normalized) => {
+      const tokens = tokenize(normalized);
+      const formDistinctive = splitOnStoplist(tokens).distinctive;
+      const distinctiveCount = Math.max(formDistinctive.length, distinctive.length);
+      return {
+        normalized,
+        distinctiveCount,
+        required: requiredCoverage(args.queryTokens.length, distinctiveCount),
+        scoring: scoringQuery(tokens),
+      };
+    });
     const scored: ScreeningHit[] = [];
     for (const row of rows) {
-      // Coverage of every query token is the surfaced ranking key; the token arm
-      // counts the distinctive ones only, and they are every token unless the
-      // query carries a stoplisted one.
-      const {
-        best: tokenScore,
-        covered,
-        distinctiveCovered,
-      } = scoreTokenPairs(query, tokenize(row.normalized), args.minScore);
-      const wholeScore = jaroWinkler(args.normalizedQuery, row.normalized);
-      if (args.fullCoverage && distinctiveCovered < distinctive.length) continue;
+      let best: ScreeningHit | undefined;
+      const names = comparisonForms(row.name).map((normalized) => ({
+        normalized,
+        tokens: tokenize(normalized),
+      }));
+      for (const query of queries) {
+        for (const name of names) {
+          // Coverage of every query token is the surfaced ranking key; the token arm
+          // counts the distinctive ones only, and they are every token unless the
+          // query carries a stoplisted one.
+          const {
+            best: tokenScore,
+            covered,
+            distinctiveCovered,
+          } = scoreTokenPairs(query.scoring, name.tokens, args.minScore);
+          const wholeScore = jaroWinkler(query.normalized, name.normalized);
+          if (args.fullCoverage && distinctiveCovered < query.distinctiveCount) continue;
 
-      if (
-        this.admitFuzzy(
-          args.normalizedQuery,
-          row.normalized,
-          required,
-          distinctiveCovered,
-          wholeScore,
-          tokenScore,
-          args.minScore,
-        )
-      ) {
-        const hit = this.rowToHit(row, 'approximate');
-        hit.score = Number(Math.max(tokenScore, wholeScore).toFixed(4));
-        hit.queryTokenCoverage = { covered, total: args.queryTokens.length };
-        scored.push(hit);
+          if (
+            this.admitFuzzy(
+              query.normalized,
+              name.normalized,
+              query.required,
+              distinctiveCovered,
+              wholeScore,
+              tokenScore,
+              args.minScore,
+            )
+          ) {
+            const hit = this.rowToHit(row, 'approximate');
+            hit.score = Number(Math.max(tokenScore, wholeScore).toFixed(4));
+            hit.queryTokenCoverage = { covered, total: args.queryTokens.length };
+            if (!best || compareFuzzyRank(hit, best) < 0) best = hit;
+          }
+        }
       }
+      if (best) scored.push(best);
     }
 
     // Best alias per designation, then rank — every admitted designation, since a
@@ -1751,7 +1873,7 @@ export class ScreeningService {
        JOIN ${leiStoreSpec.table} e ON e.lei = n.lei
        WHERE n.rowid IN (SELECT value FROM json_each(?))${args.statusClause}`,
     );
-    const pool = poolCandidates(
+    let pool = poolCandidates(
       blockingPrefixes(distinctive).map(prefixKey),
       (keys, limit) => {
         const rows = names.all(
@@ -1763,6 +1885,25 @@ export class ScreeningService {
       },
       blockingPrefixes(stoplisted).map(prefixKey),
     );
+    if (leiSignaturesIndexed(handle)) {
+      const signatures = handle.prepare<{ rowid: number }>(
+        `SELECT rowid FROM ${LEI_SIGNATURE_FTS_TABLE} WHERE ${LEI_SIGNATURE_FTS_TABLE} MATCH ? LIMIT ?`,
+      );
+      const supplemented = poolCandidates(
+        deletionSignatures(distinctive).map(signatureKey),
+        (keys, limit) => {
+          const rows = signatures.all(
+            `${keys.map((key) => `(${key})`).join(' AND ')}${within}`,
+            limit + 1,
+          );
+          if (rows.length > limit) return;
+          return leisOf.all(JSON.stringify(rows.map((row) => row.rowid))).map((row) => row.lei);
+        },
+        [],
+        pool.ids,
+      );
+      pool = { ids: supplemented.ids, bounded: pool.bounded || supplemented.bounded };
+    }
     if (pool.ids.size === 0) return { hits: [], poolBounded: pool.bounded };
 
     const rows = handle
@@ -2074,6 +2215,11 @@ function prefixKey(prefix: string): string {
   return `{normalized suffix_terms} : "${prefix}"*`;
 }
 
+/** A deletion signature is an exact term, never an FTS prefix. */
+function signatureKey(signature: string): string {
+  return `signatures : "${signature}"`;
+}
+
 /**
  * How many distinctive tokens (off `FUZZY_STOPLIST`) a candidate must cover to
  * pass the token arm of the fuzzy gate: half the query's tokens, rounded up — so
@@ -2203,7 +2349,11 @@ function alternateNamesOf(entity: NormalizedLeiEntity): LeiAlternateName[] {
  * nothing to retrieval, and the earlier row reports it. A name that folds to
  * nothing is skipped.
  */
-function writeLeiNames(insert: SqliteStatement, entity: NormalizedLeiEntity): void {
+function writeLeiNames(
+  insert: SqliteStatement,
+  entity: NormalizedLeiEntity,
+  signatures: SqliteStatement,
+): void {
   const jurisdiction = jurisdictionTerms(entity.jurisdiction);
   const seen = new Set<string>();
   for (const { name, type } of [
@@ -2213,7 +2363,19 @@ function writeLeiNames(insert: SqliteStatement, entity: NormalizedLeiEntity): vo
     const normalized = fold(name);
     if (!normalized || seen.has(normalized)) continue;
     seen.add(normalized);
-    insert.run(entity.lei, name, normalized, type, suffixTerms(normalized), jurisdiction);
+    const { lastInsertRowid } = insert.run(
+      entity.lei,
+      name,
+      normalized,
+      type,
+      suffixTerms(normalized),
+      jurisdiction,
+    );
+    signatures.run(
+      Number(lastInsertRowid),
+      deletionSignatures(tokenize(normalized)).join(' '),
+      jurisdiction,
+    );
   }
 }
 
@@ -2239,6 +2401,21 @@ function writeLeiNameStamp(handle: SqliteHandle, stamp: string): void {
   handle
     .prepare(`INSERT OR REPLACE INTO ${LEI_NAME_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
     .run(stamp);
+}
+
+/** Derived GLEIF data serves requests only after a complete build for the typed-name stamp. */
+function leiSignaturesIndexed(handle: SqliteHandle): boolean {
+  const stamp = handle
+    .prepare<{ stamp: string }>(`SELECT stamp FROM ${LEI_SIGNATURE_STAMP_TABLE} WHERE id = 1`)
+    .get()?.stamp;
+  const names = leiNameStamp(handle);
+  return names !== undefined && stamp === `v1:${names}`;
+}
+
+function writeLeiSignatureStamp(handle: SqliteHandle, stamp: string): void {
+  handle
+    .prepare(`INSERT OR REPLACE INTO ${LEI_SIGNATURE_STAMP_TABLE}(id, stamp) VALUES (1, ?)`)
+    .run(`v1:${stamp}`);
 }
 
 /** A designation row as the index rebuilds read it. */
@@ -2272,8 +2449,8 @@ function walkDesignations(
 
 function prepareNameInsert(handle: SqliteHandle): SqliteStatement {
   return handle.prepare(
-    `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type, suffix_terms)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ${NAME_TABLE} (designation_id, name, normalized, phonetic, name_type, suffix_terms, comparison_normalized, comparison_phonetic, signatures)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
 }
 
@@ -2294,6 +2471,8 @@ function writeNames(
   for (const rec of [{ name: primaryName, nameType: 'primary' as const }, ...aliases]) {
     const normalized = fold(rec.name);
     if (!normalized) continue;
+    const forms = comparisonForms(rec.name);
+    const derived = forms.join(' ');
     insert.run(
       designationId,
       rec.name,
@@ -2301,6 +2480,9 @@ function writeNames(
       doubleMetaphone(normalized),
       rec.nameType,
       suffixTerms(normalized),
+      derived,
+      doubleMetaphone(derived),
+      deletionSignatures(forms.flatMap(tokenize)).join(' '),
     );
   }
 }
@@ -2331,7 +2513,7 @@ function nameIndexStamp(handle: SqliteHandle): string | undefined {
 function writeNameIndexStamp(handle: SqliteHandle, stamp: string): void {
   handle
     .prepare(`INSERT OR REPLACE INTO ${NAME_INDEX_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
-    .run(stamp);
+    .run(`v2:${stamp}`);
 }
 
 /** Index a designation's identifiers under their categories' keys; one that normalizes to nothing is skipped. */

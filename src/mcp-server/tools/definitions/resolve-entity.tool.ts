@@ -286,7 +286,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     if (r.matches.length === 0) return [{ type: 'text', text: '**No LEI candidates found.**' }];
     const lines = [`**${r.matches.length} LEI candidate(s)** — confirm before relying on:\n`];
     for (const m of r.matches) {
-      const scoreStr = m.score !== undefined ? ` · score ${m.score.toFixed(3)}` : '';
+      const scoreStr = m.score !== undefined ? ` · score ${m.score}` : '';
       const cov = m.queryTokenCoverage;
       const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
       lines.push(`### ${m.legalName} — ${m.matchType}${scoreStr}${coverStr}`);

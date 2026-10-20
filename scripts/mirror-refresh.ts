@@ -44,6 +44,10 @@ async function main(): Promise<void> {
         total: sanctions.total,
       }),
     );
+    if (gleif) {
+      log.info('mirror:refresh — building GLEIF fuzzy signatures if missing', ctx);
+      await service.indexLeiFuzzyNames();
+    }
     if (gleif && gleif.needsInit.length > 0) {
       throw new Error(
         `GLEIF ${gleif.needsInit.join(', ')} cannot be caught up from delta files — nothing was applied and leiAsOf is unchanged. Run mirror:init to reload the GLEIF golden copies.`,

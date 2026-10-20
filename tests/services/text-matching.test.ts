@@ -9,6 +9,8 @@ import { describe, expect, it } from 'vitest';
 import {
   bestTokenScore,
   buildFtsMatch,
+  comparisonForms,
+  deletionSignatures,
   doubleMetaphone,
   FUZZY_STOPLIST,
   fold,
@@ -22,6 +24,57 @@ import {
   tokenCoverage,
   tokenize,
 } from '@/services/screening/text-matching.js';
+
+describe('fuzzy comparison forms and deletion signatures', () => {
+  it('maps the Russian alphabet before folding and preserves unknown letters', () => {
+    expect(comparisonForms('АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ')).toEqual([
+      'абвгдеежзииклмнопрстуфхцчшщъыьэюя',
+      'abvgdeyozhziyklmnoprstufkhtschshshchyeyuya',
+    ]);
+    expect(comparisonForms('Роснефть')).toEqual(['роснефть', 'rosneft']);
+    expect(comparisonForms('Совкомфлот')).toEqual(['совкомфлот', 'sovkomflot']);
+    expect(comparisonForms('Ї東京')).toEqual(['і東京']);
+    expect(comparisonForms('Rosneft')).toEqual(['rosneft']);
+    expect(comparisonForms('ъь')).toEqual(['ъь']);
+  });
+
+  it('keeps useful two-point signatures and whole supplementary-plane letters', () => {
+    expect(deletionSignatures(['a', 'ab', 'abc', 'abc'])).toEqual(['ab', 'abc', 'bc', 'ac']);
+    expect(deletionSignatures(['𠀀𠀁𠀂𠀃x'])).toEqual([
+      '𠀀𠀁𠀂𠀃',
+      '𠀁𠀂𠀃',
+      '𠀀𠀂𠀃',
+      '𠀀𠀁𠀃',
+      '𠀀𠀁𠀂',
+    ]);
+    expect(deletionSignatures([])).toEqual([]);
+  });
+
+  it.each(['line', 'breaks'] as const)(
+    'bounds comparison/signature scanner CPU across a 64-fold span: %s',
+    (shape) => {
+      const make = (size: number) =>
+        shape === 'line' ? `${'я'.repeat(size)}\n` : 'я\n'.repeat(size / 2);
+      const cpuMs = (input: string): number => {
+        const start = process.threadCpuUsage();
+        for (let repeat = 0; repeat < 8; repeat++) {
+          comparisonForms(input);
+          deletionSignatures(tokenize(fold(input)));
+        }
+        const elapsed = process.threadCpuUsage(start);
+        return (elapsed.user + elapsed.system) / 1000;
+      };
+      for (let warm = 0; warm < 8; warm++) cpuMs(make(1250));
+      const times: number[] = [];
+      for (let size = 1250; size <= 80_000; size *= 2) {
+        const time = cpuMs(make(size));
+        expect(time, `CPU at ${size}`).toBeLessThan(500);
+        times.push(Math.max(time, 0.05));
+      }
+      expect(times.at(-1)! / times[0]!).toBeLessThan(256);
+    },
+  );
+});
 
 describe('fold', () => {
   it('lowercases, strips diacritics, and collapses punctuation', () => {

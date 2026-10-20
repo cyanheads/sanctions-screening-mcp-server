@@ -13,7 +13,10 @@ import { config } from '@cyanheads/mcp-ts-core/config';
 import { allPromptDefinitions } from './mcp-server/prompts/definitions/index.js';
 import { allResourceDefinitions } from './mcp-server/resources/definitions/index.js';
 import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
-import { scheduleSanctionsRefresh } from './services/screening/sanctions-refresh.js';
+import {
+  scheduleSanctionsRefresh,
+  stopSanctionsRefresh,
+} from './services/screening/sanctions-refresh.js';
 import {
   getScreeningService,
   initScreeningService,
@@ -62,17 +65,18 @@ await createApp({
       { label: 'GLEIF', href: 'https://www.gleif.org/', external: true },
     ],
   },
-  setup() {
+  async setup() {
     initScreeningService();
     // HTTP deployments refresh on a cron: the sanctions lists, then the GLEIF
     // deltas. stdio operators run `bun run mirror:refresh` out-of-band, where a
     // cron would be redundant and could collide with a manual run.
-    if (config.mcpTransportType === 'http') void scheduleSanctionsRefresh();
+    if (config.mcpTransportType === 'http') await scheduleSanctionsRefresh();
   },
   // The service holds open SQLite handles for both mirrors. Releasing them here
   // closes prepared statements with the file rather than leaving it pinned
   // until garbage collection.
   async teardown() {
+    await stopSanctionsRefresh();
     await getScreeningService().close();
   },
 });

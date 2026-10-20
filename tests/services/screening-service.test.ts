@@ -43,6 +43,22 @@ const screenDefaults = {
 };
 
 describe('screenName — strict matching', () => {
+  it('keeps native strict names and strict-only cross-references separate across scripts', async () => {
+    await svc.ingestDesignations([namedDesignation('NATIVE', 'Совкомфлот')]);
+    const native = await svc.screenName(
+      { ...screenDefaults, query: 'Совкомфлот', autoFallback: false },
+      ctx,
+    );
+    expect(native.hits.find((hit) => hit.sourceEntryId === 'NATIVE')).toMatchObject({
+      matchType: 'exact',
+      matchedName: 'Совкомфлот',
+    });
+    const latin = await svc.screenName(
+      { ...screenDefaults, query: 'Sovcomflot', autoFallback: false },
+      ctx,
+    );
+    expect(latin.hits.find((hit) => hit.sourceEntryId === 'NATIVE')).toBeUndefined();
+  });
   it('returns an exact hit for a normalized primary-name match', async () => {
     const res = await svc.screenName({ ...screenDefaults, query: 'Ivan Testovich Volkov' }, ctx);
     expect(res.modeUsed).toBe('strict');
@@ -73,6 +89,83 @@ describe('screenName — strict matching', () => {
 });
 
 describe('screenName — fuzzy fallback', () => {
+  it('keeps original query-token coverage when romanization removes a standalone sign', async () => {
+    await svc.ingestDesignations([namedDesignation('SIGN-ROSNEFT', 'Rosneft')]);
+    const result = await svc.screenName(
+      { ...screenDefaults, query: 'Ъ Роснефть', matchMode: 'fuzzy' },
+      ctx,
+    );
+    expect(
+      result.hits.find((hit) => hit.sourceEntryId === 'SIGN-ROSNEFT')?.queryTokenCoverage,
+    ).toEqual({ covered: 1, total: 2 });
+  });
+  it('builds typed GLEIF signatures only out of band, atomically across more than one slice', async () => {
+    const handle = await svc.leiEntities.raw();
+    await svc.ingestLeiEntities([
+      ...Array.from({ length: 2001 }, (_, i) => registered(`SLICE${i}`, `Filler${i}`)),
+      registered('LASTROSNEFT', 'Rosneft'),
+    ]);
+    handle.exec('DELETE FROM lei_name_signature; DELETE FROM lei_name_signature_stamp;');
+    const resolve = () =>
+      svc.resolveEntity({ query: 'Rpsneft', matchMode: 'fuzzy', status: 'any', limit: 25 }, ctx);
+    expect((await resolve()).matches.some((hit) => hit.lei === testLei('LASTROSNEFT'))).toBe(false);
+    expect(
+      handle.prepare<{ n: number }>('SELECT COUNT(*) AS n FROM lei_name_signature').get()?.n,
+    ).toBe(0);
+    handle.exec(
+      `CREATE TRIGGER reject_signature BEFORE INSERT ON lei_name_signature WHEN new.rowid > 2000 BEGIN SELECT RAISE(ABORT, 'fixture interruption'); END;`,
+    );
+    await expect(svc.indexLeiFuzzyNames()).rejects.toThrow('fixture interruption');
+    expect(handle.prepare('SELECT 1 FROM lei_name_signature_stamp').get()).toBeFalsy();
+    expect(
+      handle.prepare<{ n: number }>('SELECT COUNT(*) AS n FROM lei_name_signature').get()?.n,
+    ).toBe(0);
+    handle.exec('DROP TRIGGER reject_signature;');
+    await svc.indexLeiFuzzyNames();
+    expect(
+      (await resolve()).matches.find((hit) => hit.lei === testLei('LASTROSNEFT')),
+    ).toMatchObject({ matchedName: 'Rosneft' });
+    await svc.ingestLeiEntities([registered('LASTROSNEFT', 'Varnok Updated')]);
+    expect((await resolve()).matches.some((hit) => hit.lei === testLei('LASTROSNEFT'))).toBe(false);
+    const replaced = await svc.resolveEntity(
+      { query: 'Vqrnok', matchMode: 'fuzzy', status: 'any', limit: 25 },
+      ctx,
+    );
+    expect(replaced.matches.find((hit) => hit.lei === testLei('LASTROSNEFT'))).toMatchObject({
+      matchedName: 'Varnok Updated',
+      matchType: 'approximate',
+    });
+  });
+  it.each([
+    ['Rpsneft', 'Rosneft'],
+    ['Sobcomflot', 'Sovcomflot'],
+    ['Совкомфлот', 'Sovcomflot'],
+    ['Sovcomflot', 'Совкомфлот'],
+    ['Роснефть', 'Rosneft'],
+  ])('supplements native blocking for %s against published %s', async (query, name) => {
+    await svc.ingestDesignations([namedDesignation('SUPPLEMENT', name)]);
+    const result = await svc.screenName({ ...screenDefaults, query, matchMode: 'fuzzy' }, ctx);
+    expect(result.hits.find((hit) => hit.sourceEntryId === 'SUPPLEMENT')).toMatchObject({
+      matchedName: name,
+      matchedNameType: 'primary',
+      matchType: 'approximate',
+      queryTokenCoverage: { covered: 1, total: 1 },
+    });
+  });
+
+  it('supplements typed GLEIF names for an early typo after an out-of-band index build', async () => {
+    await svc.ingestLeiEntities([registered('ROSNEFT', 'Rosneft')]);
+    // The fixture seed follows the same lifecycle path as mirror:init.
+    await svc.indexLeiFuzzyNames();
+    const result = await svc.resolveEntity(
+      { query: 'Rpsneft', matchMode: 'fuzzy', status: 'any', limit: 25 },
+      ctx,
+    );
+    expect(result.matches.find((hit) => hit.lei === testLei('ROSNEFT'))).toMatchObject({
+      matchedName: 'Rosneft',
+      matchType: 'approximate',
+    });
+  });
   it('auto-falls-back to fuzzy when strict finds nothing, surfacing a raw JW score', async () => {
     // "Volkow" is a one-character near-miss of the primary name "Volkov".
     const res = await svc.screenName({ ...screenDefaults, query: 'Ivan Volkow' }, ctx);
@@ -1082,7 +1175,7 @@ async function indexPrefixes(handle: SqliteHandle, run: () => Promise<unknown>):
   const prefixes: string[] = [];
   handle.prepare = ((sql: string) => {
     const statement = original(sql);
-    if (!/\bMATCH \?/.test(sql)) return statement;
+    if (!/\bMATCH \?/.test(sql) || sql.includes('name_supplement_fts')) return statement;
     return {
       ...statement,
       all: (...params: Parameters<typeof statement.all>) => {
@@ -1556,7 +1649,7 @@ describe('fuzzy phonetic arm — per-word keys (issue #68)', () => {
       ),
     );
     const phonetic = trace.statements.filter(({ params }) =>
-      String(params[0]).includes('phonetic :'),
+      /\(phonetic :/.test(String(params[0])),
     );
     expect(phonetic.map(({ params }) => params[0])).toEqual([
       '(phonetic : "MHMT")',
@@ -1809,7 +1902,7 @@ describe('fuzzy stoplist — blocking (issue #55)', () => {
     );
     const phonetic = trace.lookups
       .map(({ expression }) => expression)
-      .filter((expression) => expression.includes('phonetic :'));
+      .filter((expression) => /\(phonetic :/.test(expression));
     expect(phonetic).toEqual([`(phonetic : "${doubleMetaphone('sovcomflot')}")`]);
   });
 

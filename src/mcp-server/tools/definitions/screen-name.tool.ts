@@ -54,13 +54,13 @@ const HitSchema = z
     matchType: z
       .enum(['exact', 'strong', 'approximate'])
       .describe(
-        'exact = normalized name equality; strong = all query tokens present; approximate = fuzzy/phonetic.',
+        'exact = native normalized name equality; strong = all native query tokens present; approximate = fuzzy/phonetic, optionally comparing Russian-alphabet romanizations while retaining the published matchedName.',
       ),
     score: z
       .number()
       .optional()
       .describe(
-        'Raw Jaro-Winkler similarity (0–1) for approximate hits only — a real measurement, not a confidence verdict. Absent for exact/strong hits.',
+        'Raw Jaro-Winkler similarity (0–1) for approximate hits only, measured on native or Russian-alphabet romanized comparison forms — not a confidence verdict or an official alias. Absent for exact/strong hits.',
       ),
     queryTokenCoverage: z
       .object({
@@ -311,7 +311,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
         `**${result.hits.length} potential match(es)** — candidates to verify, not determinations:\n`,
       );
       for (const h of result.hits) {
-        const scoreStr = h.score !== undefined ? ` · score ${h.score.toFixed(3)}` : '';
+        const scoreStr = h.score !== undefined ? ` · score ${h.score}` : '';
         const cov = h.queryTokenCoverage;
         const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
         const also = alsoListedText(h.source, h.sources);

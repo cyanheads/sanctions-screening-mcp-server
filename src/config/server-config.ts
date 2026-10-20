@@ -32,7 +32,7 @@ const ServerConfigSchema = z.object({
     .string()
     .default('0 4 * * *')
     .describe(
-      'Cron for the scheduled mirror refresh (HTTP transport only). Each run re-harvests the sanctions lists and rebuilds the name and identifier indexes, then applies the GLEIF delta windows its checkpoint calls for, under one 4-hour time bound. A GLEIF gap that needs mirror:init is logged, never loaded in-process.',
+      'Cron for the scheduled mirror refresh (HTTP transport only). A supervised child re-harvests the sanctions lists and rebuilds their indexes, then applies GLEIF deltas under one fresh 4-hour bound. A gap that needs mirror:init is logged; the schedule never loads golden copies.',
     ),
   fuzzyMinScore: z.coerce
     .number()

@@ -159,7 +159,7 @@ async function planDelta(
  * whose checkpoint predates every delta window, are returned in `needsInit` with
  * no dataset applied. Reporting exceptions with no recorded load get their golden
  * copy when `loadMissingExceptions` is set (`mirror:refresh`) and are otherwise
- * left unloaded (the HTTP schedule, which never loads a golden copy in-process).
+ * left unloaded (the HTTP schedule, which never loads a golden copy).
  *
  * @throws Whatever a download or file fails with. The checkpoint and `leiAsOf`
  *   are then untouched, and the next run re-applies from the same checkpoint.

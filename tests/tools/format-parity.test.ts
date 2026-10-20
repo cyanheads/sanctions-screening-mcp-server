@@ -54,7 +54,7 @@ describe('sanctions_screen_name format()', () => {
 
     expect(text).toContain('1 potential match(es)');
     expect(text).toContain('Ivan Testovich Volkov — approximate');
-    expect(text).toContain('score 0.912'); // raw Jaro-Winkler, three decimals
+    expect(text).toContain('score 0.912345'); // the same raw value as structuredContent
     expect(text).toContain('covers 2/3 query tokens'); // the secondary ranking key
     expect(text).toContain('OFAC Specially Designated Nationals');
     expect(text).toContain('Entry ID:** FX-1001');
@@ -325,7 +325,7 @@ describe('sanctions_resolve_entity format()', () => {
 
     expect(text).toContain('1 LEI candidate(s)');
     expect(text).toContain('### Fictional Trading Company LLC — approximate');
-    expect(text).toContain('score 0.888');
+    expect(text).toContain('score 0.887777');
     expect(text).toContain('covers 3/3 query tokens');
     expect(text).toContain('`5493001KJTIIGC8Y1R12`');
     expect(text).toContain('Matched on:** "Fictional Trading Co" (PREVIOUS_LEGAL_NAME)');

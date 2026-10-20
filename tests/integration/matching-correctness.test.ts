@@ -7,6 +7,7 @@
 
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
 import { tokenize } from '@/services/screening/text-matching.js';
@@ -434,6 +435,108 @@ describe('sanctions_screen_name identity order on both surfaces (issue #60)', ()
       ([, source, entryId]) => `${source}:${entryId}`,
     );
     expect(rendered).toEqual(IDENTITY_ORDER);
+  });
+});
+
+describe('cross-script comparison on both tool surfaces', () => {
+  let harness: SeededService;
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  it('pages published names with approximate scores and retains strict list completion and score floors', async () => {
+    harness = await seededGlobalService();
+    const native: NormalizedDesignation = {
+      id: 'eu:CYRILLIC',
+      source: 'eu',
+      sourceEntryId: 'CYRILLIC',
+      entityType: 'organization',
+      primaryName: 'Совкомфлот',
+      payload: { aliases: [], identifiers: [], addresses: [], datesOfBirth: [], nationalities: [] },
+    };
+    await harness.service.ingestDesignations([
+      native,
+      {
+        ...native,
+        id: 'uk:LATIN',
+        source: 'uk',
+        sourceEntryId: 'LATIN',
+        primaryName: 'Sovcomflot',
+      },
+      { ...native, id: 'eu:SAME-LIST', sourceEntryId: 'SAME-LIST', primaryName: 'Sovcomflot' },
+      {
+        ...native,
+        id: 'un:ALIAS',
+        source: 'un',
+        sourceEntryId: 'ALIAS',
+        primaryName: 'Published Holding',
+        payload: { ...native.payload, aliases: [{ name: 'Sovcomflot', nameType: 'fka' }] },
+      },
+    ]);
+    const screen = (extra: Record<string, unknown> = {}) =>
+      runToolContract(screenNameTool, {
+        name: 'Совкомфлот',
+        sources: ['eu', 'uk', 'un'],
+        ...extra,
+      });
+    const completed = await screen();
+    expect(completed.isError).toBeFalsy();
+    const data = completed.structuredContent as {
+      hits: {
+        sourceEntryId: string;
+        matchedName: string;
+        matchedNameType: string;
+        matchType: string;
+        score?: number;
+      }[];
+      caveat: string;
+    };
+    expect(data.hits.map((hit) => hit.sourceEntryId)).toEqual(['CYRILLIC', 'LATIN', 'ALIAS']);
+    expect(data.hits[0]?.matchType).toBe('exact');
+    expect(data.hits[1]).toMatchObject({
+      matchedName: 'Sovcomflot',
+      matchType: 'approximate',
+      score: 0.9533,
+    });
+    expect(data.hits[2]).toMatchObject({ matchedName: 'Sovcomflot', matchedNameType: 'fka' });
+    expect(data.caveat).toBe(SCREENING_CAVEAT);
+    const text = completed.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('**Matched on:** "Sovcomflot" (fka)');
+    expect(text).toContain('approximate · score 0.9533 · covers 1/1 query tokens');
+    expect(text).toContain(SCREENING_CAVEAT);
+
+    const pages = [];
+    for (const offset of [0, 1, 2, 3, 4]) {
+      const page = await screen({ matchMode: 'fuzzy', limit: 1, offset });
+      expect(page.isError).toBeFalsy();
+      const content = page.structuredContent as typeof data;
+      const rendered = page.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      for (const hit of content.hits)
+        expect(rendered).toContain(`**Entry ID:** ${hit.sourceEntryId}`);
+      expect(rendered).toContain(SCREENING_CAVEAT);
+      pages.push(...content.hits.map((hit) => hit.sourceEntryId));
+    }
+    expect(pages).toEqual(['CYRILLIC', 'SAME-LIST', 'LATIN', 'ALIAS']);
+    const high = await screen({ minScore: 0.99 });
+    expect((high.structuredContent as typeof data).hits.map((hit) => hit.sourceEntryId)).toEqual([
+      'CYRILLIC',
+    ]);
+    const empty = await screen({ name: 'Unrelated Qzqw' });
+    expect((empty.structuredContent as typeof data).hits).toEqual([]);
+    expect(empty.content.map((block) => ('text' in block ? block.text : '')).join('\n')).toContain(
+      'NOT a clearance',
+    );
+    const invalid = await screen({ name: '---' });
+    expect(invalid.isError).toBe(true);
+    expect(invalid.structuredContent).toMatchObject({
+      error: {
+        code: -32602,
+        data: {
+          reason: 'name_not_searchable',
+          recovery: { hint: expect.stringContaining('letter or digit') },
+        },
+      },
+    });
   });
 });
 

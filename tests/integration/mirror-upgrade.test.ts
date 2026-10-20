@@ -190,6 +190,28 @@ afterEach(async () => {
 });
 
 describe('a 0.2.0 mirror opened by the current service', () => {
+  it('rebuilds fuzzy-only comparison terms from published names without widening released strict FTS', async () => {
+    const published: NormalizedDesignation = {
+      id: 'eu:UPGRADE-ROMAN',
+      source: 'eu',
+      sourceEntryId: 'UPGRADE-ROMAN',
+      entityType: 'organization',
+      primaryName: 'Роснефть',
+      payload: { aliases: [], identifiers: [], addresses: [], datesOfBirth: [], nationalities: [] },
+    };
+    await switchToV1Mirror(join(dir, 'romanized.db'), [published]);
+    const result = await runToolContract(screenNameTool, { name: 'Rpsneft', matchMode: 'fuzzy' });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      hits: [{ matchedName: 'Роснефть', matchType: 'approximate' }],
+    });
+    const handle = await getScreeningService().designations.raw();
+    expect(releasedStrictHits(handle, 'Rosneft')).toEqual([]);
+    expect(
+      handle.prepare<{ stamp: string }>('SELECT stamp FROM name_index_stamp').get()?.stamp,
+    ).toMatch(/^v2:/);
+    expect(handle.prepare<{ n: number }>('SELECT COUNT(*) AS n FROM name').get()?.n).toBe(1);
+  });
   it('serves sanctions_screen_name hits with the fields 0.2.0 returned, plus sources', async () => {
     const result = await screenNameTool.handler(
       screenNameTool.input.parse({ name: 'Ivan Testovich Volkov' }),

@@ -69,13 +69,16 @@ export interface CandidatePool<Id> {
  * prefix, whose block is every name with a legal form — but follow the left-out
  * blocks in the pair round, so `deu` × `akt` can still narrow `Deutsche` to the
  * names that also carry `Aktiengesellschaft`. They never pair with each other.
+ * `reserved` holds the completed native pool during a supplemental round: those
+ * ids keep their places before any additional block spends the remaining budget.
  */
 export function poolCandidates<Id>(
   keys: readonly string[],
   lookup: BlockLookup<Id>,
   partners: readonly string[] = [],
+  reserved: ReadonlySet<Id> = new Set<Id>(),
 ): CandidatePool<Id> {
-  const ids = new Set<Id>();
+  const ids = new Set<Id>(reserved);
   const admit = (block: readonly Id[] | undefined): boolean => {
     if (!block) return false;
     const added = block.filter((id) => !ids.has(id));

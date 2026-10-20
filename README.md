@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Sanctions screening and legal-entity resolution over the consolidated OFAC, EU, UK, and UN lists plus the GLEIF LEI registry, matched offline against a local mirror. Screen a name for potential watchlist hits, resolve a company to its LEI, and trace its ownership chain. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Sanctions screening and legal-entity resolution over the consolidated OFAC, EU, UK, and UN lists plus the GLEIF LEI registry, matched offline against a local mirror. Screen a name for potential watchlist hits, resolve a company to its LEI, and trace its ownership chain.
 
 > [!IMPORTANT]
 > **A screening aid, not a compliance determination.** Every result is a potential match with a transparent score and source provenance, never a verdict. A hit is a candidate to verify against the official source; an empty result is never a clearance. Sanctions compliance needs human review and a qualified determination. This server feeds that process and does not perform it.
@@ -68,6 +68,7 @@ All resource data is also reachable through the tools, for clients that don't su
 
 - `name` in any script (at most 64 words and 1,024 characters) plus optional `sources`, `entityType`, and `minScore` filters; `matchMode` is `strict` (default) or `fuzzy`. Strict runs a fuzzy pass over each selected list it finds nothing on: a full pass when it finds nothing on any list, otherwise one that adds, after the strict hits, only candidates covering every word of the name other than legal forms, articles and other function words, and the jurisdiction codes `uk`, `usa`, `uae`, and `rf`. `fuzzySources` names the lists a fuzzy pass searched; up to 100 hits per page (`limit`, default 25) with `offset`
 - Hits carry `source`, `sourceEntryId`, the list's published `referenceNumber` where it has one, `matchedName` with its `matchedNameType`, and `matchType` (`exact` / `strong` / `approximate`); approximate hits add the raw Jaro-Winkler `score` (0–1) and `queryTokenCoverage`
+- Approximate screening compares native forms and deterministic Russian-alphabet romanizations in both directions, always keeping the name and alias type exactly as published. Derived equality remains approximate; it is neither an official alias nor an identity determination. Native candidates take priority within each list's independent 2,000-name fuzzy pool; romanized forms and first-four-code-point deletion signatures supplement remaining capacity, so typo recall is bounded
 - `sources` names every selected list a hit's party is on. OFAC publishes a party on the SDN List and a non-SDN list under one entry ID in both of its files; with both OFAC lists selected that party is one hit, counted once, naming both even when the screen matched one record. Its other fields, the designation date included, come from the `source` record: `ofac_sdn`, unless the Consolidated record matched alone or better
 - `totalAvailable`, `hasMore`, and `nextOffset` page the rest, and paging reaches every match counted; `totalAvailableBasis` marks the count `exact` (strict matched on every selected list) or a `lower_bound` (a fuzzy pass ran), and a `notice` asks for a more distinctive word when a list's fuzzy candidate pool reached its budget
 
@@ -285,7 +286,7 @@ Every source is keyless, so nothing here is required.
 | Variable | Description | Default |
 |:---|:---|:---|
 | `SANCTIONS_MIRROR_PATH` | Filesystem path for the SQLite mirror; use a persistent volume when hosted. | `./data/sanctions.db` |
-| `SANCTIONS_REFRESH_CRON` | Cron for the scheduled refresh (HTTP transport only). It refreshes the sanctions lists, then applies the GLEIF delta windows the checkpoint calls for, under one 4-hour bound. A GLEIF gap that needs `mirror:init` is logged, never loaded in-process. | `0 4 * * *` |
+| `SANCTIONS_REFRESH_CRON` | Cron for the scheduled refresh (HTTP transport only). A supervised child refreshes the sanctions lists and their indexes, then applies GLEIF deltas under one fresh 4-hour bound. A gap that needs `mirror:init` is logged; the schedule never loads golden copies. | `0 4 * * *` |
 | `SANCTIONS_REFRESH_SKIP_GLEIF` | Set to `1` to skip the GLEIF leg of the scheduled refresh and of `mirror:refresh`. | unset |
 | `SANCTIONS_FUZZY_MIN_SCORE` | Jaro-Winkler floor for fuzzy matches when `minScore` is omitted. | `0.85` |
 | `OFAC_SDN_URL` | OFAC SDN advanced-XML URL. | official OFAC URL |
@@ -329,6 +330,8 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ### Mirror lifecycle
 
 The mirror loads out-of-band, never on the request path.
+
+On HTTP deployments, the scheduled refresh runs in a separate process using the serving runtime and its runtime arguments. SQLite WAL keeps committed indexes readable while that child writes, so health and screening requests continue during a rebuild. Timeout or shutdown requests cancellation, allows up to 5 seconds for cleanup, then kills and awaits a child that has not exited. Every terminal outcome releases the slot for the next tick. A killed run can leave committed harvest pages behind; the next successful refresh rebuilds their derived indexes before completing. The serving process reads updated freshness and reporting-exception counts without a restart.
 
 | Script | Purpose |
 |:---|:---|

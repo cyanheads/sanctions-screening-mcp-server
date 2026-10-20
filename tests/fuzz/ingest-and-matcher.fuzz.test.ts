@@ -24,6 +24,7 @@ import {
 } from '@/services/screening/sanctions-ingest.js';
 import {
   buildFtsMatch,
+  comparisonForms,
   doubleMetaphone,
   FUZZY_STOPLIST,
   fold,
@@ -616,7 +617,11 @@ function stoplistCases(random: () => number, rounds: number): StoplistCase[] {
       const name = shuffle([capitalize(other), ...queryStoplisted]).join(' ');
       if (
         jaroWinkler(variant, other) >= STOPLIST_FUZZ_FLOOR ||
-        jaroWinkler(fold(query), fold(name)) >= STOPLIST_FUZZ_FLOOR
+        comparisonForms(query).some((queryForm) =>
+          comparisonForms(name).some(
+            (nameForm) => jaroWinkler(queryForm, nameForm) >= STOPLIST_FUZZ_FLOOR,
+          ),
+        )
       ) {
         continue;
       }

@@ -14,18 +14,29 @@
  */
 
 import { once } from 'node:events';
+import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { logger, schedulerService } from '@cyanheads/mcp-ts-core/utils';
+import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { logger, requestContextService, schedulerService } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig, resetServerConfig } from '@/config/server-config.js';
+import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
+import { FIXTURE_DESIGNATIONS } from '@/services/screening/fixtures.js';
 import {
   longRunSignal,
   REFRESH_HOURS,
+  refreshMirrors,
   SANCTIONS_REFRESH_JOB,
   scheduleSanctionsRefresh,
+  stopSanctionsRefresh,
 } from '@/services/screening/sanctions-refresh.js';
+import {
+  ScheduledRefreshProcess,
+  scheduledRefreshProcess,
+} from '@/services/screening/scheduled-refresh-process.js';
 import { NAME_TABLE } from '@/services/screening/schema.js';
 import {
   deltaFiles,
@@ -65,10 +76,12 @@ let server: Server;
 let harness: SeededService;
 /** While true, the UN document is sent up to its first record's close, then the transfer stalls. */
 let stallUn = true;
+let whenUnStalls: (() => void) | undefined;
 const requested: string[] = [];
 
 beforeEach(async () => {
   stallUn = true;
+  whenUnStalls = undefined;
   requested.length = 0;
   server = createServer((req, res) => {
     const path = req.url ?? '';
@@ -80,6 +93,7 @@ beforeEach(async () => {
     }
     res.writeHead(200, { 'content-type': 'application/xml' });
     if (path === '/un.xml' && stallUn) {
+      whenUnStalls?.();
       // Headers and part of the body, then silence — the connection stays open.
       res.write(feed[1].slice(0, feed[1].indexOf('</INDIVIDUAL>')));
       return;
@@ -97,6 +111,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.useRealTimers();
+  await scheduledRefreshProcess.stop();
   vi.restoreAllMocks();
   try {
     schedulerService.remove(SANCTIONS_REFRESH_JOB);
@@ -107,6 +122,7 @@ afterEach(async () => {
   server.closeAllConnections();
   server.close();
   for (const [env] of Object.values(FEEDS)) delete process.env[env];
+  delete process.env.SANCTIONS_REFRESH_SKIP_GLEIF;
 });
 
 function job() {
@@ -124,6 +140,82 @@ async function indexedDesignations(): Promise<string[]> {
 }
 
 describe('scheduled sanctions refresh', () => {
+  it('stops cron ticks before reaping the writer during teardown', async () => {
+    await scheduleSanctionsRefresh();
+    const order: string[] = [];
+    vi.spyOn(job().task, 'stop').mockImplementation(async () => {
+      order.push('cron stopped');
+    });
+    vi.spyOn(scheduledRefreshProcess, 'stop').mockImplementation(async () => {
+      order.push('writer reaped');
+    });
+    await stopSanctionsRefresh();
+    expect(order).toEqual(['cron stopped', 'writer reaped']);
+  });
+  it('repairs committed derived-index damage after forced termination before reporting success', async () => {
+    await harness.service.ingestDesignations(FIXTURE_DESIGNATIONS);
+    const writer = new ScheduledRefreshProcess({
+      entry: fileURLToPath(new URL('./fixtures/refresh-child.mjs', import.meta.url)),
+      graceMs: 50,
+    });
+    process.env.TEST_REFRESH_MODE = 'partial';
+    const interrupted = writer.run(
+      new AbortController().signal,
+      requestContextService.createRequestContext({ operation: 'interrupted' }),
+    );
+    const failed = expect(interrupted).rejects.toThrow('SIGKILL');
+    try {
+      await vi.waitFor(() =>
+        expect(existsSync(`${process.env.SANCTIONS_MIRROR_PATH}.child.locked`)).toBe(true),
+      );
+      await writer.stop();
+      await failed;
+      expect(await indexedDesignations()).toEqual([]);
+    } finally {
+      await writer.stop();
+      delete process.env.TEST_REFRESH_MODE;
+    }
+    stallUn = false;
+    process.env.SANCTIONS_REFRESH_SKIP_GLEIF = '1';
+    await scheduleSanctionsRefresh();
+    await job().task.execute();
+    const handle = await harness.service.designations.raw();
+    const committed = handle
+      .prepare<{ id: string }>('SELECT id FROM designation ORDER BY id')
+      .all()
+      .map((row) => row.id);
+    expect(committed).toContain('ofac_sdn:FX-1001');
+    expect(committed).toContain('un:UN-1');
+    expect(await indexedDesignations()).toEqual(committed);
+    expect(await harness.service.sanctionsReadiness()).toMatchObject({
+      ready: true,
+      status: 'complete',
+    });
+  });
+  it('keeps the serving service off the scheduled write path', async () => {
+    stallUn = false;
+    process.env.SANCTIONS_REFRESH_SKIP_GLEIF = '1';
+    const writes = vi.spyOn(harness.service, 'syncSanctions');
+    await scheduleSanctionsRefresh();
+    await job().task.execute();
+    expect(writes).not.toHaveBeenCalled();
+    expect(await indexedDesignations()).toContain('un:UN-1');
+    delete process.env.SANCTIONS_REFRESH_SKIP_GLEIF;
+  });
+  it('rebuilds committed pages after cancellation through the shared refresh contract', async () => {
+    await expect(
+      refreshMirrors(harness.service, AbortSignal.timeout(300), {
+        context: requestContextService.createRequestContext({ operation: 'characterization' }),
+        loadMissingExceptions: false,
+      }),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.Timeout });
+    expect(await indexedDesignations()).toEqual([
+      'eu:EU-1',
+      'ofac_consolidated:CONS-1',
+      'ofac_sdn:SDN-1',
+      'uk:UK-1',
+    ]);
+  });
   it('registers the job on the configured cron expression', async () => {
     await scheduleSanctionsRefresh();
     expect(job().schedule).toBe(getServerConfig().refreshCron);
@@ -135,7 +227,9 @@ describe('scheduled sanctions refresh', () => {
       signals.push(signal);
       return {} as Awaited<ReturnType<SeededService['service']['syncSanctions']>>;
     });
-    await scheduleSanctionsRefresh();
+    await scheduleSanctionsRefresh(undefined, async (signal, context) => {
+      await refreshMirrors(harness.service, signal, { context, loadMissingExceptions: false });
+    });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
 
     await job().task.execute();
@@ -156,7 +250,19 @@ describe('scheduled sanctions refresh', () => {
 
   it('ends a run whose transfer stalls as a logged failure, and runs the next tick', async () => {
     const errors = vi.spyOn(logger, 'error');
-    await scheduleSanctionsRefresh(() => AbortSignal.timeout(500));
+    const controller = new AbortController();
+    let firstRun = true;
+    // Bound the stalled transfer itself; child startup is measured separately.
+    whenUnStalls = () =>
+      setTimeout(
+        () => controller.abort(new DOMException('Transfer deadline.', 'TimeoutError')),
+        500,
+      );
+    await scheduleSanctionsRefresh(() => {
+      if (!firstRun) return AbortSignal.timeout(10_000);
+      firstRun = false;
+      return controller.signal;
+    });
 
     // First tick: UN's transfer stalls after its headers. The time bound ends the run.
     const started = performance.now();
@@ -194,7 +300,12 @@ describe('scheduled sanctions refresh', () => {
 
   it('records a run the time bound ended as exceeding it, naming the source it stopped in', async () => {
     const errors = vi.spyOn(logger, 'error');
-    await scheduleSanctionsRefresh(() => longRunSignal(0.5 / 3600));
+    const controller = new AbortController();
+    whenUnStalls = () => {
+      const deadline = longRunSignal(0.5 / 3600);
+      deadline.addEventListener('abort', () => controller.abort(deadline.reason), { once: true });
+    };
+    await scheduleSanctionsRefresh(() => controller.signal);
 
     await job().task.execute();
 
@@ -244,6 +355,15 @@ describe('scheduled refresh — the GLEIF leg', () => {
           dataset: 'lei2',
           record: { lei: LEI, legalName: 'A RENAMED' },
         },
+        {
+          at: '2026-09-25T05:00:00Z',
+          dataset: 'repex',
+          record: {
+            lei: LEI,
+            category: 'DIRECT_ACCOUNTING_CONSOLIDATION_PARENT',
+            reasons: ['NATURAL_PERSONS'],
+          },
+        },
       ],
       CONTENT_DATE,
       STARTS,
@@ -276,6 +396,30 @@ describe('scheduled refresh — the GLEIF leg', () => {
 
   const legalName = async () => (await harness.service.getLeiEntity(LEI))?.legalName;
 
+  it('refreshes a warmed reader and its exception-count cache on both output surfaces', async () => {
+    await seedGleif({ lei2: STARTS.LastDay, rr: STARTS.LastDay, repex: STARTS.LastDay });
+    expect((await harness.service.leiReadiness()).exceptionCount).toBe(0);
+    const before = await runToolContract(listSourcesTool, {});
+    expect(before.isError).not.toBe(true);
+    await scheduleSanctionsRefresh();
+    await job().task.execute();
+    expect(await legalName()).toBe('A RENAMED');
+    const after = await runToolContract(listSourcesTool, {});
+    expect(after.structuredContent).toMatchObject({
+      sanctionsReady: true,
+      leiAsOf: expect.not.stringMatching(SEEDED_AS_OF),
+      sources: expect.arrayContaining([
+        expect.objectContaining({ code: 'gleif', reportingExceptionCount: 1 }),
+      ]),
+    });
+    const text = after.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
+    expect(text).toContain('**Reporting exceptions:** 1');
+    expect(text).toContain(String((after.structuredContent as { leiAsOf: string }).leiAsOf));
+    expect(text).toContain(
+      String((after.structuredContent as { sanctionsAsOf: string }).sanctionsAsOf),
+    );
+  });
+
   it('applies the delta window after the sanctions lists, in the same run', async () => {
     await seedGleif({ lei2: STARTS.LastDay, rr: STARTS.LastDay, repex: STARTS.LastDay });
     const order: string[] = [];
@@ -290,7 +434,10 @@ describe('scheduled refresh — the GLEIF leg', () => {
       order.push('gleif');
       await ingest(batch);
     });
-    await scheduleSanctionsRefresh();
+    /** Instrument leg order directly; other GLEIF cases exercise the compiled child. */
+    await scheduleSanctionsRefresh(undefined, async (signal, context) => {
+      await refreshMirrors(harness.service, signal, { context, loadMissingExceptions: false });
+    });
 
     await job().task.execute();
 
@@ -309,6 +456,7 @@ describe('scheduled refresh — the GLEIF leg', () => {
   it('bounds the GLEIF leg by the same run signal', async () => {
     await seedGleif({ lei2: STARTS.LastDay, rr: STARTS.LastDay, repex: STARTS.LastDay });
     const week = deltaFiles([], CONTENT_DATE, STARTS);
+    const controller = new AbortController();
     gleif.serve(
       {
         lei2: { full: '', deltas: week.lei2 },
@@ -321,11 +469,15 @@ describe('scheduled refresh — the GLEIF leg', () => {
           const body = week.lei2.LastDay;
           res.writeHead(200, { 'content-type': 'application/xml' });
           res.write(body.slice(0, body.indexOf('<lei:LEIRecords>')));
+          setTimeout(
+            () => controller.abort(new DOMException('GLEIF transfer deadline.', 'TimeoutError')),
+            1_500,
+          );
         },
       },
     );
     const errors = vi.spyOn(logger, 'error');
-    await scheduleSanctionsRefresh(() => AbortSignal.timeout(1_500));
+    await scheduleSanctionsRefresh(() => controller.signal);
 
     const started = performance.now();
     await job().task.execute();
@@ -333,7 +485,7 @@ describe('scheduled refresh — the GLEIF leg', () => {
     expect(performance.now() - started).toBeLessThan(10_000);
     expect(errors).toHaveBeenCalledWith(
       `Job '${SANCTIONS_REFRESH_JOB}' failed.`,
-      expect.any(Error),
+      expect.objectContaining({ code: JsonRpcErrorCode.Timeout }),
       expect.anything(),
     );
     expect((await harness.service.leiReadiness()).completedAt).toBe(SEEDED_AS_OF);

@@ -36,6 +36,27 @@ function corpus(blocks: Record<string, readonly number[]>) {
 }
 
 describe('poolCandidates', () => {
+  it('reserves native ids before smaller supplemental blocks spend remaining capacity', () => {
+    const native = new Set(range(0, FUZZY_POOL_BUDGET - 1));
+    const { lookup } = corpus({ tooLarge: [9000, 9001], overlap: [0, 9002], small: [9003] });
+    const pool = poolCandidates(['tooLarge', 'overlap', 'small'], lookup, [], native);
+    expect(pool.ids.isSupersetOf(native)).toBe(true);
+    expect(pool.ids.size).toBe(FUZZY_POOL_BUDGET);
+    expect(pool.ids.has(9003)).toBe(true);
+    expect(pool.ids.has(9002)).toBe(false);
+    expect(pool.bounded).toBe(true);
+    expect(native.size).toBe(FUZZY_POOL_BUDGET - 1);
+  });
+
+  it('does not charge reserved ids again when an overlapping supplemental block fills the budget', () => {
+    const native = new Set(range(0, FUZZY_POOL_BUDGET - 1));
+    const { calls, lookup } = corpus({ overlap: [0, 9000] });
+    const pool = poolCandidates(['overlap'], lookup, [], native);
+    expect(pool.ids).toEqual(new Set([...native, 9000]));
+    expect(pool.bounded).toBe(false);
+    expect(calls).toEqual([['overlap']]);
+    expect(native).toEqual(new Set(range(0, FUZZY_POOL_BUDGET - 1)));
+  });
   it('pools every block whole when they fit, and reports nothing left out', () => {
     const { lookup } = corpus({ a: [1, 2], b: [2, 3], c: [] });
     const pool = poolCandidates(['a', 'b', 'c'], lookup);

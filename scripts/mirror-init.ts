@@ -68,6 +68,7 @@ async function main(): Promise<void> {
   );
   log.info('mirror:init — building the GLEIF exact-name index', ctx);
   await service.indexLeiExactNames();
+  await service.indexLeiFuzzyNames();
   log.info('mirror:init — complete', ctx);
   await service.close();
 }
