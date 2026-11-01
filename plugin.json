@@ -1,0 +1,36 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "sanctions-screening-mcp-server",
+  "version": "0.5.1",
+  "description": "Screen names against eleven OFAC, EU, UK, UN, BIS, and State sanctions and export-control lists and resolve legal entities against GLEIF, matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/sanctions-screening-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/sanctions-screening-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": [
+    "sanctions",
+    "sanctions-screening",
+    "ofac",
+    "ofac-sdn",
+    "aml",
+    "kyc",
+    "compliance",
+    "watchlist",
+    "gleif",
+    "lei",
+    "beneficial-ownership",
+    "due-diligence",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ]
+}

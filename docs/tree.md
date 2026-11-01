@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-10-20 07:29:43
+Generated on: 2026-11-01 03:21:08
 
 ```text
 sanctions-screening-mcp-server/
@@ -31,15 +31,22 @@ sanctions-screening-mcp-server/
 │   ├── 0.5.x/
 │   └── template.md
 ├── docs/
-│   └── design.md
+│   ├── design.md
+│   └── mirror.md
 ├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
+│   ├── add-export/
+│   │   └── SKILL.md
 │   ├── add-prompt/
+│   │   └── SKILL.md
+│   ├── add-provider/
 │   │   └── SKILL.md
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -117,8 +124,9 @@ sanctions-screening-mcp-server/
 │   │   ├── references/
 │   │   │   └── outline-on-overflow.md
 │   │   └── SKILL.md
-│   └── tool-defs-analysis/
-│       └── SKILL.md
+│   ├── tool-defs-analysis/
+│   │   └── SKILL.md
+│   └── README.md
 ├── scripts/
 │   ├── _mirror-context.ts
 │   ├── build-changelog.ts
@@ -211,6 +219,8 @@ sanctions-screening-mcp-server/
 │   │   └── vet-counterparty.prompt.test.ts
 │   ├── resources/
 │   │   └── resource-contracts.test.ts
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── _gleif-publication.ts
 │   │   ├── _helpers.ts
@@ -253,7 +263,9 @@ sanctions-screening-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

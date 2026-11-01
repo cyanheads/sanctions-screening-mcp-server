@@ -2,9 +2,9 @@
 
 **Server:** sanctions-screening-mcp-server
 **Version:** 0.5.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1 (via the framework)
+**MCP SDK:** `@modelcontextprotocol/server` ^2.4.0 (via the framework)
 **Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -13,17 +13,21 @@
 
 ## What This Server Is
 
-Entity screening and resolution over the world's open sanctions data plus the global legal-entity registry, served offline. It screens a name — or looks up an identifier such as an IMO number, SWIFT/BIC code, wallet address, or document number exactly — against the consolidated OFAC (SDN + Consolidated), EU, UK (UKSL), and UN sanctions lists at once, and resolves legal entities against the GLEIF LEI database with corporate-ownership tracing.
+Entity screening and resolution over eleven sanctions and export-control lists plus the GLEIF legal-entity registry, served offline. The lists are OFAC SDN/Consolidated, EU, UK, UN, BIS Entity/Denied Persons/Unverified/Military End User, and State ITAR Debarred/Nonproliferation Sanctions. Name and exact-identifier screening share this corpus; GLEIF supplies accounting-consolidation relationship tracing.
 
 **Screening aid, not a compliance determination.** Every tool returns *potential matches* with a transparent score and source provenance — never a verdict. This framing is load-bearing: it lives in `SCREENING_CAVEAT` (`src/mcp-server/tools/definitions/_shared.ts`), in every screening tool's description, and in its output. A hit is a candidate to verify against the official source; an empty result is never a clearance. Preserve it in any edit to the surface.
 
-**The data path is a local mirror, not a live API.** All five sources are bulk, keyless, and clear for redistribution. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys) and a per-identifier `designation_identifier` index, and a GLEIF `lei_entity` mirror with a per-name `lei_name` index (legal, other, and transliterated names, typed) and a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
+**The data path is a local mirror, not a live API.** All eleven watchlists and GLEIF use keyless bulk downloads. The six BIS/State lists share one CSL download per sync; skip CSL Treasury copies, preserve provider id verbatim, and retain missing type as unknown. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys) and a per-identifier `designation_identifier` index, and a GLEIF `lei_entity` mirror with a per-name `lei_name` index (legal, other, and transliterated names, typed) and a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
 
 **Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in, or runs on its own over each selected list a strict screen found nothing on (all of them when strict found nothing anywhere). Surface only real signal: `matchType` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains. Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
 
 ---
 
 ## Core Rules
+
+- Source membership derives from `SOURCE_CODES`; keep default screens, cross-references, source listings, and schemas aligned automatically. OFAC grouping remains limited to its two direct feeds. CSL restrictions, notices, end dates, and provenance URLs remain labeled features, never inferred legal status.
+- Ownership traces page nodes, then edges, then boundaries (50 default, 100 maximum records; soft 64-KiB target with intact oversized records). Drain a segment before same-side boundary re-rooting; deduplicate branch roots and edges. Topology fingerprints invalidate changed graphs; entity and screening values remain current rather than frozen. Completeness covers loaded accounting-consolidation data only.
+- `sanctionsAsOf` is the last successful local all-list sync, not upstream publication freshness. Existing mirrors need `mirror:refresh` to load newly supported sources; configured source rows can have zero stored records before that refresh.
 
 - **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch`. Plain `Error` is fine; the framework catches, classifies, and formats. Use error factories (`notFound()`, `validationError()`, etc.) when the error code matters.
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
@@ -291,6 +295,7 @@ src/
       screening-service.ts              # Owns the local mirrors + matching engine (init/accessor pattern)
       schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_name/lei_relationship schema + MirrorService defs + each spec's v2 migration
       sanctions-ingest.ts               # OFAC/EU/UK/UN streaming ingesters (record-at-a-time XML → normalized designations)
+      csl-ingest.ts                     # Shared trade.gov download and per-list spools for six BIS/State lists
       gleif-ingest.ts                   # GLEIF files — publication index, header-first streaming of L1/L2/reporting-exception files, deletion markers
       gleif-sync.ts                     # GLEIF lifecycles — golden-copy load + checkpointed delta refresh (window per dataset, one commit)
       ingest-validation.ts              # Shared drop predicate + per-source rejection tally — no source identity or no usable name means no row
@@ -336,9 +341,20 @@ scripts/
 
 ## Skills
 
-Skills are modular instructions in `framework-skills/` at the project root. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. The directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand these development skills to every agent that installs it. Keep `skills/` free for skills meant for those agents.
+Two skill trees live at the project root, written for different readers:
 
-**Agent skill directory:** Copy skills into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
+| Tree | For | Written by |
+|:-----|:----|:-----------|
+| `framework-skills/` | The agent developing this server — framework skills (`metadata.audience: external`) plus any development-time skills of the server's own | `init` and the `maintenance` sync (framework skills); you (your own) |
+| `skills/` | The agents that install the server and call its tools — tool chains, identifier sources, gates | You, deliberately, with the `add-skill` skill. Absent by default; usually none is needed |
+
+Development skills are modular instructions. Read them directly when a task matches — e.g., `framework-skills/add-tool/SKILL.md` when adding a tool. `bun run list-skills` prints the full registry. Their directory is deliberately not `skills/`: Claude Code and Codex auto-load a plugin's root `skills/`, so a server that ships `.claude-plugin/` or `.codex-plugin/` would hand them to every agent that installs it.
+
+A published skill in root `skills/` reaches plugin installs and the `.mcpb` bundle as-is, ships in the npm package and the Docker image, and reaches MCP clients when the server opts in with `createApp({ skills: 'skills' })`. `lint:packaging` validates the tree.
+
+`skills/sanctions-screening-guide/SKILL.md` is the published consumer guide: identity confirmation, ownership continuation, capped cross-reference recovery, and screening uncertainty.
+
+**Agent skill directory:** Copy `framework-skills/` into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
 Available skills:
 
@@ -350,6 +366,7 @@ Available skills:
 | `add-app-tool` | Scaffold an MCP App tool + paired UI resource |
 | `add-resource` | Scaffold a new resource definition |
 | `add-prompt` | Scaffold a new prompt definition |
+| `add-skill` | Author a skill the server publishes in root `skills/` for the agents that use it — when one earns its place, structure, validation, delivery |
 | `add-service` | Scaffold a new service integration |
 | `add-test` | Scaffold test file for a tool, resource, or service |
 | `field-test` | Exercise tools/resources/prompts with real inputs, verify behavior, report issues |
@@ -367,11 +384,11 @@ Available skills:
 | `techniques` | Catalog of response/data-shaping techniques — overflow handling, payload shaping, retrieval patterns |
 | `api-auth` | Auth modes, scopes, JWT/OAuth |
 | `api-canvas` | DataCanvas: register tabular data, run SQL, export, plus the `spillover()` helper for big result sets — Tier 3 opt-in |
-| `api-mirror` | MirrorService — persistent self-refreshing local mirror of a bulk upstream dataset (embedded SQLite + FTS5). The data path this server is built on. |
 | `api-config` | AppConfig, parseConfig, env vars |
 | `api-context` | Context interface, RequestContext, logger, state, multi-round-trip input |
 | `api-errors` | McpError, JsonRpcErrorCode, error patterns |
 | `api-linter` | Definition linter rule catalog — invoked by `bun run lint:mcp` and `devcheck` |
+| `api-mirror` | MirrorService: persistent self-refreshing local mirror (embedded SQLite + FTS5) of a bulk upstream dataset — Tier 3 opt-in |
 | `api-services` | LLM, Speech, Graph services |
 | `api-testing` | createMockContext, test patterns |
 | `api-utils` | Formatting, parsing, security, pagination, scheduling, telemetry helpers |
