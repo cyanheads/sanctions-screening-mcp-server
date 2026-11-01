@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-11-01 03:21:08
+Generated on: 2026-11-01 03:59:25
 
 ```text
 sanctions-screening-mcp-server/
@@ -29,6 +29,7 @@ sanctions-screening-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
+│   ├── 0.6.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -36,11 +37,7 @@ sanctions-screening-mcp-server/
 ├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
-│   ├── add-export/
-│   │   └── SKILL.md
 │   ├── add-prompt/
-│   │   └── SKILL.md
-│   ├── add-provider/
 │   │   └── SKILL.md
 │   ├── add-resource/
 │   │   └── SKILL.md
@@ -150,6 +147,9 @@ sanctions-screening-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── sanctions-screening-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -180,6 +180,7 @@ sanctions-screening-mcp-server/
 │   │       ├── candidate-pool.ts
 │   │       ├── country-codes.ts
 │   │       ├── cross-reference.ts
+│   │       ├── csl-ingest.ts
 │   │       ├── fixtures.ts
 │   │       ├── gleif-ingest.ts
 │   │       ├── gleif-sync.ts
@@ -222,12 +223,14 @@ sanctions-screening-mcp-server/
 │   ├── scripts/
 │   │   └── bundle-agent-docs.test.ts
 │   ├── services/
+│   │   ├── _csl-fixture.ts
 │   │   ├── _gleif-publication.ts
 │   │   ├── _helpers.ts
 │   │   ├── _lookup-corpus.ts
 │   │   ├── candidate-pool.test.ts
 │   │   ├── country-codes.test.ts
 │   │   ├── cross-reference.test.ts
+│   │   ├── csl-ingest.test.ts
 │   │   ├── gleif-sync.test.ts
 │   │   ├── identifier-matching.test.ts
 │   │   ├── ingest-parsers.test.ts

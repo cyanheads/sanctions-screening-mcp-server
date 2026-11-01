@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/sanctions-screening-mcp-server",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "mcpName": "io.github.cyanheads/sanctions-screening-mcp-server",
   "description": "Screen names against eleven OFAC, EU, UK, UN, BIS, and State sanctions and export-control lists and resolve legal entities against GLEIF, matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.",
   "type": "module",

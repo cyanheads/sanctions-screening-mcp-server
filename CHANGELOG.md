@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-31
+
+Screen BIS and State export-control lists and continue ownership investigations across bounded pages.
+
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-10-20
 
 Fuzzy recall across early typos and Russian comparison forms, with scheduled refreshes isolated from serving requests.
