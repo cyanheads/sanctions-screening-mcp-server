@@ -1,7 +1,8 @@
 /**
  * @fileoverview Sanctions ingesters — one per source (OFAC SDN, OFAC
- * Consolidated, EU FSF, UK Sanctions List, UN SC Consolidated). Each streams its
- * source file, lifts out one record element at a time, and maps it onto the
+ * Consolidated, EU FSF, UK Sanctions List, UN SC Consolidated, and six BIS/State
+ * CSL lists). XML adapters stream record fragments; CSL adapters share one
+ * complete-download validation and replay bounded temporary spools. Both map onto the
  * common {@link NormalizedDesignation} schema. The {@link createSanctionsSync}
  * factory wires them into the MirrorService `sync` generator: each refresh
  * re-harvests every source in full (the combined corpus is tens of thousands of
@@ -40,7 +41,9 @@
 import { serviceUnavailable, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { createCslPreparation } from '@/services/screening/csl-ingest.js';
 import {
+  componentText,
   createRejections,
   type IngestRejections,
   isUsableName,
@@ -165,29 +168,6 @@ function opt<K extends string>(key: K, value: string | undefined): Record<K, str
 // published component is skipped; and nothing is inferred from another group. A
 // date is ISO 8601 at the precision its source published, never widened to a day
 // it did not name; a value with no ISO form stays as published.
-
-/**
- * Whole values the sources write where they have nothing to publish: the EU's
- * `UNKNOWN` country, the UN's `na`, and the UK's `N/A` passport number. Matched
- * case-insensitively against the whole component, with `.` and `/` dropped so
- * every spelling of "not available" (`N/A`, `n.a.`) reads as `na`. Names never
- * pass through here, so a name part such as the surname `Na` is untouched; and
- * no detail read takes a country *code* (every country is read by name), so
- * Namibia's ISO code `NA` never reaches this test.
- */
-const PLACEHOLDER_VALUES = new Set(['na', 'unknown']);
-
-/**
- * One published detail component: text carrying a letter or digit that is not a
- * placeholder, so a lone `-`, `UNKNOWN`, `na`, or `N/A` reads as absent. The
- * entity cross-reference applies the same rule to a GLEIF registration number,
- * which publishes `N/A` and `n.a.` the same way.
- */
-export function componentText(value: unknown): string | undefined {
-  const text = asText(value);
-  if (!text || PLACEHOLDER_VALUES.has(text.toLowerCase().replace(/[./]/gu, ''))) return;
-  return /[\p{L}\p{N}]/u.test(text) ? text : undefined;
-}
 
 /**
  * The elements at `path` below `node` (one element, or an array of them),
@@ -2047,16 +2027,19 @@ function unListedOn(text: string | undefined): string | undefined {
 
 // ─── Registry + sync factory ─────────────────────────────────────────────────
 
-/** All five sanctions ingesters, configured from the current server config. */
-export function buildSanctionsIngesters(): SanctionsIngester[] {
+/** All sanctions ingesters, with run-owned CSL scratch cleanup. */
+export function buildSanctionsIngesters() {
   const cfg = getServerConfig();
-  return [
+  const csl = createCslPreparation();
+  const ingesters: SanctionsIngester[] = [
     buildOfacIngester('ofac_sdn', () => cfg.ofacSdnUrl),
     buildOfacIngester('ofac_consolidated', () => cfg.ofacConsolidatedUrl),
     buildEuIngester(),
     buildUkIngester(),
     buildUnIngester(),
+    ...csl.ingesters,
   ];
+  return Object.assign(ingesters, { dispose: csl.dispose });
 }
 
 /** One source's harvest report plus what the sync removed for it. */
@@ -2193,63 +2176,68 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
     records: Record<string, string | number | null>[];
     tombstones?: string[];
   }> {
-    const ingesters = options.ingesters ?? buildSanctionsIngesters();
+    const owned = buildSanctionsIngesters();
+    const ingesters = options.ingesters ?? owned;
     const stamp = new Date().toISOString();
     const failures: SourceSyncFailure[] = [];
 
-    for (const ingester of ingesters) {
-      if (ctx.signal.aborted) return;
-      try {
-        const kept = new Set<string>();
-        let page: Record<string, string | number | null>[] = [];
-        for await (const designation of ingester.harvest(ctx.signal)) {
-          kept.add(designation.id);
-          page.push(toDesignationRow(designation));
-          if (page.length >= pageSize) {
-            yield { records: await settled(ingester, page), checkpoint: stamp };
-            page = [];
+    try {
+      for (const ingester of ingesters) {
+        if (ctx.signal.aborted) return;
+        try {
+          const kept = new Set<string>();
+          let page: Record<string, string | number | null>[] = [];
+          for await (const designation of ingester.harvest(ctx.signal)) {
+            kept.add(designation.id);
+            page.push(toDesignationRow(designation));
+            if (page.length >= pageSize) {
+              yield { records: await settled(ingester, page), checkpoint: stamp };
+              page = [];
+            }
           }
-        }
-        // The trailing partial page must be yielded before the deferred columns
-        // are applied — the runner persists a page before resuming this generator,
-        // so this is what puts the source's last rows in reach of the UPDATE.
-        if (page.length > 0) yield { records: await settled(ingester, page), checkpoint: stamp };
+          // The trailing partial page must be yielded before the deferred columns
+          // are applied — the runner persists a page before resuming this generator,
+          // so this is what puts the source's last rows in reach of the UPDATE.
+          if (page.length > 0) yield { records: await settled(ingester, page), checkpoint: stamp };
 
-        if (ingester.defersFields()) {
-          await options.applyDeferredFields(ingester.source, ingester.deferredFields(), kept);
-        }
+          if (ingester.defersFields()) {
+            await options.applyDeferredFields(ingester.source, ingester.deferredFields(), kept);
+          }
 
-        const stale = await options.staleDesignationIds(ingester.source, kept);
-        // Every kept id was just upserted, so the source now stores kept + stale rows.
-        // A document that yielded no record would remove all of them, so it never passes.
-        const withinBound = stale.length <= MAX_PRUNE_SHARE * (kept.size + stale.length);
-        const pruned = withinBound ? stale : [];
-        for (let at = 0; at < pruned.length; at += pageSize) {
-          yield { records: [], tombstones: pruned.slice(at, at + pageSize), checkpoint: stamp };
+          const stale = await options.staleDesignationIds(ingester.source, kept);
+          // Every kept id was just upserted, so the source now stores kept + stale rows.
+          // A document that yielded no record would remove all of them, so it never passes.
+          const withinBound = stale.length <= MAX_PRUNE_SHARE * (kept.size + stale.length);
+          const pruned = withinBound ? stale : [];
+          for (let at = 0; at < pruned.length; at += pageSize) {
+            yield { records: [], tombstones: pruned.slice(at, at + pageSize), checkpoint: stamp };
+          }
+          options.onSourceReport?.({
+            ...ingester.report(),
+            pruned: pruned.length,
+            withheld: stale.length - pruned.length,
+          });
+        } catch (err) {
+          if (ctx.signal.aborted) throw abortedHarvest(ctx.signal, ingester.source, err);
+          const failure: SourceSyncFailure = {
+            source: ingester.source,
+            accepted: ingester.report().accepted,
+            error: err instanceof Error ? err.message : String(err),
+          };
+          failures.push(failure);
+          options.onSourceFailed?.(failure);
         }
-        options.onSourceReport?.({
-          ...ingester.report(),
-          pruned: pruned.length,
-          withheld: stale.length - pruned.length,
-        });
-      } catch (err) {
-        if (ctx.signal.aborted) throw abortedHarvest(ctx.signal, ingester.source, err);
-        const failure: SourceSyncFailure = {
-          source: ingester.source,
-          accepted: ingester.report().accepted,
-          error: err instanceof Error ? err.message : String(err),
-        };
-        failures.push(failure);
-        options.onSourceFailed?.(failure);
       }
-    }
 
-    if (failures.length > 0) {
-      const codes = failures.map((f) => f.source);
-      throw serviceUnavailable(
-        `Sanctions harvest failed for ${codes.join(', ')} (${failures.length} of ${ingesters.length} sources); nothing was removed for a failed source. ${failures.map((f) => `${f.source}: ${f.error}`).join('; ')}`,
-        { failedSources: codes },
-      );
+      if (failures.length > 0) {
+        const codes = failures.map((f) => f.source);
+        throw serviceUnavailable(
+          `Sanctions harvest failed for ${codes.join(', ')} (${failures.length} of ${ingesters.length} sources); nothing was removed for a failed source. ${failures.map((f) => `${f.source}: ${f.error}`).join('; ')}`,
+          { failedSources: codes },
+        );
+      }
+    } finally {
+      owned.dispose();
     }
   };
 }

@@ -246,11 +246,24 @@ describe('per-list fuzzy completion on both surfaces (#59)', () => {
     ).toEqual(['eu:POU-1 strong', 'ofac_sdn:PUT-1 approximate', 'uk:PUT-UK approximate']);
     expect(structured).toMatchObject({
       matchModeUsed: 'strict',
-      fuzzySources: ['ofac_sdn', 'ofac_consolidated', 'uk', 'un'],
+      fuzzySources: [
+        'ofac_sdn',
+        'ofac_consolidated',
+        'uk',
+        'un',
+        'bis_el',
+        'bis_dpl',
+        'bis_uvl',
+        'bis_meu',
+        'state_dtc',
+        'state_acn',
+      ],
       totalAvailable: 3,
       totalAvailableBasis: 'lower_bound',
     });
-    expect(text).toContain('**fuzzySources:** ofac_sdn, ofac_consolidated, uk, un');
+    expect(text).toContain(
+      '**fuzzySources:** ofac_sdn, ofac_consolidated, uk, un, bis_el, bis_dpl, bis_uvl, bis_meu, state_dtc, state_acn',
+    );
     expect(text).toContain('### Putin Vladimir Vladimirovich — approximate');
   });
 

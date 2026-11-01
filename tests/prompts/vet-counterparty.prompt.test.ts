@@ -74,6 +74,22 @@ describe('vetCounterpartyPrompt', () => {
     expect(text).toContain('US');
   });
 
+  it('drains segment pages before side-specific boundary recovery and preserves uncertainty', async () => {
+    const messages = await vetCounterpartyPrompt.generate({ name: 'Acme Corp' });
+    const text = messages[0]!.content.type === 'text' ? messages[0]!.content.text : '';
+    expect(text).toContain('Drain nextCursor while hasMore is true');
+    expect(text).toContain('Then re-root every boundary');
+    expect(text).toContain('Deduplicate queued (lei, direction) roots and edge identities');
+    expect(text).toContain('invalid_cursor or stale_cursor');
+    expect(text).toContain('not an immutable snapshot');
+    expect(text).toContain('sanctionsScreen.hasMore');
+    expect(text).toContain('not necessarily omitted strict cross-reference hits');
+    expect(text).toContain('all eleven loaded sanctions and export-control lists');
+    expect(text).toContain('official agency lists and Federal Register publications');
+    expect(text).toContain('not purported upstream publication freshness');
+    expect(text).toContain('not endorsed or certified by the International Trade Administration');
+  });
+
   it('describes the jurisdiction argument as a country that includes its subdivisions (#36)', () => {
     const description = vetCounterpartyPrompt.args!.shape.jurisdiction.description ?? '';
     expect(description).toMatch(/subdivision/i);

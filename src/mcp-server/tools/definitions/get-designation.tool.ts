@@ -11,7 +11,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getScreeningService } from '@/services/screening/screening-service.js';
-import { SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
+import { SOURCE_CODES, SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
 import { SCREENING_CAVEAT } from './_shared.js';
 
 export const getDesignationTool = tool('sanctions_get_designation', {
@@ -20,9 +20,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     "Fetch the full record for one sanctions designation by source list + entry ID or the list's published reference number — the drill-in after sanctions_screen_name or sanctions_screen_identifier surfaces a candidate, or the lookup for a reference a notice cites (UN QDe.004, EU EU.27.28, UK OFSI Group ID). Returns all published aliases, identifiers (passport, national ID, tax and registration numbers, SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, websites), addresses, dates and places of birth at the precision the source published, nationalities, descriptive features (a vessel's flag, type, and tonnage; an aircraft's model and operator; a title or gender; sanctions notes), sanctioning program, legal basis, and designation date. The record reflects exactly what the source published; missing fields mean the source omitted them. This is a screening aid — the designation record supports a compliance review, it is not itself a determination.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
-    source: z
-      .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])
-      .describe('Which source list the entry belongs to.'),
+    source: z.enum(SOURCE_CODES).describe('Which source list the entry belongs to.'),
     entryId: z
       .string()
       .min(1)
@@ -31,9 +29,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       ),
   }),
   output: z.object({
-    source: z
-      .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])
-      .describe('Source list the entry belongs to.'),
+    source: z.enum(SOURCE_CODES).describe('Source list the entry belongs to.'),
     sourceLabel: z.string().describe('Human-readable name of the source list.'),
     sourceEntryId: z.string().describe("The source list's own entry ID."),
     referenceNumber: z

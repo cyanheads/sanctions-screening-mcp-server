@@ -1,6 +1,6 @@
 /**
  * @fileoverview `sanctions_screen_name` — the 80% entry point. Screens a name
- * against all loaded watchlists (OFAC SDN + Consolidated, EU, UK, UN) at once,
+ * against loaded sanctions and export-control watchlists at once,
  * alias- and fuzzy-aware, and returns scored potential matches with source
  * provenance. This is decision support, NOT a compliance determination: a hit is
  * a candidate to verify against the official source, and an empty result is
@@ -21,7 +21,7 @@ import {
   SCREENING_CAVEAT,
 } from './_shared.js';
 
-const SOURCE_ENUM = z.enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un']);
+const SOURCE_ENUM = z.enum(SOURCE_CODES);
 
 /** The query words a completion candidate need not cover — `FUZZY_STOPLIST` in words. */
 const UNCOUNTED_WORDS =
@@ -91,7 +91,7 @@ const HitSchema = z
 
 export const screenNameTool = tool('sanctions_screen_name', {
   title: 'sanctions-screening-mcp-server: screen name',
-  description: `Screen a name (person, company, vessel, aircraft) against all loaded sanctions watchlists at once — OFAC SDN + Consolidated, EU, UK, and UN — alias- and fuzzy-aware. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias; an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists. Strict mode (default) matches exact-normalized then all-tokens-present, then runs a fuzzy pass over each selected list strict finds nothing on: a full pass when strict finds nothing on any list, otherwise one that adds only candidates covering every word of the name other than ${UNCOUNTED_WORDS}, ranked after the strict hits. Fuzzy mode runs the fuzzy pass over every selected list. It adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score; fuzzySources names the lists it searched. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."`,
+  description: `Screen a name (person, company, vessel, aircraft) against loaded sanctions and export-control watchlists — OFAC SDN + Consolidated, EU, UK, UN, and the six BIS/State CSL lists — alias- and fuzzy-aware. Check sanctions_list_sources for coverage before interpreting an empty result; zero-record CSL lists are not loaded. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias; an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists. Strict mode (default) matches exact-normalized then all-tokens-present, then runs a fuzzy pass over each selected list strict finds nothing on: a full pass when strict finds nothing on any list, otherwise one that adds only candidates covering every word of the name other than ${UNCOUNTED_WORDS}, ranked after the strict hits. Fuzzy mode runs the fuzzy pass over every selected list. It adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score; fuzzySources names the lists it searched. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z

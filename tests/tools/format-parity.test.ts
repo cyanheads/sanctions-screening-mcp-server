@@ -622,6 +622,17 @@ describe('sanctions_trace_ownership format()', () => {
     role: 'root',
   } as const;
 
+  /** Unpaged fixture metadata; individual paging cases override these fields. */
+  const segment = {
+    boundaries: [],
+    totalAvailable: 1,
+    totalAvailableBasis: 'exact',
+    hasMore: false,
+    truncationReasons: [],
+    missingEntityCount: 0,
+    byteTargetExceeded: false,
+  };
+
   /** A node's entity line in the Entities section, plus every indented line under it. */
   const nodeLines = (text: string, lei: string): string[] => {
     const lines = text.split('\n');
@@ -633,6 +644,7 @@ describe('sanctions_trace_ownership format()', () => {
 
   it('renders nodes, per-node hits, edges, and the screened/flagged counts', () => {
     const text = render(traceOwnershipTool, {
+      ...segment,
       rootLei: root.lei,
       complete: true,
       truncated: false,
@@ -757,6 +769,7 @@ describe('sanctions_trace_ownership format()', () => {
   it('names every list of a grouped OFAC hit on a node (issue #61)', () => {
     const legal = { input: 'legal_name', value: root.legalName };
     const text = render(traceOwnershipTool, {
+      ...segment,
       rootLei: root.lei,
       complete: true,
       truncated: false,
@@ -830,6 +843,7 @@ describe('sanctions_trace_ownership format()', () => {
       },
     });
     const text = render(traceOwnershipTool, {
+      ...segment,
       rootLei: root.lei,
       complete: true,
       truncated: false,
@@ -936,6 +950,7 @@ describe('sanctions_trace_ownership format()', () => {
 
   it('renders an unscreened node on one line with its parent statuses and no screen claim', () => {
     const text = render(traceOwnershipTool, {
+      ...segment,
       rootLei: root.lei,
       complete: true,
       truncated: false,
@@ -980,6 +995,9 @@ describe('sanctions_trace_ownership format()', () => {
 
   it('renders an incomplete graph as truncated and names its unhydrated nodes', () => {
     const text = render(traceOwnershipTool, {
+      ...segment,
+      truncationReasons: ['depth_limit'],
+      missingEntityCount: 1,
       rootLei: root.lei,
       complete: false,
       truncated: true,
@@ -1019,6 +1037,8 @@ describe('sanctions_trace_ownership format()', () => {
       screenedInputs: [],
     });
     const text = render(traceOwnershipTool, {
+      ...segment,
+      missingEntityCount: 2,
       rootLei: root.lei,
       complete: false,
       truncated: false,
@@ -1073,6 +1093,7 @@ describe('sanctions_trace_ownership format()', () => {
 
   it('drops the edges section and per-node hit lines when unscreened and isolated', () => {
     const text = render(traceOwnershipTool, {
+      ...segment,
       rootLei: root.lei,
       complete: true,
       truncated: false,

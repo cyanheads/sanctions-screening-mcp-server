@@ -10,8 +10,14 @@
 
 import { z } from '@cyanheads/mcp-ts-core';
 import { getServerConfig } from '@/config/server-config.js';
+import { CSL_SOURCE_CODES } from '@/services/screening/csl-ingest.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
-import { SOURCE_LABELS, type SourceCode, UNKNOWN_NAME_TYPE } from '@/services/screening/types.js';
+import {
+  SOURCE_CODES,
+  SOURCE_LABELS,
+  type SourceCode,
+  UNKNOWN_NAME_TYPE,
+} from '@/services/screening/types.js';
 import type { SourcesPayloadSchema } from './list-sources.tool.js';
 
 /**
@@ -20,7 +26,7 @@ import type { SourcesPayloadSchema } from './list-sources.tool.js';
  * is not a finding of fact, and an empty result is not a clearance.
  */
 export const SCREENING_CAVEAT =
-  'Screening aid, not a compliance determination. Results are potential matches to verify against the official source — a hit is not a finding of fact, and an empty result is not a clearance. Real sanctions compliance is a legal process this server feeds, not one it performs.';
+  'Screening aid, not a compliance determination. Results are potential matches to verify against the official source — a hit is not a finding of fact, and an empty result is not a clearance. Real sanctions compliance is a legal process this server feeds, not one it performs. Check sanctions_list_sources for coverage: zero-record CSL lists are not loaded and were not screened. Verify CSL export-control entries against agency lists and Federal Register publications. This product uses the International Trade Administration’s Data API but is not endorsed or certified by the International Trade Administration.';
 
 /**
  * The most characters and words `sanctions_screen_name` and
@@ -43,6 +49,12 @@ export const SOURCE_LICENSES: Record<SourceCode, string> = {
   eu: 'EU consolidated list — freely redistributable',
   uk: 'Open Government Licence v3.0 (attribution required)',
   un: 'Freely redistributable',
+  bis_el: 'US Government public domain; ITA terms: https://developer.trade.gov/terms-of-service',
+  bis_dpl: 'US Government public domain; ITA terms: https://developer.trade.gov/terms-of-service',
+  bis_uvl: 'US Government public domain; ITA terms: https://developer.trade.gov/terms-of-service',
+  bis_meu: 'US Government public domain; ITA terms: https://developer.trade.gov/terms-of-service',
+  state_dtc: 'US Government public domain; ITA terms: https://developer.trade.gov/terms-of-service',
+  state_acn: 'US Government public domain; ITA terms: https://developer.trade.gov/terms-of-service',
 };
 
 /** GLEIF golden copy is CC0 — cited but no attribution required. */
@@ -64,6 +76,12 @@ export function sourceUrls(): Record<SourceCode, string> {
     eu: cfg.euFsfUrl,
     uk: cfg.ukSanctionsUrl,
     un: cfg.unScUrl,
+    bis_el: cfg.cslUrl,
+    bis_dpl: cfg.cslUrl,
+    bis_uvl: cfg.cslUrl,
+    bis_meu: cfg.cslUrl,
+    state_dtc: cfg.cslUrl,
+    state_acn: cfg.cslUrl,
   };
 }
 
@@ -84,8 +102,18 @@ export async function buildSourcesPayload(svc: ScreeningService): Promise<Source
     svc.leiNamesIndexed(),
   ]);
   const urlFor = sourceUrls();
+  const missingCsl = counts
+    .filter(
+      (source) => source.recordCount === 0 && CSL_SOURCE_CODES.some((code) => code === source.code),
+    )
+    .map((source) => source.code);
   return {
     sanctionsReady: sanctions.ready,
+    ...(missingCsl.length
+      ? {
+          coverageNotice: `CSL export-control coverage is not loaded for ${missingCsl.join(', ')}; zero records do not mean no listed parties. Mirror readiness and sanctionsAsOf can predate these lists. Run SANCTIONS_REFRESH_SKIP_GLEIF=1 bun run mirror:refresh to load them, then check sanctions_list_sources again.`,
+        }
+      : {}),
     ...(sanctions.completedAt ? { sanctionsAsOf: sanctions.completedAt } : {}),
     leiReady: lei.ready,
     ...(lei.completedAt ? { leiAsOf: lei.completedAt } : {}),
@@ -155,7 +183,7 @@ export const MatchedIdentifierSchema = z
  * files; a screen of both lists returns that party as one hit naming both.
  */
 export const HitSourcesSchema = z
-  .array(z.enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un']))
+  .array(z.enum(SOURCE_CODES))
   .describe(
     'Every screened list this candidate is on, in list order: one list, or ofac_sdn and ofac_consolidated together for an OFAC party both OFAC lists publish under one entry ID — one hit, not two. Read this, not source, for every list; the entry ID resolves in sanctions_get_designation under each.',
   );

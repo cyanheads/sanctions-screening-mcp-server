@@ -11,7 +11,7 @@ import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
-import { SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
+import { SOURCE_CODES, SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
 
 /**
  * A URI template variable as the caller meant it. The variable reaches the
@@ -40,9 +40,7 @@ export const designationResource = resource('sanctions://designation/{source}/{e
   // cache would serve it past that gate.
   cacheHint: { ttlMs: 3_600_000, cacheScope: 'private' },
   params: z.object({
-    source: z
-      .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])
-      .describe('Source list the entry belongs to.'),
+    source: z.enum(SOURCE_CODES).describe('Source list the entry belongs to.'),
     entryId: z
       .string()
       .min(1)

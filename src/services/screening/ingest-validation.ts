@@ -43,3 +43,21 @@ export interface IngestRejections {
 export function createRejections(): IngestRejections {
   return { missingIdentifier: 0, unusableName: 0 };
 }
+
+/**
+ * A published detail component carrying a letter or digit, excluding the whole
+ * placeholders UNKNOWN and N/A. Not for names or country codes (NA is Namibia).
+ * XML scalar wrappers and numeric components retain their published text.
+ */
+export function componentText(value: unknown): string | undefined {
+  if (typeof value === 'object' && value !== null && '#text' in value)
+    return componentText(value['#text']);
+  const text =
+    typeof value === 'string'
+      ? value.trim()
+      : typeof value === 'number'
+        ? String(value)
+        : undefined;
+  if (!text || ['na', 'unknown'].includes(text.toLowerCase().replace(/[./]/gu, ''))) return;
+  return /[\p{L}\p{N}]/u.test(text) ? text : undefined;
+}

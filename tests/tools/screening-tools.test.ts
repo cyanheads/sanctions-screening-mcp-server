@@ -158,6 +158,40 @@ describe('screening tools (seeded)', () => {
       traceOwnershipTool.handler(input, ctxFor(traceOwnershipTool.errors)),
     ).rejects.toMatchObject({ data: { reason: 'lei_not_found' } });
   });
+
+  it('trace_ownership returns cursor failure reasons and actionable restart recovery on both surfaces', async () => {
+    const query = { lei: '5493001KJTIIGC8Y1R12', limit: 1 };
+    const first = await traceOwnershipTool.handler(
+      traceOwnershipTool.input.parse(query),
+      ctxFor(traceOwnershipTool.errors),
+    );
+    await seeded.service.ingestLeiRelationships([
+      {
+        childLei: query.lei,
+        parentLei: 'MISSING00000000000000',
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+      },
+    ]);
+    for (const [cursor, reason] of [
+      ['corrupt', 'invalid_cursor'],
+      [first.nextCursor!, 'stale_cursor'],
+    ]) {
+      const result = await runToolContract(traceOwnershipTool, { ...query, cursor });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: { reason, recovery: { hint: expect.stringContaining('no cursor') } },
+        },
+      });
+      const text = result.content
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n');
+      expect(text).toContain('Restart sanctions_trace_ownership');
+      expect(text).toContain('no cursor');
+    }
+  });
 });
 
 describe('query-token coverage on both client surfaces (issue #15)', () => {

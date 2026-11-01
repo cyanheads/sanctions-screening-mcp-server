@@ -1,21 +1,27 @@
 /**
  * @fileoverview Common normalized schema for sanctions designations and GLEIF
  * legal-entity records, plus the matching-engine vocabulary. Every upstream
- * source (OFAC, EU, UK, UN, GLEIF) collapses onto these shapes so the matching
+ * source (OFAC, EU, UK, UN, BIS/State CSL, GLEIF) collapses onto these shapes so the matching
  * engine and tools never see a source-specific structure.
  * @module services/screening/types
  */
 
 /** Source list codes — the value stored in `designation.source`. */
-export type SourceCode = 'ofac_sdn' | 'ofac_consolidated' | 'eu' | 'uk' | 'un';
+export type SourceCode = (typeof SOURCE_CODES)[number];
 
 /** All sanctions source codes, in display order. */
-export const SOURCE_CODES: readonly SourceCode[] = [
+export const SOURCE_CODES = [
   'ofac_sdn',
   'ofac_consolidated',
   'eu',
   'uk',
   'un',
+  'bis_el',
+  'bis_dpl',
+  'bis_uvl',
+  'bis_meu',
+  'state_dtc',
+  'state_acn',
 ] as const;
 
 /** Human-facing label per source, used in provenance and `sanctions_list_sources`. */
@@ -25,6 +31,12 @@ export const SOURCE_LABELS: Record<SourceCode, string> = {
   eu: 'EU Consolidated Financial Sanctions List',
   uk: 'UK Sanctions List (FCDO)',
   un: 'UN Security Council Consolidated List',
+  bis_el: 'Entity List (EL) - Bureau of Industry and Security',
+  bis_dpl: 'Denied Persons List (DPL) - Bureau of Industry and Security',
+  bis_uvl: 'Unverified List (UVL) - Bureau of Industry and Security',
+  bis_meu: 'Military End User (MEU) List - Bureau of Industry and Security',
+  state_dtc: 'ITAR Debarred (DTC) - State Department',
+  state_acn: 'Nonproliferation Sanctions (ACN) - State Department',
 };
 
 /** Coarse entity classification shared across all sources. */

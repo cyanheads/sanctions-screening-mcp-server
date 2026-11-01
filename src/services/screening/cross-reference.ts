@@ -14,7 +14,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { countryCodeOf } from '@/services/screening/country-codes.js';
-import { componentText } from '@/services/screening/sanctions-ingest.js';
+import { componentText } from '@/services/screening/ingest-validation.js';
 import {
   type CountBasis,
   compareDesignationIdentity,

@@ -32,8 +32,9 @@ await createApp({
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
+  skills: 'skills',
   instructions:
-    'Screen names against the consolidated OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF, all fuzzy-matched offline over a local mirror. Start with sanctions_screen_name for "is this entity on a watchlist"; holding a vessel IMO number, a SWIFT/BIC code, a wallet address, or a passport or national ID number instead of a name, look it up exactly with sanctions_screen_identifier; sanctions_resolve_entity → sanctions_get_entity → sanctions_trace_ownership for "who is this legal entity and who owns it." Every result is a screening AID, not a compliance determination — a hit is a candidate to verify against the official source, and an empty result is never a clearance. Check sanctions_list_sources for which lists are loaded and how fresh the mirror is.',
+    'Screen names and identifiers against eleven OFAC, EU, UK, UN, BIS, and State sanctions and export-control lists offline over a keyless mirror. Use sanctions_screen_name or sanctions_screen_identifier; sanctions_resolve_entity → sanctions_get_entity → sanctions_trace_ownership resolves GLEIF identity and accounting-consolidation relationships. Drain trace pages before same-side boundary recovery. The sanctions-screening-guide skill covers identity confirmation, continuation and uncertainty. Results are a screening aid, never a compliance determination or clearance. Check sanctions_list_sources for configured lists, stored counts and successful local sync times, not upstream publication freshness. Verify candidates against official agency lists and Federal Register publications.',
   // The tool, resource, and prompt surface is fixed at startup — nothing
   // registers or retires a definition at runtime — so a 2026-07-28 client may
   // hold the listings for an hour. Shared caches may too: the same listings are
@@ -49,7 +50,7 @@ await createApp({
   landing: {
     requireAuth: false,
     tagline:
-      'Screen names against OFAC, EU, UK, and UN sanctions lists and resolve legal entities against GLEIF — offline, fuzzy-matched. A screening aid, not a compliance determination.',
+      'Screen eleven OFAC, EU, UK, UN, BIS, and State sanctions and export-control lists and resolve GLEIF entities offline. A screening aid, not a compliance determination. This product uses the International Trade Administration’s Data API but is not endorsed or certified by the International Trade Administration.',
     links: [
       {
         label: 'OFAC Sanctions List Service',

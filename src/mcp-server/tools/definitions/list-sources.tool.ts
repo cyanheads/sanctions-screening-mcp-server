@@ -17,6 +17,12 @@ import { buildSourcesPayload } from './_shared.js';
  * it builds against exactly the fields declared here.
  */
 export const SourcesPayloadSchema = z.object({
+  coverageNotice: z
+    .string()
+    .optional()
+    .describe(
+      'Unloaded CSL list codes and refresh guidance. Present when any CSL list has zero mirrored records; prior sanctions readiness does not establish coverage of newly added lists.',
+    ),
   sanctionsReady: z
     .boolean()
     .describe('True once the sanctions mirror has completed at least one full sync.'),
@@ -69,15 +75,19 @@ export const SourcesPayloadSchema = z.object({
             ),
           license: z.string().describe('Redistribution license / terms for this source.'),
         })
-        .describe('One loaded source with count, provenance, and license.'),
+        .describe(
+          'One supported source with current mirrored count, provenance, and license; zero-record CSL lists are not loaded.',
+        ),
     )
-    .describe('All loaded sources, sanctions lists then the GLEIF dataset.'),
+    .describe(
+      'All supported sources, sanctions lists then the GLEIF dataset. Check coverageNotice for unloaded CSL lists.',
+    ),
 });
 
 export const listSourcesTool = tool('sanctions_list_sources', {
   title: 'sanctions-screening-mcp-server: list sources',
   description:
-    "List the sanctions watchlists (OFAC SDN + Consolidated, EU, UK, UN) and GLEIF datasets currently loaded in the local mirror, each with its record count, source URL, license, and the mirror's readiness and as-of timestamp — for GLEIF, also its Level 2 ownership relationship count, whether its reporting exceptions are loaded and how many, and whether its alternate-name index is built. Use this for provenance and freshness on any result — results are only as current as the last mirror refresh, and a not-ready mirror means screening cannot run yet. Attribution: UK data is under the Open Government Licence v3.0; all sources are cited here.",
+    'List supported watchlists (OFAC SDN + Consolidated, EU, UK, UN, BIS Entity/Denied Persons/Unverified/Military End User, State ITAR Debarred/Nonproliferation) and GLEIF datasets with current mirrored counts, source URLs, licenses, readiness, and as-of timestamps. coverageNotice names unloaded CSL lists and how to refresh them; prior mirror readiness does not establish coverage of newly added lists. For GLEIF, reports Level 2 ownership relationships, reporting-exception coverage, and alternate-name index readiness. Use this for provenance, freshness, and coverage on any result. Attribution: UK data is under the Open Government Licence v3.0; BIS and State CSL data is supplied by the International Trade Administration under its published terms. This product uses the International Trade Administration’s Data API but is not endorsed or certified by the International Trade Administration.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({}),
   output: SourcesPayloadSchema,
@@ -93,6 +103,7 @@ export const listSourcesTool = tool('sanctions_list_sources', {
 
   format: (r) => {
     const lines = ['# Loaded sources', ''];
+    if (r.coverageNotice) lines.push(`**Coverage:** ${r.coverageNotice}`, '');
     lines.push(
       `**Sanctions mirror:** ${r.sanctionsReady ? 'ready' : 'NOT ready'}${r.sanctionsAsOf ? ` (as of ${r.sanctionsAsOf})` : ''}`,
     );

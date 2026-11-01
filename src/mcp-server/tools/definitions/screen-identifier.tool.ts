@@ -16,7 +16,7 @@ import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
 import { alsoListedText, HitSourcesSchema, SCREENING_CAVEAT } from './_shared.js';
 
-const SOURCE_ENUM = z.enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un']);
+const SOURCE_ENUM = z.enum(SOURCE_CODES);
 
 const MatchedIdentifierSchema = z
   .object({

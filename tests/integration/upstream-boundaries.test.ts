@@ -10,8 +10,10 @@ import { DEFAULT_SOURCE_URLS, resetServerConfig } from '@/config/server-config.j
 import { openGleifFile, resolveGleifPublication } from '@/services/screening/gleif-ingest.js';
 import { buildSanctionsIngesters } from '@/services/screening/sanctions-ingest.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
+import { cslDocument } from '../services/_csl-fixture.js';
 
 const sourceBodies = new Map<string, string>([
+  [DEFAULT_SOURCE_URLS.csl, cslDocument()],
   [
     DEFAULT_SOURCE_URLS.ofacSdn,
     '<sdnList><sdnEntry><uid>SDN-1</uid><firstName>Offline</firstName><lastName>SDN</lastName></sdnEntry></sdnList>',
@@ -40,7 +42,7 @@ afterEach(() => {
 });
 
 describe('sanctions source boundaries', () => {
-  it('harvests all five sources through the external fetch boundary only', async () => {
+  it('harvests all eleven sources through six external downloads', async () => {
     const fetch = vi.fn(async (input: string | URL | Request) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
       const body = sourceBodies.get(url);
@@ -58,7 +60,7 @@ describe('sanctions source boundaries', () => {
         }
         return { source: ingester.source, records };
       }),
-    );
+    ).finally(() => ingesters.dispose());
 
     expect(harvested.map((result) => result.source)).toEqual([
       'ofac_sdn',
@@ -66,9 +68,15 @@ describe('sanctions source boundaries', () => {
       'eu',
       'uk',
       'un',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
     ]);
     expect(harvested.every((result) => result.records.length === 1)).toBe(true);
-    expect(fetch).toHaveBeenCalledTimes(5);
+    expect(fetch).toHaveBeenCalledTimes(6);
     expect(
       new Set(
         fetch.mock.calls.map(([input]) =>

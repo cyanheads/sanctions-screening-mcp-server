@@ -51,6 +51,7 @@ import {
   hasLeiNameNormalizedIndex,
   IDENTIFIER_STAMP_TABLE,
   IDENTIFIER_TABLE,
+  LEI_ENTITY_TABLE,
   LEI_EXCEPTION_TABLE,
   LEI_NAME_FTS_TABLE,
   LEI_NAME_NORMALIZED_INDEX,
@@ -2116,6 +2117,35 @@ export class ScreeningService {
     if (leis.length === 0) return [];
     const rows = await this.leiMirror.getByIds(leis);
     return rows.filter((r) => r.payload).map((r) => readLeiPayload(String(r.payload)));
+  }
+
+  /** Level 1 membership without reading entity payloads; batches stay below SQLite's bind limit. */
+  async existingLeiEntities(leis: string[]): Promise<Set<string>> {
+    const handle = await this.leiHandle();
+    const found = new Set<string>();
+    for (let offset = 0; offset < leis.length; offset += 500) {
+      const batch = leis.slice(offset, offset + 500);
+      const rows = handle
+        .prepare<{ lei: string }>(
+          `SELECT lei FROM ${LEI_ENTITY_TABLE} WHERE lei IN (${batch.map(() => '?').join(',')}) AND payload IS NOT NULL`,
+        )
+        .all(...batch);
+      for (const row of rows) found.add(row.lei);
+    }
+    return found;
+  }
+
+  /** Whether either indexed end of a Level 2 relationship references this LEI. */
+  async hasRelationshipReference(lei: string): Promise<boolean> {
+    const handle = await this.leiHandle();
+    return (
+      handle
+        .prepare(`SELECT 1 FROM ${LEI_RELATIONSHIP_TABLE} WHERE child_lei = ? LIMIT 1`)
+        .get(lei) != null ||
+      handle
+        .prepare(`SELECT 1 FROM ${LEI_RELATIONSHIP_TABLE} WHERE parent_lei = ? LIMIT 1`)
+        .get(lei) != null
+    );
   }
 
   // ─── Sources / freshness ───────────────────────────────────────────────────

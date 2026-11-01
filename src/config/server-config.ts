@@ -20,6 +20,7 @@ export const DEFAULT_SOURCE_URLS = {
     'https://webgate.ec.europa.eu/fsd/fsf/public/files/xmlFullSanctionsList_1_1/content?token=dG9rZW4tMjAxNw',
   ukSanctions: 'https://sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.xml',
   unSc: 'https://scsanctions.un.org/resources/xml/en/consolidated.xml',
+  csl: 'https://data.trade.gov/downloadable_consolidated_screening_list/v1/consolidated.json',
   gleifGoldenCopyBase: 'https://goldencopy.gleif.org',
 } as const;
 
@@ -64,6 +65,10 @@ const ServerConfigSchema = z.object({
     .string()
     .default(DEFAULT_SOURCE_URLS.gleifGoldenCopyBase)
     .describe('Base URL for the GLEIF golden-copy / delta download API.'),
+  cslUrl: z
+    .string()
+    .default(DEFAULT_SOURCE_URLS.csl)
+    .describe('Trade.gov CSL bulk JSON URL for BIS and State export-control lists.'),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -81,6 +86,7 @@ export function getServerConfig(): ServerConfig {
     euFsfUrl: 'EU_FSF_URL',
     ukSanctionsUrl: 'UK_SANCTIONS_URL',
     unScUrl: 'UN_SC_URL',
+    cslUrl: 'CSL_URL',
     gleifGoldenCopyBaseUrl: 'GLEIF_GOLDEN_COPY_BASE_URL',
   });
   return _config;

@@ -24,6 +24,7 @@ import {
 } from '@/services/screening/sanctions-ingest.js';
 import { IDENTIFIER_TABLE, NAME_TABLE } from '@/services/screening/schema.js';
 import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
+import { cslDocument } from './_csl-fixture.js';
 import { freshService, type SeededService } from './_helpers.js';
 
 // ─── Source fixtures, one record per source ────────────────────────────────────
@@ -92,6 +93,7 @@ const UN_INDIVIDUAL = `<INDIVIDUAL>
 </INDIVIDUAL>`;
 
 const SOURCE_BODIES = new Map<string, string>([
+  [DEFAULT_SOURCE_URLS.csl, cslDocument()],
   [DEFAULT_SOURCE_URLS.ofacSdn, ofacDocument('SDN')],
   [DEFAULT_SOURCE_URLS.ofacConsolidated, ofacDocument('CONS')],
   [DEFAULT_SOURCE_URLS.euFsf, `<?xml version="1.0"?><export>${EU_ENTITY}</export>`],
@@ -212,6 +214,12 @@ describe('createSanctionsSync — harvest loop contract', () => {
       'eu',
       'uk',
       'un',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
     ]);
     expect(records.map((r) => r.id)).toEqual([
       'ofac_sdn:900',
@@ -219,6 +227,12 @@ describe('createSanctionsSync — harvest loop contract', () => {
       'eu:EU-1',
       'uk:UK-1',
       'un:UN-1',
+      'bis_el:CSL-bis_el',
+      'bis_dpl:CSL-bis_dpl',
+      'bis_uvl:CSL-bis_uvl',
+      'bis_meu:CSL-bis_meu',
+      'state_dtc:CSL-state_dtc',
+      'state_acn:CSL-state_acn',
     ]);
 
     // One run stamps one checkpoint across every page it yields.
@@ -281,6 +295,12 @@ describe('createSanctionsSync — harvest loop contract', () => {
       'eu',
       'uk',
       'un',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
     ]);
     expect(reports.find((r) => r.source === 'eu')).toEqual({
       source: 'eu',
@@ -331,6 +351,12 @@ describe('createSanctionsSync — pruning', () => {
       ['eu', ['eu:EU-1', 'eu:EU-2', 'eu:EU-3']],
       ['uk', ['uk:UK-1']],
       ['un', ['un:UN-1']],
+      ['bis_el', ['bis_el:CSL-bis_el']],
+      ['bis_dpl', ['bis_dpl:CSL-bis_dpl']],
+      ['bis_uvl', ['bis_uvl:CSL-bis_uvl']],
+      ['bis_meu', ['bis_meu:CSL-bis_meu']],
+      ['state_dtc', ['state_dtc:CSL-state_dtc']],
+      ['state_acn', ['state_acn:CSL-state_acn']],
     ]);
     // EU's tombstones follow its records, in bounded pages, before UK's records.
     expect(
@@ -344,6 +370,10 @@ describe('createSanctionsSync — pruning', () => {
       { records: [], tombstones: ['eu:GONE-3'] },
       { records: ['uk:UK-1'], tombstones: [] },
       { records: ['un:UN-1'], tombstones: [] },
+      ...['bis_el', 'bis_dpl', 'bis_uvl', 'bis_meu', 'state_dtc', 'state_acn'].map((source) => ({
+        records: [`${source}:CSL-${source}`],
+        tombstones: [],
+      })),
     ]);
     expect(new Set(pages.map((p) => p.checkpoint)).size).toBe(1);
     expect(reports.map((r) => [r.source, r.pruned])).toEqual([
@@ -352,6 +382,12 @@ describe('createSanctionsSync — pruning', () => {
       ['eu', 3],
       ['uk', 0],
       ['un', 0],
+      ['bis_el', 0],
+      ['bis_dpl', 0],
+      ['bis_uvl', 0],
+      ['bis_meu', 0],
+      ['state_dtc', 0],
+      ['state_acn', 0],
     ]);
   });
 
@@ -378,13 +414,35 @@ describe('createSanctionsSync — pruning', () => {
     // EU's empty document would remove all it stores, so the removal is withheld
     // and reported. UK never arrived, so it is asked nothing and reported as a
     // failure; the run moves on to UN.
-    expect(asked).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu', 'un']);
+    expect(asked).toEqual([
+      'ofac_sdn',
+      'ofac_consolidated',
+      'eu',
+      'un',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
+    ]);
     expect(reports.find((r) => r.source === 'eu')).toMatchObject({
       accepted: 0,
       pruned: 0,
       withheld: 1,
     });
-    expect(reports.map((r) => r.source)).toEqual(['ofac_sdn', 'ofac_consolidated', 'eu', 'un']);
+    expect(reports.map((r) => r.source)).toEqual([
+      'ofac_sdn',
+      'ofac_consolidated',
+      'eu',
+      'un',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
+    ]);
     expect(failures).toEqual([{ source: 'uk', accepted: 0, error: expect.stringMatching(/404/) }]);
   });
 
@@ -449,17 +507,43 @@ describe('createSanctionsSync — a failing source does not stop the others', ()
     expect(error?.message).toMatch(/ofac_sdn: .*404[\s\S]*; un: .*404/);
     expect(failures.map((f) => f.source)).toEqual(['ofac_sdn', 'un']);
     // The failed sources are asked nothing, so they prune nothing.
-    expect(asked).toEqual(['ofac_consolidated', 'eu', 'uk']);
-    expect(reports.map((r) => r.source)).toEqual(['ofac_consolidated', 'eu', 'uk']);
+    expect(asked).toEqual([
+      'ofac_consolidated',
+      'eu',
+      'uk',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
+    ]);
+    expect(reports.map((r) => r.source)).toEqual([
+      'ofac_consolidated',
+      'eu',
+      'uk',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
+    ]);
     expect(pages.flatMap((p) => p.records.map((r) => r.id))).toEqual([
       'ofac_consolidated:901',
       'eu:EU-1',
       'uk:UK-1',
+      'bis_el:CSL-bis_el',
+      'bis_dpl:CSL-bis_dpl',
+      'bis_uvl:CSL-bis_uvl',
+      'bis_meu:CSL-bis_meu',
+      'state_dtc:CSL-state_dtc',
+      'state_acn:CSL-state_acn',
     ]);
     expect(pages.flatMap((p) => p.tombstones ?? [])).toEqual(['eu:GONE-1']);
   });
 
-  it('names all five sources when every one fails', async () => {
+  it('names every source when every one fails', async () => {
     stubSourceFetch(new Map());
     const failures: SourceSyncFailure[] = [];
     const sync = createSanctionsSync({
@@ -476,6 +560,12 @@ describe('createSanctionsSync — a failing source does not stop the others', ()
       'eu',
       'uk',
       'un',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
     ]);
     for (const source of failures.map((f) => f.source)) {
       expect(error?.message).toContain(`${source}: `);

@@ -937,6 +937,34 @@ describe('resolveEntity — single-token false-positive gate (issue #4)', () => 
 });
 
 describe('ownership', () => {
+  it('checks indexed relationship references at either end without admitting an absent LEI', async () => {
+    expect(await svc.hasRelationshipReference('5493001KJTIIGC8Y1R12')).toBe(true);
+    expect(await svc.hasRelationshipReference('529900T8BM49AURSDO55')).toBe(true);
+    expect(await svc.hasRelationshipReference('529900UNKNOWNLEI0009')).toBe(false);
+    await svc.ingestLeiRelationships([
+      {
+        childLei: 'MISSING-CHILD',
+        parentLei: 'MISSING-PARENT',
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+      },
+    ]);
+    expect(await svc.hasRelationshipReference('MISSING-CHILD')).toBe(true);
+    expect(await svc.hasRelationshipReference('MISSING-PARENT')).toBe(true);
+    expect(await svc.getLeiEntity('MISSING-PARENT')).toBeNull();
+  });
+
+  it('counts only existing Level 1 membership across bind batches, without hydrating payloads', async () => {
+    const missing = Array.from({ length: 501 }, (_, i) => `ABSENT${i}`);
+    const existing = await svc.existingLeiEntities([
+      ...missing,
+      '5493001KJTIIGC8Y1R12',
+      '529900T8BM49AURSDO55',
+      '5493001KJTIIGC8Y1R12',
+    ]);
+    expect(existing).toEqual(new Set(['5493001KJTIIGC8Y1R12', '529900T8BM49AURSDO55']));
+    expect(await svc.existingLeiEntities([])).toEqual(new Set());
+  });
+
   it('returns the direct parent relationship for a child LEI', async () => {
     const rels = await svc.getRelationships('5493001KJTIIGC8Y1R12', 'parents');
     expect(rels).toHaveLength(1);
@@ -2173,7 +2201,18 @@ describe('per-list strict→fuzzy completion (issue #59)', () => {
     }
     expect(res).toMatchObject({
       modeUsed: 'strict',
-      fuzzySources: ['ofac_sdn', 'ofac_consolidated', 'uk', 'un'],
+      fuzzySources: [
+        'ofac_sdn',
+        'ofac_consolidated',
+        'uk',
+        'un',
+        'bis_el',
+        'bis_dpl',
+        'bis_uvl',
+        'bis_meu',
+        'state_dtc',
+        'state_acn',
+      ],
       totalAvailable: 3,
       totalAvailableBasis: 'lower_bound',
       fuzzyFallbackTriggered: false,
@@ -2239,7 +2278,16 @@ describe('per-list strict→fuzzy completion (issue #59)', () => {
       listed('ofac_consolidated', 'GRP-59', 'Vladimir Poutine Holding', 'organization'),
     ]);
     const res = await screen('Vladimir Poutine');
-    expect(res.fuzzySources).toEqual(['uk', 'un']);
+    expect(res.fuzzySources).toEqual([
+      'uk',
+      'un',
+      'bis_el',
+      'bis_dpl',
+      'bis_uvl',
+      'bis_meu',
+      'state_dtc',
+      'state_acn',
+    ]);
     expect(ids(res.hits)).toEqual(['ofac_sdn:GRP-59', 'eu:POU-1', 'uk:PUT-UK']);
   });
 });

@@ -15,7 +15,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { crossReferenceEntity } from '@/services/screening/cross-reference.js';
 import { leiChecksumValid } from '@/services/screening/lei-checksum.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
-import { SOURCE_LABELS } from '@/services/screening/types.js';
+import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
 import {
   alsoListedText,
   crossReferencePointer,
@@ -102,7 +102,7 @@ export const getEntityTool = tool('sanctions_get_entity', {
         z
           .object({
             source: z
-              .enum(['ofac_sdn', 'ofac_consolidated', 'eu', 'uk', 'un'])
+              .enum(SOURCE_CODES)
               .describe(
                 'Watchlist whose record this hit is attributed to: primaryName comes from it. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched alone or better, and matchedName, matchedIdentifiers, and matchedOn cover what either record matched; sources names every list.',
               ),

@@ -21,14 +21,18 @@ import { DEFAULT_SOURCE_URLS } from '@/config/server-config.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
+import type { CSL_SOURCE_CODES } from '@/services/screening/csl-ingest.js';
 import { NAME_TABLE } from '@/services/screening/schema.js';
 import type { SourceCode } from '@/services/screening/types.js';
+import { cslDocument } from '../services/_csl-fixture.js';
 import { emptyGlobalService, type SeededService } from '../services/_helpers.js';
+
+type XmlSource = Exclude<SourceCode, (typeof CSL_SOURCE_CODES)[number]>;
 
 // ─── Feeds ─────────────────────────────────────────────────────────────────────
 
 /** `[entryId, "Given Family"]` per published designation, by source. */
-type Corpus = Record<SourceCode, [string, string][]>;
+type Corpus = Record<XmlSource, [string, string][]>;
 
 const BASELINE: Corpus = {
   ofac_sdn: [
@@ -50,7 +54,7 @@ const BASELINE: Corpus = {
   ],
 };
 
-const URLS: Record<SourceCode, string> = {
+const URLS: Record<XmlSource, string> = {
   ofac_sdn: DEFAULT_SOURCE_URLS.ofacSdn,
   ofac_consolidated: DEFAULT_SOURCE_URLS.ofacConsolidated,
   eu: DEFAULT_SOURCE_URLS.euFsf,
@@ -64,7 +68,7 @@ function split(name: string): [string, string] {
 }
 
 /** Render one source's published document, in that source's own schema. */
-function document(source: SourceCode, entries: [string, string][]): string {
+function document(source: XmlSource, entries: [string, string][]): string {
   const prolog = '<?xml version="1.0" encoding="utf-8"?>\n';
   switch (source) {
     case 'ofac_sdn':
@@ -105,14 +109,15 @@ type Feed = string | 404;
 /** Every source serving its baseline document, with `overrides` replacing some. */
 function feeds(overrides: Partial<Record<SourceCode, Feed>> = {}): Map<string, Feed> {
   const out = new Map<string, Feed>();
-  for (const source of Object.keys(URLS) as SourceCode[]) {
+  for (const source of Object.keys(URLS) as XmlSource[]) {
     out.set(URLS[source], overrides[source] ?? document(source, BASELINE[source]));
   }
+  out.set(DEFAULT_SOURCE_URLS.csl, cslDocument());
   return out;
 }
 
 /** The baseline corpus of `source` minus the named entry ids. */
-function without(source: SourceCode, ...ids: string[]): string {
+function without(source: XmlSource, ...ids: string[]): string {
   return document(
     source,
     BASELINE[source].filter(([id]) => !ids.includes(id)),
@@ -184,7 +189,19 @@ async function counts(): Promise<Record<string, number>> {
   );
 }
 
-const BASELINE_COUNTS = { ofac_sdn: 2, ofac_consolidated: 1, eu: 2, uk: 2, un: 2 };
+const BASELINE_COUNTS = {
+  ofac_sdn: 2,
+  ofac_consolidated: 1,
+  eu: 2,
+  uk: 2,
+  un: 2,
+  bis_el: 1,
+  bis_dpl: 1,
+  bis_uvl: 1,
+  bis_meu: 1,
+  state_dtc: 1,
+  state_acn: 1,
+};
 
 const ctxFor = <const E extends readonly ErrorContract[] | undefined>(errors: E) =>
   createMockContext({ errors });
@@ -240,7 +257,7 @@ describe('refresh removes designations a source stopped publishing', () => {
     // Only the delisted row went: the source's other row and every other source stay.
     expect(await counts()).toEqual({ ...BASELINE_COUNTS, un: 1 });
     expect((await getDesignation('un', 'UN-1')).primaryName).toBe('Hazel Crane');
-    expect((await harness.service.sanctionsReadiness()).total).toBe(8);
+    expect((await harness.service.sanctionsReadiness()).total).toBe(14);
   });
 
   it('never surfaces a pruned designation, even before the name index is rebuilt', async () => {
@@ -405,10 +422,17 @@ describe('a failing source does not stop the sources after it', () => {
     );
     await expect(
       harness.service.syncSanctions('refresh', new AbortController().signal),
-    ).rejects.toThrow(/Sanctions harvest failed for eu \(1 of 5 sources\)[\s\S]*eu: .*404/);
+    ).rejects.toThrow(/Sanctions harvest failed for eu \(1 of 11 sources\)[\s\S]*eu: .*404/);
 
     // The sources after the failure were requested and refreshed.
-    expect(requested).toEqual([URLS.ofac_sdn, URLS.ofac_consolidated, URLS.eu, URLS.uk, URLS.un]);
+    expect(requested).toEqual([
+      URLS.ofac_sdn,
+      URLS.ofac_consolidated,
+      URLS.eu,
+      URLS.uk,
+      URLS.un,
+      DEFAULT_SOURCE_URLS.csl,
+    ]);
     expect(await storedIds()).not.toContain('un:UN-2');
     // The failed source kept every row and pruned nothing.
     expect(await counts()).toEqual({ ...BASELINE_COUNTS, un: 1 });
@@ -464,7 +488,7 @@ describe('a failing source does not stop the sources after it', () => {
         await harness.service.syncSanctions('refresh', new AbortController().signal);
       })(),
     ).rejects.toThrow(
-      /failed for ofac_sdn, un \(2 of 5 sources\)[\s\S]*ofac_sdn: .*404[\s\S]*; un: .*404/,
+      /failed for ofac_sdn, un \(2 of 11 sources\)[\s\S]*ofac_sdn: .*404[\s\S]*; un: .*404/,
     );
 
     // UK, between the two failures, refreshed and pruned; the failed sources kept everything.

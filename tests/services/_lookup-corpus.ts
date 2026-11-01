@@ -14,9 +14,13 @@
 
 import { vi } from 'vitest';
 import { DEFAULT_SOURCE_URLS } from '@/config/server-config.js';
+import type { CSL_SOURCE_CODES } from '@/services/screening/csl-ingest.js';
 import { parseEu, parseOfac, parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
 import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
+import { cslDocument } from './_csl-fixture.js';
+
+type XmlSource = Exclude<SourceCode, (typeof CSL_SOURCE_CODES)[number]>;
 
 /** An EIP-55 mixed-case Ethereum address (the checksum example from EIP-55). */
 export const ETH_CHECKSUMMED = '0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed';
@@ -28,7 +32,7 @@ export const XBT_BECH32 = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4';
 const PROLOG = '<?xml version="1.0" encoding="utf-8"?>\n';
 
 /** Each source's published document. */
-export const LOOKUP_DOCUMENTS: Record<SourceCode, string> = {
+export const LOOKUP_DOCUMENTS: Record<XmlSource, string> = {
   ofac_sdn: `${PROLOG}<sdnList>
     <sdnEntry><uid>4243</uid><lastName>EBANO</lastName><sdnType>Vessel</sdnType>
       <idList><id><idType>Vessel Registration Identification</idType><idNumber>IMO 7406784</idNumber></id></idList>
@@ -132,7 +136,7 @@ export function lookupDesignations(): NormalizedDesignation[] {
   ];
 }
 
-const URLS: Record<SourceCode, string> = {
+const URLS: Record<XmlSource, string> = {
   ofac_sdn: DEFAULT_SOURCE_URLS.ofacSdn,
   ofac_consolidated: DEFAULT_SOURCE_URLS.ofacConsolidated,
   eu: DEFAULT_SOURCE_URLS.euFsf,
@@ -146,11 +150,12 @@ const URLS: Record<SourceCode, string> = {
  */
 export function serveLookupCorpus(overrides: Partial<Record<SourceCode, string>> = {}): void {
   const bodies = new Map(
-    (Object.keys(URLS) as SourceCode[]).map((source) => [
+    (Object.keys(URLS) as XmlSource[]).map((source) => [
       URLS[source],
       overrides[source] ?? LOOKUP_DOCUMENTS[source],
     ]),
   );
+  bodies.set(DEFAULT_SOURCE_URLS.csl, cslDocument());
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: string | URL | Request) => {

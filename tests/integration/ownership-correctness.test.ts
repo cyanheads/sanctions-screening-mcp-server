@@ -6,8 +6,9 @@
  * @module tests/integration/ownership-correctness.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 import type {
@@ -344,15 +345,9 @@ describe('sanctions_trace_ownership graph behavior', () => {
     ]);
     expect(result.edges).toEqual([
       {
-        childLei: ROOT,
-        parentLei: PARENT,
+        childLei: GRANDPARENT,
+        parentLei: ULTIMATE,
         relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
-        relationshipStatus: 'ACTIVE',
-      },
-      {
-        childLei: ROOT,
-        parentLei: PARENT,
-        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
         relationshipStatus: 'ACTIVE',
       },
       {
@@ -362,8 +357,14 @@ describe('sanctions_trace_ownership graph behavior', () => {
         relationshipStatus: 'ACTIVE',
       },
       {
-        childLei: GRANDPARENT,
-        parentLei: ULTIMATE,
+        childLei: ROOT,
+        parentLei: PARENT,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+        relationshipStatus: 'ACTIVE',
+      },
+      {
+        childLei: ROOT,
+        parentLei: PARENT,
         relationshipType: 'IS_ULTIMATELY_CONSOLIDATED_BY',
         relationshipStatus: 'ACTIVE',
       },
@@ -387,6 +388,384 @@ describe('sanctions_trace_ownership graph behavior', () => {
 /** A synthetic 20-character LEI: the tag, zero-padded to 18 characters, then two digits. */
 const lei = (tag: string): string => `${tag.padEnd(18, '0')}00`;
 const ULT = 'IS_ULTIMATELY_CONSOLIDATED_BY';
+
+describe('ownership segment pagination', () => {
+  let global: SeededService;
+  beforeEach(async () => {
+    global = await seededGlobalService();
+  });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await global.cleanup();
+  });
+  const trace = (input: Record<string, unknown>) =>
+    traceOwnershipTool.handler(traceOwnershipTool.input.parse(input), ctx());
+
+  it('reconstructs a deterministic multi-level cycle without repeating nodes or edges', async () => {
+    const a = lei('PAGEA');
+    const b = lei('PAGEB');
+    const c = lei('PAGEC');
+    await global.service.ingestLeiEntities([
+      entity(a, 'Page A'),
+      entity(b, 'Page B'),
+      entity(c, 'Page C'),
+    ]);
+    await global.service.ingestLeiRelationships([
+      relationship(c, b),
+      relationship(b, a),
+      relationship(a, c),
+      relationship(c, a),
+    ]);
+    const query = { lei: a, direction: 'both', depth: 5, screenNodes: true, limit: 2 };
+    const nameScreens = vi.spyOn(global.service, 'screenName');
+    const identifierScreens = vi.spyOn(global.service, 'screenIdentifier');
+    const hydration = vi.spyOn(global.service, 'getLeiEntitiesBatch');
+    const pages = [await trace(query)];
+    while (pages.at(-1)?.hasMore) {
+      const before = [
+        nameScreens.mock.calls.length,
+        identifierScreens.mock.calls.length,
+        hydration.mock.calls.length,
+      ];
+      pages.push(await trace({ ...query, cursor: pages.at(-1)?.nextCursor }));
+      if (!pages.at(-1)?.nodes.length) {
+        expect([
+          nameScreens.mock.calls.length,
+          identifierScreens.mock.calls.length,
+          hydration.mock.calls.length,
+        ]).toEqual(before);
+      }
+      expect(pages.length).toBeLessThan(10);
+    }
+    expect(pages.map((p) => p.nodes.length + p.edges.length + p.boundaries.length)).toEqual([
+      2, 2, 2, 1,
+    ]);
+    // Parents-side placement wins: c is one parent hop, b is two, even though children reaches b first.
+    expect(pages.flatMap((p) => p.nodes.map((n) => n.lei))).toEqual([a, c, b]);
+    expect(pages.flatMap((p) => p.edges)).toEqual([
+      { ...relationship(a, c) },
+      { ...relationship(b, a) },
+      { ...relationship(c, a) },
+      { ...relationship(c, b) },
+    ]);
+    expect(pages[0]).toMatchObject({
+      totalAvailable: 7,
+      totalAvailableBasis: 'exact',
+      complete: false,
+      truncated: true,
+      truncationReasons: ['page_limit'],
+    });
+    expect(pages.at(-1)).toMatchObject({ hasMore: false, complete: true, truncated: false });
+    expect(pages.at(-1)).not.toHaveProperty('nextCursor');
+    expect(pages.reduce((n, p) => n + p.screenedNodeCount, 0)).toBe(3);
+    expect(hydration.mock.calls.flatMap((call) => call[0])).toEqual([a, c, b]);
+    for (const page of pages) {
+      expect(page.caveat).toBe(SCREENING_CAVEAT);
+      expect(render(page)).toContain('totalAvailable: 7');
+      expect(render(page)).toContain(`hasMore: ${page.hasMore}`);
+      if (page.nextCursor) expect(render(page)).toContain(page.nextCursor);
+      if (!page.nodes.length)
+        expect(page).toMatchObject({
+          screenedNodeCount: 0,
+          flaggedNodeCount: 0,
+          screeningStatus: 'screened',
+        });
+    }
+    expect(render(pages[0]!)).toContain('elsewhere in the assembled graph');
+  });
+
+  it('keeps segment-wide missing hydration on edge-only and empty terminal pages', async () => {
+    await global.service.ingestLeiRelationships([relationship(MISSING, ROOT)]);
+    const query = { lei: ROOT, direction: 'children', limit: 1 };
+    const first = await trace(query);
+    const second = await trace({ ...query, cursor: first.nextCursor });
+    const last = await trace({ ...query, cursor: second.nextCursor });
+    expect(second).toMatchObject({ missingEntityLeis: [MISSING], missingEntityCount: 1 });
+    expect(last).toMatchObject({
+      nodes: [],
+      complete: false,
+      missingEntityLeis: [],
+      missingEntityCount: 1,
+      hasMore: false,
+    });
+    const payload = JSON.parse(Buffer.from(second.nextCursor!, 'base64url').toString());
+    payload.offset = last.totalAvailable;
+    const terminal = await trace({
+      ...query,
+      cursor: Buffer.from(JSON.stringify(payload)).toString('base64url'),
+    });
+    expect(terminal).toMatchObject({
+      nodes: [],
+      edges: [],
+      boundaries: [],
+      hasMore: false,
+      complete: false,
+    });
+    payload.offset++;
+    await expect(
+      trace({ ...query, cursor: Buffer.from(JSON.stringify(payload)).toString('base64url') }),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_cursor' } });
+  });
+
+  it('returns side-specific depth-five and ultimate-leaf recovery, including missing Level 1 roots', async () => {
+    const chain = [ROOT, ...Array.from({ length: 6 }, (_, i) => lei(`DEPTH${i}`))];
+    await global.service.ingestLeiRelationships(
+      chain.slice(1).map((id, i) => relationship(chain[i]!, id)),
+    );
+    const result = await trace({ lei: ROOT, direction: 'parents', depth: 5 });
+    expect(result.boundaries).toEqual([
+      { lei: chain[5], direction: 'parents', reason: 'depth_limit', depth: 5 },
+    ]);
+    expect(result.truncationReasons).toEqual(['depth_limit']);
+    const boundary = result.boundaries[0]!;
+    const branch = await trace({
+      lei: boundary.lei,
+      direction: boundary.direction,
+      depth: boundary.depth,
+    });
+    expect(branch.nodes.map((n) => n.lei)).toEqual([chain[5], chain[6]]);
+    expect(branch.nodes[0]).toMatchObject({ depth: 0, role: 'root', legalName: chain[5] });
+    expect(render(result)).toContain(
+      JSON.stringify({ lei: chain[5], direction: 'parents', depth: 5 }),
+    );
+    await global.service.ingestLeiRelationships([relationship(PARENT, MISSING)]);
+    const leaf = await trace({ lei: ROOT, direction: 'parents', depth: 1 });
+    expect(leaf.boundaries).toContainEqual({
+      lei: PARENT,
+      direction: 'parents',
+      reason: 'ultimate_leaf',
+      depth: 1,
+    });
+    const resumed = await trace({ lei: PARENT, direction: 'parents', depth: 1 });
+    expect(resumed.nodes.some((n) => n.lei === MISSING)).toBe(true);
+  });
+
+  it('rejects corrupt, query-mismatched and changed-topology cursors, but accepts current-value changes', async () => {
+    const query = { lei: ROOT, limit: 1 };
+    const first = await trace(query);
+    await expect(trace({ ...query, cursor: 'broken' })).rejects.toMatchObject({
+      data: { reason: 'invalid_cursor' },
+    });
+    await expect(trace({ ...query, depth: 4, cursor: first.nextCursor })).rejects.toMatchObject({
+      data: { reason: 'invalid_cursor' },
+    });
+    await global.service.ingestLeiEntities([entity(PARENT, 'Renamed Parent')]);
+    expect((await trace({ ...query, cursor: first.nextCursor })).nodes[0]?.legalName).toBe(
+      'Renamed Parent',
+    );
+    await global.service.ingestLeiRelationships([relationship(ROOT, MISSING)]);
+    await expect(trace({ ...query, cursor: first.nextCursor })).rejects.toMatchObject({
+      data: { reason: 'stale_cursor' },
+    });
+  });
+
+  it.each(['', ' \n\t'])(
+    'treats a blank optional cursor %j as an initial request',
+    async (cursor) => {
+      const page = await trace({ lei: ROOT, limit: 1, cursor });
+      expect(page.nodes.map((n) => n.lei)).toEqual([ROOT]);
+      expect(page).toMatchObject({ hasMore: true, totalAvailable: 3 });
+      expect(render(page)).toContain(page.nextCursor!);
+      await expect(
+        trace({ lei: ROOT, limit: 1, cursor: ` ${page.nextCursor} ` }),
+      ).rejects.toMatchObject({ data: { reason: 'invalid_cursor' } });
+    },
+  );
+
+  it('resumes the same topology in a fresh process without a signing key or cached snapshot', async () => {
+    const query = { lei: ROOT, limit: 1 };
+    const first = await trace(query);
+    const input = { ...query, cursor: first.nextCursor };
+    const script = `import {traceOwnershipTool as tool} from './src/mcp-server/tools/definitions/trace-ownership.tool.ts'; import {initScreeningService,getScreeningService} from './src/services/screening/screening-service.ts'; import {createMockContext} from '@cyanheads/mcp-ts-core/testing'; initScreeningService(); try {const page=await tool.handler(tool.input.parse(${JSON.stringify(input)}),createMockContext({errors:tool.errors})); process.stdout.write(JSON.stringify(page));} finally {await getScreeningService().close();}`;
+    const page = JSON.parse(
+      execFileSync('bun', ['--eval', script], { encoding: 'utf8', timeout: 10_000 }),
+    );
+    expect(page).toMatchObject({ rootLei: ROOT, totalAvailable: 3, hasMore: true });
+    expect(page.nodes.map((node: { lei: string }) => node.lei)).toEqual([PARENT]);
+    expect(render(page)).toContain(page.nextCursor);
+  });
+
+  it('paginates a dense cyclic graph in canonical order, including the edge-only tail', async () => {
+    const ids = Array.from({ length: 12 }, (_, i) => lei(`DENSE${String(i).padStart(2, '0')}`));
+    await global.service.ingestLeiEntities(ids.map((id) => entity(id, id)));
+    const rows = ids.flatMap((child) =>
+      ids.filter((parent) => parent !== child).map((parent) => relationship(child, parent)),
+    );
+    await global.service.ingestLeiRelationships(rows.toReversed());
+    const query = { lei: ids[0], direction: 'both', depth: 5, limit: 50 };
+    const pages = [await trace(query)];
+    while (pages.at(-1)?.hasMore)
+      pages.push(await trace({ ...query, cursor: pages.at(-1)?.nextCursor }));
+    expect(pages.map((p) => p.nodes.length + p.edges.length + p.boundaries.length)).toEqual([
+      50, 50, 44,
+    ]);
+    expect(pages.flatMap((p) => p.nodes.map((n) => n.lei))).toEqual(ids);
+    expect(pages.flatMap((p) => p.edges)).toEqual(rows);
+    expect(pages.flatMap((p) => p.boundaries)).toEqual([]);
+    expect(pages.at(-1)).toMatchObject({ complete: true, truncated: false, totalAvailable: 144 });
+  });
+
+  it('reports a root-only page and an empty continuation truthfully', async () => {
+    const id = lei('ISOLATEDPAGE');
+    await global.service.ingestLeiEntities([entity(id, 'Isolated Page')]);
+    const first = await trace({ lei: id, limit: 1 });
+    expect(first).toMatchObject({
+      totalAvailable: 1,
+      boundaries: [],
+      hasMore: false,
+      complete: true,
+      byteTargetExceeded: false,
+    });
+    expect(render(first)).toContain('hasMore: false');
+    // Obtain a well-shaped cursor for this topology by the public read-only cursor format.
+    // A caller may request its terminal offset; there are no remaining records to repeat.
+    const query = { lei: ROOT, limit: 1 };
+    const initial = await trace(query);
+    const cursor = JSON.parse(Buffer.from(initial.nextCursor!, 'base64url').toString());
+    cursor.offset = initial.totalAvailable;
+    const terminal = await trace({
+      ...query,
+      cursor: Buffer.from(JSON.stringify(cursor)).toString('base64url'),
+    });
+    expect(terminal).toMatchObject({
+      nodes: [],
+      edges: [],
+      boundaries: [],
+      complete: true,
+      hasMore: false,
+      screenedNodeCount: 0,
+    });
+    expect(render(terminal)).toContain('**0 node(s), 0 edge(s).**');
+  });
+
+  it('emits an oversized screened record intact before stopping, never screening an omitted node', async () => {
+    const name = 'Z'.repeat(40_000);
+    await global.service.ingestLeiEntities([entity(ROOT, name)]);
+    const batch = vi.spyOn(global.service, 'getLeiEntitiesBatch');
+    const result = await trace({ lei: ROOT, screenNodes: true });
+    expect(result).toMatchObject({ byteTargetExceeded: true, screenedNodeCount: 1, hasMore: true });
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0]?.legalName).toBe(name);
+    expect(batch.mock.calls.flatMap((c) => c[0])).toEqual([ROOT]);
+    expect(render(result)).toContain(name);
+    expect(render(result)).toContain('byteTargetExceeded: true');
+    const clamped = await runToolContract(traceOwnershipTool, {
+      lei: ROOT,
+      screenNodes: true,
+      limit: 500,
+    });
+    expect(clamped.structuredContent).toMatchObject({
+      byteTargetExceeded: true,
+      screenedNodeCount: 1,
+      notice: 'Requested limit 500 clamped to 100 records.',
+    });
+    expect(
+      Buffer.byteLength(
+        JSON.stringify({ structuredContent: clamped.structuredContent, content: clamped.content }),
+      ),
+    ).toBeGreaterThan(65536);
+  });
+
+  it('keeps ultimate-leaf recovery actionable on edge-only and boundary-only pages', async () => {
+    await global.service.ingestLeiRelationships([relationship(PARENT, MISSING)]);
+    const query = { lei: ROOT, direction: 'parents', depth: 5, limit: 1, screenNodes: true };
+    const pages = [await trace(query)];
+    while (pages.at(-1)?.hasMore)
+      pages.push(await trace({ ...query, cursor: pages.at(-1)?.nextCursor }));
+    expect(pages.map((p) => [p.nodes.length, p.edges.length, p.boundaries.length])).toEqual([
+      [1, 0, 0],
+      [1, 0, 0],
+      [0, 1, 0],
+      [0, 0, 1],
+    ]);
+    for (const page of pages) {
+      const text = render(page);
+      expect(text).toContain('ultimate-parent edge, which is never walked');
+      expect(text).not.toContain('Re-run with a higher depth');
+      expect(text).not.toContain('A higher depth');
+      expect(page).toMatchObject({
+        screeningStatus: 'screened',
+        truncationReasons: expect.arrayContaining(['ultimate_leaf']),
+      });
+    }
+    const boundary = pages.at(-1)!.boundaries[0]!;
+    const branch = await trace({
+      lei: boundary.lei,
+      direction: boundary.direction,
+      depth: boundary.depth,
+      screenNodes: true,
+    });
+    expect(branch.nodes.some((n) => n.lei === MISSING)).toBe(true);
+    expect(pages.at(-1)).toMatchObject({ hasMore: false, screenedNodeCount: 0 });
+  });
+
+  it('probes both sides of an ultimate-only leaf without changing parents-side placement', async () => {
+    const root = lei('DUALROOT');
+    const leaf = lei('DUALLEAF');
+    const omitted = lei('DUALOMITTED');
+    await global.service.ingestLeiEntities([entity(root, 'Dual Root'), entity(leaf, 'Dual Leaf')]);
+    await global.service.ingestLeiRelationships([
+      relationship(root, leaf, ULT),
+      relationship(leaf, root, ULT),
+      relationship(omitted, leaf),
+    ]);
+    const result = await trace({ lei: root, direction: 'both', depth: 3 });
+    expect(
+      result.nodes.map((n) => ({
+        lei: n.lei,
+        depth: n.depth,
+        role: n.role,
+        reachedVia: n.reachedVia,
+      })),
+    ).toEqual([
+      { lei: root, depth: 0, role: 'root', reachedVia: undefined },
+      { lei: leaf, depth: 1, role: 'parent', reachedVia: 'ultimate' },
+    ]);
+    expect(result.boundaries).toEqual([
+      { lei: leaf, direction: 'children', reason: 'ultimate_leaf', depth: 3 },
+    ]);
+    expect(result).toMatchObject({ complete: false, truncated: true, hasMore: false });
+    const boundary = result.boundaries[0]!;
+    const resumed = await trace({
+      lei: boundary.lei,
+      direction: boundary.direction,
+      depth: boundary.depth,
+    });
+    expect(resumed.nodes.map((n) => n.lei)).toEqual([leaf, omitted, root]);
+    expect(resumed.missingEntityLeis).toEqual([omitted]);
+  });
+
+  it('enforces default and maximum record counts with a visible clamp notice', async () => {
+    const children = Array.from({ length: 120 }, (_, i) =>
+      lei(`CHILD${String(i).padStart(3, '0')}`),
+    );
+    await global.service.ingestLeiRelationships(children.map((id) => relationship(id, ROOT)));
+    const initial = await trace({ lei: ROOT, direction: 'children' });
+    expect(initial.nodes).toHaveLength(50);
+    expect(initial.totalAvailable).toBe(241);
+    const capped = await runToolContract(traceOwnershipTool, {
+      lei: ROOT,
+      direction: 'children',
+      limit: 500,
+    });
+    const domain = traceOwnershipTool.output.parse(capped.structuredContent);
+    expect(domain.nodes).toHaveLength(100);
+    expect(capped.structuredContent).toMatchObject({
+      notice: 'Requested limit 500 clamped to 100 records.',
+    });
+    const text = capped.content
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    expect(text).toContain('Requested limit 500 clamped to 100 records.');
+    expect(domain.byteTargetExceeded).toBe(
+      Buffer.byteLength(
+        JSON.stringify({ structuredContent: capped.structuredContent, content: capped.content }),
+      ) > 65536,
+    );
+    expect(() => traceOwnershipTool.input.parse({ lei: ROOT, limit: 0 })).toThrow();
+  });
+});
 
 describe('sanctions_trace_ownership walk sides and ultimate edges (issues #38, #58)', () => {
   let global: SeededService;
