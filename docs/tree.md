@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-11-01 03:59:25
+Generated on: 2026-11-11 13:58:48
 
 ```text
 sanctions-screening-mcp-server/
@@ -164,17 +164,18 @@ sanctions-screening-mcp-server/
 │   │   │       ├── entity.resource.ts
 │   │   │       ├── index.ts
 │   │   │       └── sources.resource.ts
-│   │   └── tools/
-│   │       └── definitions/
-│   │           ├── _shared.ts
-│   │           ├── get-designation.tool.ts
-│   │           ├── get-entity.tool.ts
-│   │           ├── index.ts
-│   │           ├── list-sources.tool.ts
-│   │           ├── resolve-entity.tool.ts
-│   │           ├── screen-identifier.tool.ts
-│   │           ├── screen-name.tool.ts
-│   │           └── trace-ownership.tool.ts
+│   │   ├── tools/
+│   │   │   └── definitions/
+│   │   │       ├── _shared.ts
+│   │   │       ├── get-designation.tool.ts
+│   │   │       ├── get-entity.tool.ts
+│   │   │       ├── index.ts
+│   │   │       ├── list-sources.tool.ts
+│   │   │       ├── resolve-entity.tool.ts
+│   │   │       ├── screen-identifier.tool.ts
+│   │   │       ├── screen-name.tool.ts
+│   │   │       └── trace-ownership.tool.ts
+│   │   └── normalize-inputs.ts
 │   ├── services/
 │   │   └── screening/
 │   │       ├── candidate-pool.ts
@@ -206,7 +207,9 @@ sanctions-screening-mcp-server/
 │   ├── integration/
 │   │   ├── fixtures/
 │   │   │   └── refresh-child.mjs
+│   │   ├── framework-adoption.test.ts
 │   │   ├── gleif-refresh-script.test.ts
+│   │   ├── input-normalization.test.ts
 │   │   ├── matching-correctness.test.ts
 │   │   ├── mirror-upgrade.test.ts
 │   │   ├── ownership-correctness.test.ts

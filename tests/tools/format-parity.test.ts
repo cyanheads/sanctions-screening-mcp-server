@@ -47,6 +47,9 @@ describe('sanctions_screen_name format()', () => {
           queryTokenCoverage: { covered: 2, total: 3 },
           program: 'UKRAINE-EO13662',
           designationDate: '2019-03-15',
+          birthDates: [{ date: '1968–1972', circa: true }, { date: '1970-07' }],
+          nationalities: ['RU', '[go](https://example.invalid)'],
+          addressCountries: ['GB', '*word* <b>x</b>'],
         },
       ],
       caveat: SCREENING_CAVEAT,
@@ -61,6 +64,9 @@ describe('sanctions_screen_name format()', () => {
     expect(text).toContain('Matched on:** "Ivan Wolkow" (aka)');
     expect(text).toContain('Program:** UKRAINE-EO13662');
     expect(text).toContain('Designated:** 2019-03-15');
+    expect(text).toContain('Birth dates:** circa 1968–1972, 1970-07');
+    expect(text).toContain(String.raw`Nationalities:** RU, \[go\](https://example.invalid)`);
+    expect(text).toContain(String.raw`Address countries:** GB, \*word\* \<b>x\</b>`);
     expect(text).toMatch(/not a compliance determination/i);
   });
 
@@ -87,6 +93,9 @@ describe('sanctions_screen_name format()', () => {
     expect(text).not.toContain('query tokens');
     expect(text).not.toContain('Program:');
     expect(text).not.toContain('Designated:');
+    expect(text).not.toContain('Birth dates:');
+    expect(text).not.toContain('Nationalities:');
+    expect(text).not.toContain('Address countries:');
     expect(text).not.toContain('Also listed on');
   });
 

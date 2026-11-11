@@ -152,6 +152,24 @@ describe('LEI check digits on a mirror miss (issue #62)', () => {
     }
   });
 
+  it('applies checksum-after-miss to lower-case inputs on all LEI surfaces', async () => {
+    for (const tool of [getEntityTool, traceOwnershipTool]) {
+      const heldResult = await runToolContract(tool, { lei: ANNULLED.toLowerCase() });
+      expect(heldResult.isError).toBeFalsy();
+      const miss = await runToolContract(tool, { lei: APPLE_TYPO.toLowerCase() });
+      expect(envelopeOf(miss)).toMatchObject({ data: { reason: 'invalid_lei_checksum' } });
+    }
+    await expect(
+      entityResource.handler(resourceParams(ANNULLED.toLowerCase()), ctxFor(entityResource.errors)),
+    ).resolves.toMatchObject({ lei: ANNULLED, status: 'ANNULLED' });
+    await expect(
+      entityResource.handler(
+        resourceParams(APPLE_TYPO.toLowerCase()),
+        ctxFor(entityResource.errors),
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_lei_checksum' } });
+  });
+
   it('leaves the input schemas accepting a checksum-failing LEI', () => {
     for (const lei of [APPLE_TYPO, ANNULLED]) {
       expect(getEntityTool.input.safeParse({ lei }).success).toBe(true);

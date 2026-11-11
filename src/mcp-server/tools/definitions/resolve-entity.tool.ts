@@ -9,12 +9,15 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { clampPageLimit, pageLimitSchema } from '@/mcp-server/normalize-inputs.js';
 import {
   getScreeningService,
   LEI_STRICT_SCAN_BOUND,
 } from '@/services/screening/screening-service.js';
 import { fold, tokenize } from '@/services/screening/text-matching.js';
-import { gleifNameTypeText, MAX_NAME_CHARS, MAX_NAME_WORDS } from './_shared.js';
+import { gleifNameTypeText, MAX_NAME_CHARS, MAX_NAME_WORDS, renderNotice } from './_shared.js';
+
+const PAGE_LIMIT = 50;
 
 export const resolveEntityTool = tool('sanctions_resolve_entity', {
   title: 'sanctions-screening-mcp-server: resolve entity',
@@ -55,7 +58,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       .enum(['any', 'issued', 'lapsed'])
       .default('issued')
       .describe(
-        "Registration status filter. issued (default) matches ISSUED; lapsed matches exactly LAPSED; any applies no filter and is the only value that reaches the other states (RETIRED, DUPLICATE, ANNULLED, PENDING_TRANSFER, PENDING_ARCHIVAL, MERGED) — each candidate's status field names its state.",
+        "Registration status filter. issued (default) matches ISSUED; lapsed matches exactly LAPSED; any also reaches other or missing statuses. If the filter leaves no strict match, notice reports strict candidates it excluded. Each candidate's status field names its published state.",
       ),
     minScore: z
       .number()
@@ -65,13 +68,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       .describe(
         "Jaro-Winkler floor for fuzzy hits (0–1); defaults to the server's configured floor.",
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(50)
-      .default(10)
-      .describe('Maximum LEI candidates to return in one page.'),
+    limit: pageLimitSchema(PAGE_LIMIT, 10, 'Maximum LEI candidates to return in one page.'),
     offset: z
       .number()
       .int()
@@ -164,9 +161,10 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       .string()
       .optional()
       .describe(
-        "Guidance when no LEI matched and how to broaden, when the requested offset sits past the end of the result set, when a bound cut the candidate set and how to narrow the name, or when the mirror has not indexed GLEIF's other and transliterated names yet, so only legal names were searched.",
+        "Guidance when no LEI matched and how to broaden, when the requested offset sits past the end of the result set, when a bound cut the candidate set and how to narrow the name, or when the mirror has not indexed GLEIF's other and transliterated names yet, so only legal names were searched. It also reports a clamped limit or strict candidates excluded by the registration-status filter.",
       ),
   },
+  enrichmentTrailer: { notice: { render: renderNotice } },
   errors: [
     {
       reason: 'name_not_searchable',
@@ -192,6 +190,8 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
   ],
 
   async handler(input, ctx) {
+    const notices: string[] = [];
+    const limit = clampPageLimit(input.limit, PAGE_LIMIT, 'sanctions_resolve_entity', ctx, notices);
     const words = tokenize(fold(input.name)).length;
     if (words === 0) {
       throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.');
@@ -215,7 +215,7 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
         matchMode: input.matchMode,
         status: input.status,
         ...(input.minScore !== undefined ? { minScore: input.minScore } : {}),
-        limit: input.limit,
+        limit,
         offset: input.offset,
       },
       ctx,
@@ -235,7 +235,6 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     // hide an out-of-range offset or read a paging artifact as "no LEI exists".
     // An empty result always follows a fuzzy pass (an empty strict pass falls
     // back), so the notice never suggests one.
-    const notices: string[] = [];
     if (result.totalAvailable === 0) {
       const broaden = [
         jurisdiction ? 'drop the jurisdiction filter' : '',
@@ -248,6 +247,16 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     } else if (result.matches.length === 0) {
       notices.push(
         `Offset ${input.offset} is past the end of this result set, which holds ${result.totalAvailable} LEI candidate(s)${result.totalAvailableBasis === 'lower_bound' ? ' — a lower bound: more may exist beyond it' : ''}. Re-request from offset 0 and page forward with nextOffset.`,
+      );
+    }
+    if (result.excludedStrict) {
+      const { count, countBasis, statuses } = result.excludedStrict;
+      const buckets = statuses.map(({ status, count }) =>
+        status === undefined ? `no published status: ${count}` : `${status}: ${count}`,
+      );
+      const bound = countBasis === 'lower_bound' ? 'at least ' : '';
+      notices.push(
+        `The registration-status filter excluded ${bound}${count} strict candidates (${buckets.join(', ')}). Set status:"any" to include them.`,
       );
     }
     if (result.strictScanBounded) {

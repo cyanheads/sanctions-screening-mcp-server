@@ -294,6 +294,10 @@ export type MatchMode = 'strict' | 'fuzzy';
 
 /** A scored screening hit returned by the matching engine. */
 export interface ScreeningHit {
+  /** Distinct published countries from the matched designation’s addresses. */
+  addressCountries?: string[];
+  /** Published dates of birth at their stored precision. */
+  birthDates?: { date: string; circa?: true }[];
   /** The source's own designation date, `YYYY-MM-DD`, when published. */
   designationDate?: string;
   /** `{source}:{sourceEntryId}` of the matched designation. */
@@ -304,6 +308,8 @@ export interface ScreeningHit {
   /** Provenance of the matched name (primary / aka / fka / low-quality-aka). */
   matchedNameType: NameType;
   matchType: MatchType;
+  /** Nationalities published by the matched designation. */
+  nationalities?: string[];
   /** Primary published name of the matched designation. */
   primaryName: string;
   program?: string;

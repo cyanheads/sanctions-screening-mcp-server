@@ -16,6 +16,7 @@ import { FIXTURE_LEI_ENTITIES } from '@/services/screening/fixtures.js';
 import { LEI_NAME_NORMALIZED_INDEX, LEI_STATUS_INDEX } from '@/services/screening/schema.js';
 import {
   LEGACY_LEI_FUZZY_PREFIX_SCANS,
+  LEI_STRICT_SCAN_BOUND,
   type ResolveEntityOptions,
   type ScreeningService,
 } from '@/services/screening/screening-service.js';
@@ -500,6 +501,104 @@ describe('status filter (#23)', () => {
   });
 });
 
+describe.each(['indexed', 'legacy'] as const)(
+  'strict exclusions under a status filter (%s)',
+  (path) => {
+    beforeEach(async () => {
+      await svc.ingestLeiEntities([
+        {
+          lei: lei('EXCLUDED1'),
+          legalName: 'Quaverstone',
+          otherNames: ['Quaverstone Holdings'],
+          jurisdiction: 'GB',
+          status: 'LAPSED',
+        },
+        {
+          lei: lei('EXCLUDED2'),
+          legalName: 'Quaverstone UK',
+          otherNames: [],
+          jurisdiction: 'GB',
+          status: 'LAPSED',
+        },
+        {
+          lei: lei('EXCLUDED3'),
+          legalName: 'Quaverstone Registry',
+          otherNames: [],
+          jurisdiction: 'GB',
+        },
+        {
+          lei: lei('EXCLUDED4'),
+          legalName: 'Quaverstone Registry',
+          otherNames: [],
+          jurisdiction: 'DE',
+          status: 'RETIRED',
+        },
+        {
+          lei: lei('ISSUED1'),
+          legalName: 'Quaverston',
+          otherNames: [],
+          jurisdiction: 'GB',
+          status: 'ISSUED',
+        },
+      ]);
+      if (path === 'legacy') {
+        await svc.leiEntities.store.writeState({
+          status: 'complete',
+          completedAt: '2027-01-01T00:00:00.000Z',
+          total: 5,
+        });
+      }
+    });
+
+    it('returns the issued fuzzy candidate in the same order (characterization)', async () => {
+      const result = await resolve({ query: 'Quaverstone', jurisdiction: 'GB', status: 'issued' });
+      expect(result.alternateNamesIndexed).toBe(path === 'indexed');
+      expect(result.fuzzyFallbackTriggered).toBe(true);
+      expect(result.matches.map((match) => [match.lei, match.status, match.matchType])).toEqual([
+        [lei('ISSUED1'), 'ISSUED', 'approximate'],
+      ]);
+    });
+
+    it('reports strict exclusions independently of paging, with one count per LEI', async () => {
+      const result = await resolve({
+        query: 'Quaverstone',
+        jurisdiction: 'GB',
+        status: 'issued',
+        offset: 99,
+      });
+      expect(result.matches).toEqual([]);
+      expect(result.excludedStrict).toEqual({
+        count: 3,
+        countBasis: 'exact',
+        statuses: [{ status: 'LAPSED', count: 2 }, { count: 1 }],
+      });
+    });
+
+    it('reports issued candidates excluded by lapsed', async () => {
+      const result = await resolve({ query: 'Quaverston', status: 'lapsed' });
+      expect(result.excludedStrict).toEqual({
+        count: 1,
+        countBasis: 'exact',
+        statuses: [{ status: 'ISSUED', count: 1 }],
+      });
+    });
+
+    it.each([
+      [{ status: 'issued', jurisdiction: 'US' }, 2],
+      [{ status: 'any' }, 1],
+      [{ status: 'lapsed', jurisdiction: 'GB' }, 1],
+    ] as const)('omits exclusion metadata for %j after %i strict scans', async (opts, count) => {
+      const handle = await svc.leiEntities.raw();
+      const statements = await captureStatements(handle, async () => {
+        expect((await resolve({ query: 'Quaverstone', ...opts })).excludedStrict).toBeUndefined();
+      });
+      expect(
+        statements.filter(({ sql }) => sql.includes(`LIMIT ${LEI_STRICT_SCAN_BOUND}`)),
+      ).toHaveLength(count);
+    });
+  },
+);
+
 // ─── #36: a country includes its subdivisions ─────────────────────────────────
 
 const APPLE_US_CA = 'HWUPKR0MPOU8FGXBT394';
@@ -852,6 +951,19 @@ describe('strict resolution — exact names first, under the scan bound (#9)', (
     status,
   });
   const EXACT_STATEMENT = /\bnormalized = \?/;
+
+  it('marks status exclusion counts as lower bounds when their strict scan caps', async () => {
+    await svc.ingestLeiEntities(
+      crowd(LEI_STRICT_SCAN_BOUND + 1).map((entity) => ({ ...entity, status: 'LAPSED' })),
+    );
+    const result = await resolve({ query: 'Quorvane', status: 'issued', jurisdiction: 'US' });
+    expect(result.excludedStrict).toEqual({
+      count: LEI_STRICT_SCAN_BOUND,
+      countBasis: 'lower_bound',
+      statuses: [{ status: 'LAPSED', count: LEI_STRICT_SCAN_BOUND }],
+    });
+    expect(result.matches).toEqual([]);
+  });
 
   it('returns every exact name ahead of the strong matches when the bound binds', async () => {
     // Written after 2,100 strong names, so no exact name is among the first 2,000 the scan reads.

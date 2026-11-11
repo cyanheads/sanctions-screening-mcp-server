@@ -9,6 +9,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { CSL_SOURCE_CODES } from '@/services/screening/csl-ingest.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
@@ -41,6 +42,14 @@ export const SCREENING_CAVEAT =
 export const MAX_NAME_CHARS = 1024;
 /** See {@link MAX_NAME_CHARS}. */
 export const MAX_NAME_WORDS = 64;
+
+/** Render raw notice text as a Markdown blockquote without interpreting its markup. */
+export function renderNotice(notice: string | undefined): string {
+  return escapeMarkdownInline(notice ?? '')
+    .split('\n')
+    .map((line) => `> ${line}`)
+    .join('\n');
+}
 
 /** Redistribution terms per sanctions source, surfaced for attribution. */
 export const SOURCE_LICENSES: Record<SourceCode, string> = {

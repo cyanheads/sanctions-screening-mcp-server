@@ -47,7 +47,7 @@ const resources = [
   ['sanctions://sources', sourcesResource],
 ] as const;
 
-const LEI_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const LEI_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
 /** `count` LEIs the input schemas accept (18 alphanumerics + 2 digits), from a fixed-seed LCG. */
 function schemaValidLeis(count: number): string[] {
@@ -57,7 +57,7 @@ function schemaValidLeis(count: number): string[] {
     return state % bound;
   };
   return Array.from({ length: count }, () => {
-    const body = Array.from({ length: 18 }, () => LEI_ALPHABET[next(36)]).join('');
+    const body = Array.from({ length: 18 }, () => LEI_ALPHABET[next(LEI_ALPHABET.length)]).join('');
     return `${body}${next(10)}${next(10)}`;
   });
 }

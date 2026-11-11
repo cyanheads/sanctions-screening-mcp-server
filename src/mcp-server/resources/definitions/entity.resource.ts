@@ -7,6 +7,7 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { canonicalLei, LeiInputSchema } from '@/mcp-server/normalize-inputs.js';
 import { leiChecksumValid } from '@/services/screening/lei-checksum.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 
@@ -20,10 +21,7 @@ export const entityResource = resource('sanctions://entity/{lei}', {
   // Private for the same reason as the designation resource.
   cacheHint: { ttlMs: 3_600_000, cacheScope: 'private' },
   params: z.object({
-    lei: z
-      .string()
-      .regex(/^[A-Z0-9]{18}[0-9]{2}$/, 'LEI must be 20 chars: 18 alphanumerics + 2 check digits.')
-      .describe('The 20-character GLEIF Legal Entity Identifier.'),
+    lei: LeiInputSchema.describe('The 20-character GLEIF Legal Entity Identifier.'),
   }),
   errors: [
     {
@@ -50,19 +48,20 @@ export const entityResource = resource('sanctions://entity/{lei}', {
   ],
 
   async handler(params, ctx) {
+    const lei = canonicalLei(params.lei, 'sanctions://entity/{lei}', ctx);
     const svc = getScreeningService();
     // Readiness first, mirroring sanctions_get_entity, and gated on the GLEIF
     // mirror alone — the two mirrors sync independently.
     if (!(await svc.leiReady())) {
       throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.');
     }
-    const entity = await svc.getLeiEntity(params.lei);
+    const entity = await svc.getLeiEntity(lei);
     if (!entity) {
-      throw leiChecksumValid(params.lei)
-        ? ctx.fail('lei_not_found', `No GLEIF entity with LEI "${params.lei}".`)
+      throw leiChecksumValid(lei)
+        ? ctx.fail('lei_not_found', `No GLEIF entity with LEI "${lei}".`)
         : ctx.fail(
             'invalid_lei_checksum',
-            `LEI "${params.lei}" fails its ISO 17442 check digits, and no GLEIF entity carries it.`,
+            `LEI "${lei}" fails its ISO 17442 check digits, and no GLEIF entity carries it.`,
           );
     }
     return entity;

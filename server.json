@@ -41,6 +41,13 @@
           "format": "string",
           "isRequired": false,
           "default": "0.85"
+        },
+        {
+          "name": "SANCTIONS_NORMALIZE_INPUTS",
+          "description": "Accept mixed-case LEIs and clamp oversized name-search page limits. Set false to enforce uppercase LEIs and page maxima at validation.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {
@@ -121,6 +128,13 @@
           "format": "string",
           "isRequired": false,
           "default": "0.85"
+        },
+        {
+          "name": "SANCTIONS_NORMALIZE_INPUTS",
+          "description": "Accept mixed-case LEIs and clamp oversized name-search page limits. Set false to enforce uppercase LEIs and page maxima at validation.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {

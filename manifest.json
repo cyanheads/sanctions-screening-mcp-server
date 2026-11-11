@@ -14,7 +14,8 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "SANCTIONS_NORMALIZE_INPUTS": "${user_config.sanctions_normalize_inputs}"
       }
     }
   },
@@ -23,5 +24,13 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "sanctions_normalize_inputs": {
+      "type": "boolean",
+      "title": "Normalize screening inputs",
+      "description": "Accept mixed-case LEIs and clamp oversized name-search page limits.",
+      "required": false,
+      "default": true
+    }
+  }
 }

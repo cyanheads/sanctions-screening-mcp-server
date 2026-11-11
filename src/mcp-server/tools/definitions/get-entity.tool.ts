@@ -12,6 +12,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { canonicalLei, LeiInputSchema } from '@/mcp-server/normalize-inputs.js';
 import { crossReferenceEntity } from '@/services/screening/cross-reference.js';
 import { leiChecksumValid } from '@/services/screening/lei-checksum.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
@@ -27,8 +28,6 @@ import {
   ScreenedInputSchema,
   screenedInputText,
 } from './_shared.js';
-
-const LEI_RE = /^[A-Z0-9]{18}[0-9]{2}$/;
 
 /**
  * Potential matches the cross-reference returns, after merging every input's
@@ -46,13 +45,7 @@ export const getEntityTool = tool('sanctions_get_entity', {
     "Fetch the full GLEIF Level 1 record for one LEI: legal name, other/trading names, legal and headquarters addresses, registration status, jurisdiction, registration authority and ID, and last-update date — plus a sanctions cross-reference against all loaded watchlists. The cross-reference screens the legal name and every other and transliterated name strict (exact, then all tokens present — never fuzzy, unlike sanctions_screen_name), and looks up the LEI and the registration number as exact non-document identifiers, the registration number matching only an identifier published for the country of the entity's legal jurisdiction. Hits merge to one per designation, an OFAC party both OFAC lists publish to one hit whose sources names both: matchedOn names every input that produced each, and a hit only an identifier produced carries matchedIdentifiers and no matchedName. The screening cross-reference is a screening AID: a hit is a candidate to verify against the official source, and no hit is not a clearance. screeningStatus says whether that cross-reference actually ran — an empty sanctionsHits under not_ready means the sanctions mirror was unavailable, not that nothing matched. sanctionsScreen says whether the hit list is the whole set: it reports how many potential matches existed before the cap, so a capped cross-reference is distinguishable from a complete one. LEI must be a 20-character GLEIF identifier (18 alphanumerics + 2 check digits).",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
-    lei: z
-      .string()
-      .regex(
-        LEI_RE,
-        'LEI must be 20 chars: 18 alphanumerics + 2 check digits (e.g. 5493001KJTIIGC8Y1R12).',
-      )
-      .describe('The 20-character GLEIF Legal Entity Identifier to look up.'),
+    lei: LeiInputSchema.describe('The 20-character GLEIF Legal Entity Identifier to look up.'),
   }),
   output: z.object({
     lei: z.string().describe('The 20-character GLEIF Legal Entity Identifier.'),
@@ -70,7 +63,7 @@ export const getEntityTool = tool('sanctions_get_entity', {
             type: z
               .string()
               .describe(
-                "GLEIF name type: PREVIOUS_LEGAL_NAME (a former legal name, not the current one), TRADING_OR_OPERATING_NAME, ALTERNATIVE_LANGUAGE_LEGAL_NAME, PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME, AUTO_ASCII_TRANSLITERATED_LEGAL_NAME, or UNKNOWN for a name the mirror stored without GLEIF's type.",
+                'Published GLEIF name type, or UNKNOWN if missing. PREVIOUS_LEGAL_NAME is a former name.',
               ),
           })
           .describe('One name GLEIF publishes beside the legal name.'),
@@ -104,7 +97,7 @@ export const getEntityTool = tool('sanctions_get_entity', {
             source: z
               .enum(SOURCE_CODES)
               .describe(
-                'Watchlist whose record this hit is attributed to: primaryName comes from it. For an OFAC party both OFAC lists publish, ofac_sdn unless the Consolidated record matched alone or better, and matchedName, matchedIdentifiers, and matchedOn cover what either record matched; sources names every list.',
+                'Source of primaryName. Grouped OFAC hits use SDN unless Consolidated matched alone or better. Evidence and sources cover both records.',
               ),
             sourceLabel: z.string().describe('Human-readable source list name.'),
             sourceEntryId: z
@@ -116,31 +109,25 @@ export const getEntityTool = tool('sanctions_get_entity', {
               .string()
               .optional()
               .describe(
-                "The designation's name or alias that matched one of the entity's screened names — the strongest match. Absent when only an identifier produced the hit.",
+                'Strongest matching designation name or alias. Absent for identifier-only hits.',
               ),
             matchType: z
               .enum(['exact', 'strong', 'approximate'])
               .optional()
-              .describe(
-                'Match classification of matchedName: exact or strong, never approximate (the cross-reference screens strict, never fuzzy). Absent when only an identifier produced the hit.',
-              ),
+              .describe('Exact or strong, never approximate. Absent for identifier-only hits.'),
             score: z
               .number()
               .optional()
-              .describe(
-                'Never set by this cross-reference: only an approximate (fuzzy) match carries a raw Jaro-Winkler score, and the cross-reference screens strict.',
-              ),
+              .describe('Never set here: the cross-reference uses strict matching.'),
             matchedIdentifiers: z
               .array(MatchedIdentifierSchema)
               .optional()
               .describe(
-                "Every identifier the designation publishes that equals the entity's LEI or its country-matched registration number, as published. Present only when an identifier produced the hit.",
+                'Published identifiers matching the LEI or country-matched registration number. Absent for name-only hits.',
               ),
             matchedOn: z
               .array(ScreenedInputSchema)
-              .describe(
-                'Every input of the entity that produced this hit — its legal name, an other or transliterated name, its LEI, or its registration number — in screening order.',
-              ),
+              .describe('All matching name and identifier inputs, in screening order.'),
           })
           .describe(
             "A potential watchlist match on one or more of the entity's names or identifiers — verify, do not assume.",
@@ -154,33 +141,27 @@ export const getEntityTool = tool('sanctions_get_entity', {
         totalAvailable: z
           .number()
           .int()
-          .describe(
-            'Distinct designations the cross-reference found across every screened name and identifier, an OFAC party both OFAC lists publish counted once, before the cap was applied.',
-          ),
+          .describe('Distinct designations before the cap, grouping duplicate OFAC parties.'),
         totalAvailableBasis: z
           .enum(['exact', 'lower_bound'])
-          .describe(
-            'How to read totalAvailable. Always exact here: every name is screened strict, never fuzzy, and a strict screen counts every designation it reaches, so totalAvailable is the whole set across the screened names and identifiers.',
-          ),
+          .describe('Always exact: all strict name and exact identifier hits are counted.'),
         hasMore: z
           .boolean()
           .describe(
-            "True when the potential matches were capped — re-screen the entity's names with sanctions_screen_name and look up its LEI and registration number with sanctions_screen_identifier to see the rest.",
+            'True if capped. Recover with sanctions_screen_name for names and sanctions_screen_identifier for LEI and registration number.',
           ),
         screenedInputs: z
           .array(ScreenedInputSchema)
           .describe(
-            'What the cross-reference screened beyond the legal name and the LEI, which it always screens: every other and transliterated name, then the registration number when the entity publishes one (a not-available placeholder such as N/A is none) and a legal jurisdiction to match it by. Empty when there is nothing beyond those two.',
+            'Inputs beyond legal name and LEI: other and transliterated names, then a published registration number with jurisdiction, excluding placeholders such as N/A. Empty with no extras.',
           ),
       })
       .optional()
-      .describe(
-        "Disclosure for the cross-reference: how many potential matches existed before the cap, whether sanctionsHits is the complete set, and what was screened. Present only when screeningStatus is 'screened'.",
-      ),
+      .describe("Coverage and cap disclosure. Present only when screeningStatus is 'screened'."),
     screeningStatus: z
       .enum(['screened', 'not_ready'])
       .describe(
-        "Whether the cross-reference ran: screened = the entity's names and identifiers were screened against every loaded watchlist; not_ready = the sanctions mirror has never synced, so no screening ran and the empty sanctionsHits says nothing about this entity. Read sanctionsHits only when this is 'screened'.",
+        'screened = all loaded lists searched; not_ready = sanctions mirror never synced and empty sanctionsHits is inconclusive.',
       ),
     caveat: z
       .string()
@@ -213,18 +194,19 @@ export const getEntityTool = tool('sanctions_get_entity', {
   ],
 
   async handler(input, ctx) {
+    const lei = canonicalLei(input.lei, 'sanctions_get_entity', ctx);
     const svc = getScreeningService();
     if (!(await svc.leiReady())) {
       throw ctx.fail('mirror_not_ready', 'The local GLEIF (LEI) mirror is not yet populated.');
     }
 
-    const entity = await svc.getLeiEntity(input.lei);
+    const entity = await svc.getLeiEntity(lei);
     if (!entity) {
-      throw leiChecksumValid(input.lei)
-        ? ctx.fail('lei_not_found', `No GLEIF entity with LEI "${input.lei}".`)
+      throw leiChecksumValid(lei)
+        ? ctx.fail('lei_not_found', `No GLEIF entity with LEI "${lei}".`)
         : ctx.fail(
             'invalid_lei_checksum',
-            `LEI "${input.lei}" fails its ISO 17442 check digits, and no GLEIF entity carries it.`,
+            `LEI "${lei}" fails its ISO 17442 check digits, and no GLEIF entity carries it.`,
           );
     }
 

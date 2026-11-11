@@ -7,6 +7,7 @@
  * @module services/screening/sanctions-refresh
  */
 
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { SyncResult } from '@cyanheads/mcp-ts-core/mirror';
 import {
   logger,
@@ -89,6 +90,8 @@ export async function refreshMirrors(
   try {
     sanctions = await service.syncSanctions('refresh', signal);
   } catch (err) {
+    // Another writer is already refreshing the shared mirror.
+    if (err instanceof McpError && err.data?.reason === 'sync_locked') throw err;
     failures.push(err);
   }
   let gleif: GleifRefreshOutcome | undefined;

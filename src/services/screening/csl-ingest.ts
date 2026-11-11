@@ -39,6 +39,7 @@ export const CSL_SOURCE_CODES = [
 type CslSource = (typeof CSL_SOURCE_CODES)[number];
 const optionalText = z.string().nullish();
 const texts = z.array(z.string()).nullish();
+const isoDate = z.iso.date();
 const RecordSchema = z.object({
   source: z.string(),
   id: optionalText,
@@ -134,6 +135,19 @@ function entityType(value: string | null | undefined): EntityType {
   }
 }
 
+/** Convert calendar-valid CSL US dates; preserve other published text. */
+function designationDate(value: string | null | undefined): string | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  return text.replace(
+    /^(\d{1,2})\/(\d{1,2})\/(?!0000)(\d{4})$/,
+    (original, month: string, day: string, year: string) => {
+      const candidate = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+      return isoDate.safeParse(candidate).success ? candidate : original;
+    },
+  );
+}
+
 function normalize(
   record: CslRecord,
   source: CslSource,
@@ -156,6 +170,7 @@ function normalize(
     ...places.map((place) => ({ place })),
   ];
   const program = published(record.programs).join('; ');
+  const startDate = designationDate(record.start_date);
   return {
     id: `${source}:${id}`,
     source,
@@ -163,7 +178,7 @@ function normalize(
     primaryName: name,
     entityType: entityType(record.type),
     ...(program ? { program } : {}),
-    ...(record.start_date ? { designationDate: record.start_date } : {}),
+    ...(startDate ? { designationDate: startDate } : {}),
     payload: {
       aliases: [...new Set((record.alt_names ?? []).map((name) => name.trim()))]
         .filter(isUsableName)

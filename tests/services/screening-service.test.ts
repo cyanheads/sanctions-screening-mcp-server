@@ -11,7 +11,10 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FUZZY_POOL_BUDGET } from '@/services/screening/candidate-pool.js';
 import { parseOfac } from '@/services/screening/sanctions-ingest.js';
-import type { ScreeningService } from '@/services/screening/screening-service.js';
+import {
+  buildScreeningService,
+  type ScreeningService,
+} from '@/services/screening/screening-service.js';
 import { doubleMetaphone } from '@/services/screening/text-matching.js';
 import {
   type NormalizedDesignation,
@@ -588,6 +591,76 @@ describe('screenName — filters', () => {
   });
 });
 
+describe('screenName — unknown types under a typed filter', () => {
+  beforeEach(async () => {
+    await svc.ingestDesignations([
+      listed('bis_el', 'TYPE-1', 'Zelvan Rostok Marinsk', 'unknown'),
+      listed('eu', 'TYPE-2', 'Zelvan Rostok Marinsk', 'organization'),
+    ]);
+  });
+
+  it('keeps the source type when screening without a filter (characterization)', async () => {
+    const result = await svc.screenName(
+      { ...screenDefaults, query: 'Zelvan Rostok Marinsk', sources: ['bis_el'] },
+      ctx,
+    );
+    expect(result.hits.map((hit) => [hit.designationId, hit.entityType, hit.matchType])).toEqual([
+      ['bis_el:TYPE-1', 'unknown', 'exact'],
+    ]);
+  });
+
+  it.each(['person', 'organization', 'vessel', 'aircraft'] as const)(
+    'keeps an unknown exact hit under %s',
+    async (entityType) => {
+      const result = await svc.screenName(
+        { ...screenDefaults, query: 'Zelvan Rostok Marinsk', sources: ['bis_el'], entityType },
+        ctx,
+      );
+      expect(result.hits.map((hit) => [hit.designationId, hit.entityType, hit.matchType])).toEqual([
+        ['bis_el:TYPE-1', 'unknown', 'exact'],
+      ]);
+    },
+  );
+
+  it.each(['fuzzy', 'strict'] as const)(
+    'keeps a fuzzy-only unknown hit in %s mode',
+    async (matchMode) => {
+      const result = await svc.screenName(
+        {
+          ...screenDefaults,
+          query: 'Zelvann Rostock Marinska',
+          sources: ['bis_el'],
+          entityType: 'organization',
+          matchMode,
+        },
+        ctx,
+      );
+      expect(result.hits.map((hit) => [hit.designationId, hit.entityType, hit.matchType])).toEqual([
+        ['bis_el:TYPE-1', 'unknown', 'approximate'],
+      ]);
+    },
+  );
+
+  it('keeps a full-coverage unknown hit from a strict-empty list', async () => {
+    await svc.ingestDesignations([
+      listed('bis_dpl', 'TYPE-3', 'Zelvann Rostock Marinska', 'unknown'),
+    ]);
+    const result = await svc.screenName(
+      {
+        ...screenDefaults,
+        query: 'Zelvan Rostok Marinsk',
+        sources: ['eu', 'bis_dpl'],
+        entityType: 'organization',
+      },
+      ctx,
+    );
+    expect(result.hits.map((hit) => [hit.designationId, hit.entityType, hit.matchType])).toEqual([
+      ['eu:TYPE-2', 'organization', 'exact'],
+      ['bis_dpl:TYPE-3', 'unknown', 'approximate'],
+    ]);
+  });
+});
+
 describe('source filter — a repeated list counts once (issue #73)', () => {
   /** As many entries as there are lists, every one the same list. */
   const repeated = (source: SourceCode): SourceCode[] => SOURCE_CODES.map(() => source);
@@ -628,6 +701,75 @@ describe('source filter — a repeated list counts once (issue #73)', () => {
     });
     expect(hits.map((hit) => [hit.source, hit.sources])).toEqual([['eu', ['eu']]]);
   });
+});
+
+describe('screenIdentifier — IMO company numbers', () => {
+  const identifier = { type: 'Identification Number', value: 'IMO 1790183' };
+  const screen = (service: ScreeningService, value: string, type: 'any' | 'imo' | 'other') =>
+    service.screenIdentifier({ value, type, sources: ['ofac_sdn'] });
+
+  beforeEach(async () => {
+    const entity = listed(
+      'ofac_sdn',
+      '17068',
+      'Ocean Maritime Management Company Limited',
+      'organization',
+    );
+    await svc.ingestDesignations([
+      { ...entity, payload: { ...entity.payload, identifiers: [identifier] } },
+    ]);
+  });
+
+  it.each([
+    ['1790183', 'any'],
+    ['IMO 1790183', 'imo'],
+    ['IMO 1790183', 'any'],
+  ] as const)('matches %s under %s once, with the published identifier', async (value, type) => {
+    const hits = await screen(svc, value, type);
+    expect(hits.map((hit) => [hit.source, hit.sourceEntryId, hit.matchedIdentifiers])).toEqual([
+      ['ofac_sdn', '17068', [identifier]],
+    ]);
+  });
+
+  it('excludes the IMO number from other lookups', async () => {
+    expect(await screen(svc, 'IMO 1790183', 'other')).toEqual([]);
+  });
+
+  it.each(['complete', 'in_progress'] as const)(
+    'rebuilds an unversioned identifier index on reopen while sync is %s',
+    async (status) => {
+      const handle = await svc.designations.raw();
+      const state = await svc.designations.store.readState();
+      handle
+        .prepare('UPDATE designation_identifier_stamp SET stamp = ? WHERE id = 1')
+        .run(`${state.startedAt ?? ''}|${state.completedAt ?? ''}`);
+      handle.exec(
+        "UPDATE designation_identifier SET category = 'other', key = 'IMO1790183' WHERE designation_id = 'ofac_sdn:17068'",
+      );
+      await svc.designations.store.writeState({ ...state, status });
+      await svc.close();
+      const reopened = buildScreeningService();
+      try {
+        const hits = await screen(reopened, '1790183', 'imo');
+        expect(hits.map((hit) => [hit.source, hit.sourceEntryId, hit.matchedIdentifiers])).toEqual([
+          ['ofac_sdn', '17068', [identifier]],
+        ]);
+        const reopenedHandle = await reopened.designations.raw();
+        expect(
+          reopenedHandle
+            .prepare('SELECT category, key FROM designation_identifier WHERE designation_id = ?')
+            .all('ofac_sdn:17068'),
+        ).toEqual([{ category: 'imo', key: '1790183' }]);
+        expect(
+          reopenedHandle
+            .prepare('SELECT stamp FROM designation_identifier_stamp WHERE id = 1')
+            .get(),
+        ).toEqual({ stamp: `v1:${state.startedAt ?? ''}|${state.completedAt ?? ''}` });
+      } finally {
+        await reopened.close();
+      }
+    },
+  );
 });
 
 describe('screenName — offset pagination and overflow disclosure (issue #9)', () => {
@@ -2087,6 +2229,59 @@ describe('OFAC SDN + Consolidated grouping (issue #61)', () => {
       designationDate: '2014-09-12',
       sources: ['ofac_sdn', 'ofac_consolidated'],
     });
+  });
+
+  it('projects only the returned copy’s published details, preserving sparse fields', async () => {
+    const sdn = listed('ofac_sdn', 'BIO-1', 'Chaldeo Vesper Archive', 'person');
+    const consolidated = listed('ofac_consolidated', 'BIO-1', 'Chaldeo Vesper', 'person');
+    const sparse = listed('eu', 'BIO-2', 'Chaldeo Vesper Holdings', 'person');
+    await svc.ingestDesignations([
+      {
+        ...sdn,
+        payload: { ...sdn.payload, datesOfBirth: [{ date: '1980-01-01' }], nationalities: ['IT'] },
+      },
+      {
+        ...consolidated,
+        payload: {
+          ...consolidated.payload,
+          datesOfBirth: [
+            { date: '1955/1957', circa: true, place: 'A' },
+            { date: '1960-02' },
+            { place: 'B' },
+          ],
+          nationalities: ['MA', 'FR'],
+          addresses: [
+            { full: '1', country: 'FR' },
+            { full: '2', country: 'FR' },
+            { full: '3', country: 'MA' },
+            { full: '4' },
+          ],
+        },
+      },
+      { ...sparse, payload: { ...sparse.payload, datesOfBirth: [{ place: 'C' }] } },
+    ]);
+    const options = { ...screenDefaults, query: 'Chaldeo Vesper', autoFallback: false, limit: 1 };
+    const unhydrated = await svc.screenName(options, ctx);
+    expect(unhydrated.hits[0]).not.toHaveProperty('birthDates');
+    const first = await svc.screenName({ ...options, includeDetails: true }, ctx);
+    expect(first.totalAvailable).toBe(2);
+    expect(first.hits).toEqual([
+      {
+        ...unhydrated.hits[0],
+        designationId: 'ofac_consolidated:BIO-1',
+        sources: ['ofac_sdn', 'ofac_consolidated'],
+        birthDates: [{ date: '1955/1957', circa: true }, { date: '1960-02' }],
+        nationalities: ['MA', 'FR'],
+        addressCountries: ['FR', 'MA'],
+      },
+    ]);
+    const second = await svc.screenName({ ...options, includeDetails: true, offset: 1 }, ctx);
+    expect(second.hits.map((hit) => hit.designationId)).toEqual(['eu:BIO-2']);
+    expect(second.hits[0]).not.toHaveProperty('birthDates');
+    expect(second.hits[0]).not.toHaveProperty('nationalities');
+    expect(second.hits[0]).not.toHaveProperty('addressCountries');
+    const afterEnd = await svc.screenName({ ...options, includeDetails: true, offset: 2 }, ctx);
+    expect(afterEnd.hits).toEqual([]);
   });
 
   it('pages grouped hits disjointly, never splitting a pair across pages', async () => {

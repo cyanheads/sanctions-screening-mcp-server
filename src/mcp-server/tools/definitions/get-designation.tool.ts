@@ -10,6 +10,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES, SOURCE_LABELS, type SourceCode } from '@/services/screening/types.js';
 import { SCREENING_CAVEAT } from './_shared.js';
@@ -53,7 +54,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       .string()
       .optional()
       .describe(
-        "The source's own designation date as YYYY-MM-DD; absent when unpublished. An OFAC party is dated from its entries on the lists that file publishes, so its ofac_sdn and ofac_consolidated records can differ.",
+        "Designation date in YYYY-MM-DD when known to day precision, or published date text otherwise; absent when unpublished. An OFAC party's date can differ between its ofac_sdn and ofac_consolidated records.",
       ),
     aliases: z
       .array(
@@ -228,7 +229,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     lines.push(`**Type:** ${r.entityType}`);
     if (r.program) lines.push(`**Program:** ${r.program}`);
     if (r.legalBasis) lines.push(`**Legal basis:** ${r.legalBasis}`);
-    if (r.designationDate) lines.push(`**Designated:** ${r.designationDate}`);
+    if (r.designationDate) lines.push(`**Designated:** ${escapeMarkdownInline(r.designationDate)}`);
 
     if (r.aliases.length > 0) {
       lines.push('\n## Aliases');

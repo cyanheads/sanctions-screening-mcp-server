@@ -16,6 +16,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import type {
   Mirror,
   SqliteHandle,
@@ -145,6 +146,8 @@ export interface ScreenNameOptions {
    */
   autoFallback?: boolean;
   entityType: EntityType | 'any';
+  /** Read corroborating designation details for the returned page. Defaults to false. */
+  includeDetails?: boolean;
   limit: number;
   matchMode: MatchMode;
   /** Jaro-Winkler floor for fuzzy hits; defaults to config `fuzzyMinScore`. */
@@ -207,6 +210,13 @@ export interface ResolveEntityResult {
    * transliterated name could not be found.
    */
   alternateNamesIndexed: boolean;
+  /** Strict candidates excluded by an active registration-status filter. */
+  excludedStrict?: {
+    count: number;
+    countBasis: CountBasis;
+    /** An entry without a status counts LEIs with no published registration status. */
+    statuses: { status?: string; count: number }[];
+  };
   fuzzyFallbackTriggered: boolean;
   matches: LeiMatch[];
   modeUsed: MatchMode;
@@ -489,9 +499,9 @@ export class ScreeningService {
    * the name index but never touches the identifier index, so a mirror it wrote —
    * or synced after a rollback — would otherwise answer identifier lookups from
    * missing or stale rows, and for a screening aid an empty answer reads as a
-   * clearance. The index carries the sync-state stamp of the run it followed; a
-   * different stamp means a run it did not follow. While a run is in progress its
-   * own rebuild follows, so only an index holding nothing is rebuilt then.
+   * clearance. The index carries its classification version and the sync-state
+   * stamp of the run it followed. During a sync, an index on the current
+   * classification version can serve until the post-sync rebuild.
    *
    * The name index follows the same rule, under its own stamp, which only this
    * release and later ones write. An earlier release reads `name_fts` alone and
@@ -524,7 +534,11 @@ export class ScreeningService {
           requestContextService.createRequestContext({ operation: 'mirror.nameIndexRebuild' }),
         );
       }
-      const stale = state.status !== 'in_progress' && identifierStamp(raw) !== stamp;
+      const builtIdentifiers = identifierStamp(raw);
+      const stale =
+        !builtIdentifiers?.startsWith(IDENTIFIER_STAMP_VERSION) ||
+        (state.status !== 'in_progress' &&
+          builtIdentifiers !== `${IDENTIFIER_STAMP_VERSION}${stamp}`);
       if (stale || identifierIndexUnbuilt(raw)) {
         raw.transaction(() => rebuildIdentifierIndex(raw, stamp));
         logger.info(
@@ -583,10 +597,18 @@ export class ScreeningService {
    *   that failed, or the caller's abort.
    */
   async syncSanctions(mode: SyncMode, signal: AbortSignal): Promise<SyncResult> {
+    let rebuild = true;
     try {
       return await this.designationMirror.runSync({ mode, signal });
+    } catch (error) {
+      if (error instanceof McpError) {
+        const reason = error.data?.reason;
+        // The lease holder owns the writes and the ensuing index rebuild.
+        if (reason === 'sync_locked' || reason === 'sync_lease_lost') rebuild = false;
+      }
+      throw error;
     } finally {
-      await this.rebuildSearchIndexes();
+      if (rebuild) await this.rebuildSearchIndexes();
     }
   }
 
@@ -1128,7 +1150,7 @@ export class ScreeningService {
     const typeFilter =
       opts.entityType === 'any'
         ? ''
-        : ` AND d.entity_type = '${this.escapeLiteral(opts.entityType)}'`;
+        : ` AND d.entity_type IN ('${this.escapeLiteral(opts.entityType)}', 'unknown')`;
 
     // Step 1+2: exact-normalized, then strict all-tokens-present (FTS5 AND).
     const strictHits = this.runStrict(handle, { normalizedQuery, sourceFilter, typeFilter });
@@ -1179,8 +1201,9 @@ export class ScreeningService {
         ? { fuzzyCount: fuzzy.hits.length, fuzzySources, poolBounded: fuzzy.poolBounded, minScore }
         : {}),
     });
+    const page = completeOfacSources(handle, ranked.slice(offset, offset + opts.limit), selected);
     return {
-      hits: completeOfacSources(handle, ranked.slice(offset, offset + opts.limit), selected),
+      hits: opts.includeDetails ? withScreeningDetails(handle, page) : page,
       modeUsed: fuzzy && !completion ? 'fuzzy' : 'strict',
       normalizedQuery,
       fuzzyFallbackTriggered: fuzzy !== undefined && opts.matchMode === 'strict' && !completion,
@@ -1708,18 +1731,31 @@ export class ScreeningService {
     // The index path intersects the jurisdiction inside its FTS lookup, and its
     // exact-name lookup by the same term; the pre-index path filters the joined
     // row, as it always has.
-    const indexScope = {
-      jurisdictionTerm: opts.jurisdiction ? jurisdictionTerm(opts.jurisdiction) : '',
-      statusClause,
-    };
-    const legacyScope = {
-      filterClause: `${opts.jurisdiction ? ` AND ${this.jurisdictionClause(opts.jurisdiction)}` : ''}${statusClause}`,
-    };
+    const term = opts.jurisdiction ? jurisdictionTerm(opts.jurisdiction) : '';
+    const indexScope = { jurisdictionTerm: term, statusClause };
+    const jurisdictionClause = opts.jurisdiction
+      ? ` AND ${this.jurisdictionClause(opts.jurisdiction)}`
+      : '';
+    const legacyScope = { filterClause: jurisdictionClause + statusClause };
 
-    const strictScan = indexed
-      ? this.runLeiStrict(handle, { normalizedQuery, queryTokens, ...indexScope })
-      : this.runLegacyLeiStrict(handle, { normalizedQuery, ...legacyScope });
+    const scanStrict = (statusFilter: string) =>
+      indexed
+        ? this.runLeiStrict(handle, {
+            normalizedQuery,
+            queryTokens,
+            jurisdictionTerm: term,
+            statusClause: statusFilter,
+          })
+        : this.runLegacyLeiStrict(handle, {
+            normalizedQuery,
+            filterClause: jurisdictionClause + statusFilter,
+          });
+    const strictScan = scanStrict(statusClause);
     const strict = strictScan.results;
+    const excludedStrict =
+      statusClause && strict.length === 0 && queryTokens.length > 0
+        ? summarizeExcludedStrict(scanStrict(''))
+        : undefined;
     const wantFuzzy = queryTokens.length > 0 && (opts.matchMode === 'fuzzy' || strict.length === 0);
     const scoring = {
       normalizedQuery,
@@ -1746,6 +1782,7 @@ export class ScreeningService {
     });
     return {
       alternateNamesIndexed: indexed,
+      ...(excludedStrict ? { excludedStrict } : {}),
       matches: ranked.slice(offset, offset + opts.limit),
       modeUsed: fuzzy ? 'fuzzy' : 'strict',
       normalizedQuery,
@@ -2326,6 +2363,29 @@ function leiMatch(
   };
 }
 
+/** Summarize a strict scan whose results already contain one match per LEI. */
+function summarizeExcludedStrict(
+  scan: BoundedScan<LeiMatch>,
+): ResolveEntityResult['excludedStrict'] {
+  if (scan.results.length === 0) return;
+  const counts = new Map<string, number>();
+  let missing = 0;
+  for (const { status } of scan.results) {
+    if (status === undefined) missing++;
+    else counts.set(status, (counts.get(status) ?? 0) + 1);
+  }
+  return {
+    count: scan.results.length,
+    countBasis: scan.capped ? 'lower_bound' : 'exact',
+    statuses: [
+      ...[...counts]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([status, count]) => ({ status, count })),
+      ...(missing ? [{ count: missing }] : []),
+    ],
+  };
+}
+
 /** Order an entity's name rows: the legal name first, then the order they were written. */
 function compareNameRows(a: LeiNameRow, b: LeiNameRow): number {
   return (
@@ -2455,6 +2515,35 @@ interface DesignationPayloadRow {
   primary_name: string;
 }
 
+/** Read corroborating details from the retained source record of each paged hit. */
+function withScreeningDetails(handle: SqliteHandle, hits: ScreeningHit[]): ScreeningHit[] {
+  if (hits.length === 0) return hits;
+  const rows = handle
+    .prepare<Pick<DesignationPayloadRow, 'id' | 'payload'>>(
+      `SELECT id, payload FROM designation WHERE id IN (SELECT value FROM json_each(?))`,
+    )
+    .all(JSON.stringify(hits.map((hit) => hit.designationId)));
+  const payloads = new Map(
+    rows.map((row) => [row.id, JSON.parse(row.payload) as DesignationPayload]),
+  );
+  return hits.map((hit) => {
+    const payload = payloads.get(hit.designationId);
+    if (!payload) return hit;
+    const birthDates = payload.datesOfBirth.flatMap(({ date, circa }) =>
+      date ? [{ date, ...(circa ? { circa } : {}) }] : [],
+    );
+    const addressCountries = new Set(
+      payload.addresses.flatMap(({ country }) => (country ? [country] : [])),
+    );
+    return {
+      ...hit,
+      ...(birthDates.length ? { birthDates } : {}),
+      ...(payload.nationalities.length ? { nationalities: payload.nationalities } : {}),
+      ...(addressCountries.size ? { addressCountries: [...addressCountries] } : {}),
+    };
+  });
+}
+
 /**
  * Visit every stored designation with its parsed payload, in keyset slices of
  * {@link DESIGNATION_READ_SLICE} ordered by id, so only one slice of payloads is
@@ -2553,7 +2642,7 @@ function writeIdentifiers(
   identifiers: readonly IdentifierRecord[],
 ): void {
   for (const identifier of identifiers) {
-    const category = identifierCategory(identifier.type);
+    const category = identifierCategory(identifier.type, identifier.value);
     const key = identifierKey(category, identifier.value);
     if (!key) continue;
     insert.run(
@@ -2576,6 +2665,9 @@ function syncStamp(state: SyncState): string {
   return `${state.startedAt ?? ''}|${state.completedAt ?? ''}`;
 }
 
+/** Stamp prefix for the current identifier classification rules. */
+const IDENTIFIER_STAMP_VERSION = 'v1:';
+
 /** The stamp the identifier index was last built under, or undefined when it never was. */
 function identifierStamp(handle: SqliteHandle): string | undefined {
   return handle
@@ -2586,7 +2678,7 @@ function identifierStamp(handle: SqliteHandle): string | undefined {
 function writeIdentifierStamp(handle: SqliteHandle, stamp: string): void {
   handle
     .prepare(`INSERT OR REPLACE INTO ${IDENTIFIER_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
-    .run(stamp);
+    .run(`${IDENTIFIER_STAMP_VERSION}${stamp}`);
 }
 
 /** Rebuild the identifier index alone from the stored payloads. The caller owns the transaction. */

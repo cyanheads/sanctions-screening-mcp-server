@@ -175,13 +175,14 @@ const WORST_CASES: [label: string, build: (n: number) => string][] = [
   ['a bracket run inside CDATA', (n) => `<r><![CDATA[${']'.repeat(n)}]]></r>`],
 ];
 
-/** Milliseconds for `runs` checks of `text` in `size`-character chunks — the fastest of three trials. */
+/** Thread CPU milliseconds for `runs` checks; descheduled time is not scanner work. */
 async function timeChecks(text: string, size: number, runs: number): Promise<number> {
   let best = Number.POSITIVE_INFINITY;
   for (let trial = 0; trial < 3; trial += 1) {
-    const started = performance.now();
+    const started = process.threadCpuUsage();
     for (let run = 0; run < runs; run += 1) await verdict(text, size);
-    best = Math.min(best, performance.now() - started);
+    const elapsed = process.threadCpuUsage(started);
+    best = Math.min(best, (elapsed.user + elapsed.system) / 1000);
   }
   return best;
 }

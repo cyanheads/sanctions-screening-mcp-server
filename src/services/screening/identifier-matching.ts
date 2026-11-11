@@ -20,7 +20,7 @@ export const IDENTIFIER_TYPES = [
 /** A named identifier category. */
 export type IdentifierType = (typeof IDENTIFIER_TYPES)[number];
 
-/** A stored identifier's category — `other` for every label the table does not map. */
+/** A stored identifier's category — `other` for unmapped labels without an IMO value. */
 export type IdentifierCategory = IdentifierType | 'other';
 
 /**
@@ -56,11 +56,13 @@ const LABEL_CATEGORIES: ReadonlyMap<string, IdentifierType> = new Map([
 /** OFAC labels each currency's address `Digital Currency Address - <code>`. */
 const DIGITAL_CURRENCY_LABEL_PREFIX = 'digital currency address - ';
 
-/** The category a published identifier label belongs to. */
-export function identifierCategory(label: string): IdentifierCategory {
+/** Classify a published identifier, using its value only for unmapped labels. */
+export function identifierCategory(label: string, value?: string): IdentifierCategory {
   const folded = label.replace(/\s+/gu, ' ').trim().toLowerCase();
   if (folded.startsWith(DIGITAL_CURRENCY_LABEL_PREFIX)) return 'digital_currency_address';
-  return LABEL_CATEGORIES.get(folded) ?? 'other';
+  const category = LABEL_CATEGORIES.get(folded);
+  if (category) return category;
+  return value !== undefined && /^IMO[0-9]{7}$/u.test(foldIdentifier(value)) ? 'imo' : 'other';
 }
 
 /** Characters every key drops: whitespace and the separators lists print numbers with. */
@@ -124,7 +126,7 @@ const ALL_CATEGORIES: readonly IdentifierCategory[] = [...IDENTIFIER_TYPES, 'oth
 /**
  * The probes a caller's value runs as: one per category it may match, each
  * keyed under that category's rule. `any` probes every category, including the
- * labels the table does not map; `other` probes those labels alone — the
+ * values classified as `other`; `other` probes that category alone — the
  * non-document identifiers (registration, tax, and legal-entity numbers, …),
  * never a passport, national ID, IMO number, SWIFT/BIC code, or wallet. Empty
  * when the value normalizes to nothing under every rule it runs as.

@@ -14,7 +14,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { identifierProbes } from '@/services/screening/identifier-matching.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
-import { alsoListedText, HitSourcesSchema, SCREENING_CAVEAT } from './_shared.js';
+import { alsoListedText, HitSourcesSchema, renderNotice, SCREENING_CAVEAT } from './_shared.js';
 
 const SOURCE_ENUM = z.enum(SOURCE_CODES);
 
@@ -59,7 +59,7 @@ const HitSchema = z
 export const screenIdentifierTool = tool('sanctions_screen_identifier', {
   title: 'sanctions-screening-mcp-server: screen identifier',
   description:
-    'Look up an identifier — a vessel IMO number, a SWIFT/BIC code, a digital-currency wallet address, a passport or national ID number, or any other identifier a list publishes — against all loaded sanctions watchlists at once: OFAC SDN + Consolidated, EU, UK, and UN. Exact match after normalization, with no fuzzy or partial matching and no score: spacing, letter case, and the separators - . / are ignored, an IMO number matches with or without its IMO prefix, a SWIFT/BIC code compares on its first eight characters so a branch code matches its institution, and a wallet address folds case only where its encoding is case-insensitive (hex, bech32, cashaddr — never base58). Returns every designation that publishes a matching identifier, one per designation — an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists — with the identifiers that matched as published; sanctions_get_designation pulls the full record. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared" — an identifier a list prints only in free-text remarks, or bundled with other numbers in one field, does not match.',
+    'Look up an identifier — a vessel or company IMO number, a SWIFT/BIC code, a digital-currency wallet address, a passport or national ID number, or any other identifier a list publishes — against loaded sanctions and export-control watchlists — OFAC SDN + Consolidated, EU, UK, UN, and the six BIS/State CSL lists. Check sanctions_list_sources for coverage. Exact match after normalization, with no fuzzy or partial matching and no score: spacing, letter case, and the separators - . / are ignored, an IMO number matches with or without its IMO prefix, a SWIFT/BIC code compares on its first eight characters so a branch code matches its institution, and a wallet address folds case only where its encoding is case-insensitive (hex, bech32, cashaddr — never base58). Returns every designation that publishes a matching identifier, one per designation — an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists — with the identifiers that matched as published; sanctions_get_designation pulls the full record. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared" — an identifier a list prints only in free-text remarks, or bundled with other numbers in one field, does not match.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     value: z
@@ -72,7 +72,7 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
       .enum(['any', 'imo', 'swift_bic', 'digital_currency_address', 'passport', 'national_id'])
       .default('any')
       .describe(
-        'Restrict to one identifier category, matched on the label each list publishes, or "any" (default) to search every published identifier, including categories with no name here (MMSI, call signs, tail numbers, tax and registration numbers, email, websites).',
+        'Restrict to one identifier category, or "any" (default) to search all published identifiers, including MMSI, call signs, tax and registration numbers. Published label categories take precedence. An otherwise unclassified label with an IMO prefix and exactly seven digits is indexed as imo, including company numbers.',
       ),
     sources: z
       .array(SOURCE_ENUM)
@@ -100,6 +100,7 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
         'Guidance when no designation matched — what to try next, and what an empty result does NOT mean.',
       ),
   },
+  enrichmentTrailer: { notice: { render: renderNotice } },
   errors: [
     {
       reason: 'identifier_not_searchable',

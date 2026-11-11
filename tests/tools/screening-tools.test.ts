@@ -16,6 +16,7 @@ import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-iden
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 import { parseEu, parseOfac, parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
+import { LEI_STRICT_SCAN_BOUND } from '@/services/screening/screening-service.js';
 import { parseXml } from '@/services/screening/xml.js';
 import {
   emptyGlobalService,
@@ -372,6 +373,52 @@ describe('query-token coverage on both client surfaces (issue #15)', () => {
       matchedNameType: 'PREVIOUS_LEGAL_NAME',
       matchType: 'exact',
     });
+  });
+
+  it('adds excluded strict registration statuses to both result surfaces', async () => {
+    const result = await runToolContract(resolveEntityTool, { name: 'Qorvath Nominee Services' });
+    const counts = '2 strict candidates (LAPSED: 1, RETIRED: 1)';
+    expect(result.structuredContent).toMatchObject({ notice: expect.stringContaining(counts) });
+    expect(result.content).toEqual(
+      expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining(counts) })]),
+    );
+  });
+
+  it('discloses bounded registration-status exclusions on both result surfaces', async () => {
+    await seeded.service.ingestLeiEntities(
+      Array.from({ length: LEI_STRICT_SCAN_BOUND + 1 }, (_, index) => ({
+        lei: `QORVATHSTATUS${String(index).padStart(5, '0')}42`,
+        legalName: `Qorvath Bounded Registry ${index}`,
+        otherNames: [],
+        status: 'LAPSED',
+      })),
+    );
+    const result = await runToolContract(resolveEntityTool, { name: 'Qorvath Bounded Registry' });
+    const notice = 'excluded at least 2000 strict candidates (LAPSED: 2000)';
+    expect(result.structuredContent).toMatchObject({ notice: expect.stringContaining(notice) });
+    expect(result.content).toEqual(
+      expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining(notice) })]),
+    );
+  });
+
+  it('returns published identifying details on both name-screen surfaces', async () => {
+    const result = await runToolContract(screenNameTool, {
+      name: 'Ivan Testovich Volkov',
+      sources: ['ofac_sdn'],
+    });
+    expect(result.structuredContent).toMatchObject({
+      hits: [
+        {
+          birthDates: [{ date: '1970-01-01' }],
+          nationalities: ['Testland'],
+          addressCountries: ['Testland'],
+        },
+      ],
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('**Birth dates:** 1970-01-01');
+    expect(text).toContain('**Nationalities:** Testland');
+    expect(text).toContain('**Address countries:** Testland');
   });
 
   it('describes the status and jurisdiction filters as they now apply (#23, #36)', () => {

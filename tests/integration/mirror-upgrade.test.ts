@@ -212,7 +212,7 @@ describe('a 0.2.0 mirror opened by the current service', () => {
     ).toMatch(/^v2:/);
     expect(handle.prepare<{ n: number }>('SELECT COUNT(*) AS n FROM name').get()?.n).toBe(1);
   });
-  it('serves sanctions_screen_name hits with the fields 0.2.0 returned, plus sources', async () => {
+  it('serves existing name-hit fields and corroborating details from a 0.2.0 mirror', async () => {
     const result = await screenNameTool.handler(
       screenNameTool.input.parse({ name: 'Ivan Testovich Volkov' }),
       ctxFor(screenNameTool.errors),
@@ -229,6 +229,9 @@ describe('a 0.2.0 mirror opened by the current service', () => {
       matchType: 'exact',
       program: 'TEST-PROGRAM',
       designationDate: '2021-03-15',
+      birthDates: [{ date: '1970-01-01' }],
+      nationalities: ['Testland'],
+      addressCountries: ['Testland'],
     });
   });
 

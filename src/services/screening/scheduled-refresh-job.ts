@@ -35,13 +35,20 @@ try {
   });
   result = { needsInit: refreshed.gleif?.needsInit ?? [] };
 } catch (error) {
-  result = {
-    error: {
-      message: error instanceof Error ? error.message : String(error),
-      ...(error instanceof McpError ? { code: error.code } : {}),
-    },
-  };
-  exitCode = 1;
+  if (error instanceof McpError && error.data?.reason === 'sync_locked') {
+    logger.info(
+      'Scheduled mirror refresh skipped because another process holds the sync lease.',
+      requestContextService.createRequestContext({ operation: 'scheduledMirrorRefresh' }),
+    );
+  } else {
+    result = {
+      error: {
+        message: error instanceof Error ? error.message : String(error),
+        ...(error instanceof McpError ? { code: error.code } : {}),
+      },
+    };
+    exitCode = 1;
+  }
 } finally {
   await service.close();
   input.close();

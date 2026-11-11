@@ -21,6 +21,7 @@ import {
   createSanctionsSync,
   type SourceSyncFailure,
   type SourceSyncReport,
+  toDesignationRow,
 } from '@/services/screening/sanctions-ingest.js';
 import { IDENTIFIER_TABLE, NAME_TABLE } from '@/services/screening/schema.js';
 import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
@@ -1068,16 +1069,6 @@ describe('rebuildSearchIndexes', () => {
     harness = undefined;
   });
 
-  async function seed(count: number): Promise<SeededService> {
-    harness = await freshService();
-    await harness.service.ingestDesignations(
-      Array.from({ length: count }, (_, i) =>
-        designation('un', `R${String(i).padStart(4, '0')}`, `Person Number ${i}`, [`Alias ${i}`]),
-      ),
-    );
-    return harness;
-  }
-
   /**
    * More designations than one keyset slice holds, so the walk crosses slice
    * boundaries — where a cursor that failed to advance would loop, and one that
@@ -1085,8 +1076,28 @@ describe('rebuildSearchIndexes', () => {
    */
   const ACROSS_SLICES = 4500;
 
+  function designationAt(i: number, aliases: string[] = []): NormalizedDesignation {
+    return designation('un', `R${String(i).padStart(4, '0')}`, `Person Number ${i}`, aliases);
+  }
+
+  async function seed(
+    makeDesignation = (i: number) => designationAt(i, [`Alias ${i}`]),
+  ): Promise<SeededService> {
+    harness = await freshService();
+    const { service } = harness;
+    // Open the empty auxiliary indexes first, then write only primary rows as
+    // the mirror harvest does. The explicit rebuild projects the test corpus.
+    await service.sourceCounts();
+    await service.designations.store.applyBatch(
+      Array.from({ length: ACROSS_SLICES }, (_, i) => toDesignationRow(makeDesignation(i))),
+      [],
+    );
+    expect(await service.designations.store.count()).toBe(ACROSS_SLICES);
+    return harness;
+  }
+
   it('reindexes every designation and alias across slice boundaries, and is idempotent', async () => {
-    const { service } = await seed(ACROSS_SLICES);
+    const { service } = await seed();
     const handle = await service.designations.raw();
     const count = (): number =>
       handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${NAME_TABLE}`).get()?.n ?? 0;
@@ -1124,28 +1135,23 @@ describe('rebuildSearchIndexes', () => {
   });
 
   it('rebuilds the identifier index across slice boundaries, and is idempotent', async () => {
-    harness = await freshService();
-    await harness.service.ingestDesignations(
-      Array.from({ length: ACROSS_SLICES }, (_, i) => {
-        const d = designation('un', `R${String(i).padStart(4, '0')}`, `Person Number ${i}`);
-        return {
-          ...d,
-          payload: { ...d.payload, identifiers: [{ type: 'Passport', value: `P-${i}` }] },
-        };
-      }),
-    );
-    const handle = await harness.service.designations.raw();
+    const { service } = await seed((i) => {
+      const d = designationAt(i);
+      return {
+        ...d,
+        payload: { ...d.payload, identifiers: [{ type: 'Passport', value: `P-${i}` }] },
+      };
+    });
+    const handle = await service.designations.raw();
     const rows = (): { keys: number; n: number } | undefined =>
       handle
         .prepare<{ keys: number; n: number }>(
           `SELECT COUNT(*) AS n, COUNT(DISTINCT key) AS keys FROM ${IDENTIFIER_TABLE}`,
         )
         .get();
-    handle.exec(`DELETE FROM ${IDENTIFIER_TABLE}`);
-
-    await harness.service.rebuildSearchIndexes();
+    await service.rebuildSearchIndexes();
     expect(rows()).toEqual({ n: ACROSS_SLICES, keys: ACROSS_SLICES });
-    await harness.service.rebuildSearchIndexes();
+    await service.rebuildSearchIndexes();
     expect(rows()).toEqual({ n: ACROSS_SLICES, keys: ACROSS_SLICES });
     expect(
       handle
@@ -1163,7 +1169,7 @@ describe('rebuildSearchIndexes', () => {
   });
 
   it('reads the designation table in bounded slices', async () => {
-    const { service } = await seed(ACROSS_SLICES);
+    const { service } = await seed();
     const handle = (await service.designations.raw()) as SqliteHandle;
     const original = handle.prepare.bind(handle);
     const designationReads: string[] = [];

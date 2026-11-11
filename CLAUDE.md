@@ -3,7 +3,7 @@
 **Server:** sanctions-screening-mcp-server
 **Version:** 0.6.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0 (via the framework)
 **Zod:** ^4.6.7
 
@@ -103,6 +103,7 @@ Real example: `sanctions://entity/{lei}` — a URI mirror of `sanctions_get_enti
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { canonicalLei, LeiInputSchema } from '@/mcp-server/normalize-inputs.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 
 export const entityResource = resource('sanctions://entity/{lei}', {
@@ -111,7 +112,7 @@ export const entityResource = resource('sanctions://entity/{lei}', {
   description: "Fetch one GLEIF Level 1 legal-entity record by LEI — a read-only URI mirror of sanctions_get_entity's entity payload.",
   mimeType: 'application/json',
   params: z.object({
-    lei: z.string().regex(/^[A-Z0-9]{18}[0-9]{2}$/, 'LEI must be 20 chars: 18 alphanumerics + 2 check digits.').describe('The 20-character GLEIF Legal Entity Identifier.'),
+    lei: LeiInputSchema.describe('The 20-character GLEIF Legal Entity Identifier.'),
   }),
   errors: [
     { reason: 'lei_not_found', code: JsonRpcErrorCode.NotFound,
@@ -119,8 +120,9 @@ export const entityResource = resource('sanctions://entity/{lei}', {
       recovery: 'Resolve the entity name with sanctions_resolve_entity to obtain a valid LEI first.' },
   ],
   async handler(params, ctx) {
-    const entity = await getScreeningService().getLeiEntity(params.lei);
-    if (!entity) throw ctx.fail('lei_not_found', `No GLEIF entity with LEI "${params.lei}".`);
+    const lei = canonicalLei(params.lei, 'sanctions://entity/{lei}', ctx);
+    const entity = await getScreeningService().getLeiEntity(lei);
+    if (!entity) throw ctx.fail('lei_not_found', `No GLEIF entity with LEI "${lei}".`);
     return entity;
   },
 });
@@ -438,7 +440,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` builds the stdio extension for Claude Desktop. `mcpb pack` uses `.mcpbignore`, so development files need root-anchored exclusions. Root `skills/` ships with the bundle. `scripts/clean-mcpb.ts` prunes dev dependencies, dependency-root agent docs, platform-specific bindings, and build-only files. Runtime modules such as the SDK’s nested `skills/` and compiled `better-sqlite3` addon remain. `lint:packaging` verifies the result.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

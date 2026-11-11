@@ -92,6 +92,75 @@ describe('CSL source contracts', () => {
 });
 
 describe('CSL preparation and normalization', () => {
+  it.each([
+    ['1999-01-02', '1999-01-02'],
+    ['unknown date', 'unknown date'],
+    [' 8/11/2015', '2015-08-11'],
+    ['02/29/2000', '2000-02-29'],
+    ['2/29/2024', '2024-02-29'],
+    ['2/29/1900', '2/29/1900'],
+    ['2/29/2023', '2/29/2023'],
+    ['4/31/2024', '4/31/2024'],
+    ['13/1/2024', '13/1/2024'],
+    ['1/0/2024', '1/0/2024'],
+    ['1/1/0000', '1/1/0000'],
+    ['  published date text  ', 'published date text'],
+    [' 1999-01-02 ', '1999-01-02'],
+    [' ', undefined],
+    [null, undefined],
+    [undefined, undefined],
+  ])('preserves the meaning of CSL start_date %j', async (startDate, expected) => {
+    const rows = await harvest(
+      cslDocument([{ ...CSL_RECORDS[0], start_date: startDate }, ...CSL_RECORDS.slice(1)]),
+    );
+    expect(rows[0]?.designationDate).toBe(expected);
+    expect(Object.hasOwn(rows[0]!, 'designationDate')).toBe(expected !== undefined);
+  });
+
+  it('refreshes a published start date on designation and name-screen surfaces', async () => {
+    const state = await emptyGlobalService();
+    try {
+      serveLookupCorpus();
+      const originalFetch = globalThis.fetch;
+      let startDate = '2014-01-01';
+      vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) =>
+        String(input) === DEFAULT_SOURCE_URLS.csl
+          ? new Response(
+              cslDocument([{ ...CSL_RECORDS[0], start_date: startDate }, ...CSL_RECORDS.slice(1)]),
+            )
+          : originalFetch(input, init),
+      );
+      const signal = new AbortController().signal;
+      await state.service.syncSanctions('init', signal);
+      expect((await state.service.getDesignation('bis_el', 'CSL-bis_el'))?.designationDate).toBe(
+        '2014-01-01',
+      );
+      startDate = ' 8/11/2015';
+      await state.service.syncSanctions('refresh', signal);
+      const detail = await runToolContract(getDesignationTool, {
+        source: 'bis_el',
+        entryId: 'CSL-bis_el',
+      });
+      const screen = await runToolContract(screenNameTool, {
+        name: 'Synthetic Export bis_el',
+        sources: ['bis_el'],
+      });
+      expect(detail.structuredContent).toMatchObject({ designationDate: '2015-08-11' });
+      expect(screen.structuredContent).toMatchObject({
+        hits: [{ sourceEntryId: 'CSL-bis_el', designationDate: '2015-08-11' }],
+      });
+      for (const result of [detail, screen]) {
+        const text = result.content
+          .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+          .join('\n');
+        expect(text).toContain('2015-08-11');
+        expect(text).not.toContain('8/11/2015');
+      }
+    } finally {
+      await state.cleanup();
+    }
+  });
+
   it('replays unchanged identities, delists within the guard, and preserves last successful as-of after a shared CSL failure', async () => {
     const state = await emptyGlobalService();
     try {

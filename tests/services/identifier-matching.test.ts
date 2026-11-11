@@ -54,6 +54,21 @@ describe('identifierCategory', () => {
   ])('files %j under other', (label) => {
     expect(identifierCategory(label)).toBe('other');
   });
+
+  it.each([
+    ['Identification Number', 'IMO 1790183', 'imo'],
+    ['Company Number', 'ｉｍｏ １７９０１８３', 'imo'],
+    ['Registration Number', 'IMO-5342883', 'imo'],
+    ['Registration Number', '5342883', 'other'],
+    ['Identification Number', 'IMO 1790183 / 5342883', 'other'],
+    ['Identification Number', 'IMO 1790183X', 'other'],
+    ['Passport', 'IMO 1790183', 'passport'],
+    ['National ID No.', 'IMO 1790183', 'national_id'],
+    ['SWIFT BIC', 'IMO 1790183', 'swift_bic'],
+    ['Digital Currency Address - XBT', 'IMO 1790183', 'digital_currency_address'],
+  ])('classifies %s with value %s as %s', (label, value, category) => {
+    expect(identifierCategory(label, value)).toBe(category);
+  });
 });
 
 describe('identifierKey', () => {
@@ -113,6 +128,34 @@ describe('identifierKey', () => {
     expect(identifierKey('digital_currency_address', base58.replace('a', 'A'))).not.toBe(base58);
     // A mixed-case string that happens to start like bech32 is not bech32.
     expect(identifierKey('digital_currency_address', 'bc1QmixedCase')).toBe('bc1QmixedCase');
+  });
+});
+
+describe('identifier normalization CPU', () => {
+  it.each([
+    { make: (n: number) => '1'.repeat(n), largest: 320_000 },
+    { make: (n: number) => `${'§1 x'.repeat(n / 4)}\ny`, largest: 80_000 },
+    { make: (n: number) => '  \r\n'.repeat(n / 4), largest: 80_000 },
+    { make: (n: number) => 'IMO '.repeat(n / 4), largest: 80_000 },
+  ])('bounds CPU across increasing input sizes (maximum $largest)', ({ make, largest }) => {
+    const baseline = make(5_000);
+    const measure = (input: string, repeats: number): number => {
+      const start = process.threadCpuUsage();
+      for (let i = 0; i < repeats; i++) identifierCategory('Registration Number', input);
+      const elapsed = process.threadCpuUsage(start);
+      return (elapsed.user + elapsed.system) / repeats;
+    };
+    measure(baseline, 64);
+    for (let size = 10_000; size <= largest; size *= 2) {
+      const input = make(size);
+      const samples = Array.from({ length: 5 }, () => {
+        const small = measure(baseline, 32);
+        const large = measure(input, 4);
+        return { large, growth: large / small };
+      });
+      expect(Math.min(...samples.map(({ large }) => large))).toBeLessThan(100_000);
+      expect(Math.min(...samples.map(({ growth }) => growth))).toBeLessThan(256);
+    }
   });
 });
 

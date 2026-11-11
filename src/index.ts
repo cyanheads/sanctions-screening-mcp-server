@@ -11,8 +11,6 @@
 import { createApp } from '@cyanheads/mcp-ts-core';
 import { config } from '@cyanheads/mcp-ts-core/config';
 import { allPromptDefinitions } from './mcp-server/prompts/definitions/index.js';
-import { allResourceDefinitions } from './mcp-server/resources/definitions/index.js';
-import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
 import {
   scheduleSanctionsRefresh,
   stopSanctionsRefresh,
@@ -22,6 +20,10 @@ import {
   initScreeningService,
 } from './services/screening/screening-service.js';
 
+const tools: typeof import('./mcp-server/tools/definitions/index.js').allToolDefinitions = [];
+const resources: typeof import('./mcp-server/resources/definitions/index.js').allResourceDefinitions =
+  [];
+
 await createApp({
   name: 'sanctions-screening-mcp-server',
   title: 'sanctions-screening-mcp-server',
@@ -29,8 +31,8 @@ await createApp({
   // `ctx.requestInput`, so nothing here needs a session to come back to.
   // `MCP_SESSION_MODE` still overrides this when a deployment sets it.
   sessionMode: 'stateless',
-  tools: allToolDefinitions,
-  resources: allResourceDefinitions,
+  tools,
+  resources,
   prompts: allPromptDefinitions,
   skills: 'skills',
   instructions:
@@ -67,6 +69,14 @@ await createApp({
     ],
   },
   async setup() {
+    // Core loads .env before setup and builds the registries after it. Import
+    // the definitions here so the startup flag controls their advertised schemas.
+    const [{ allToolDefinitions }, { allResourceDefinitions }] = await Promise.all([
+      import('./mcp-server/tools/definitions/index.js'),
+      import('./mcp-server/resources/definitions/index.js'),
+    ]);
+    tools.push(...allToolDefinitions);
+    resources.push(...allResourceDefinitions);
     initScreeningService();
     // HTTP deployments refresh on a cron: the sanctions lists, then the GLEIF
     // deltas. stdio operators run `bun run mirror:refresh` out-of-band, where a

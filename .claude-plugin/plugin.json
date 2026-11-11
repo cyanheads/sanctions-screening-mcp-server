@@ -25,12 +25,22 @@
     "mcp-server",
     "model-context-protocol"
   ],
+  "userConfig": {
+    "sanctions_normalize_inputs": {
+      "type": "boolean",
+      "title": "Normalize screening inputs",
+      "description": "Accept mixed-case LEIs and clamp oversized name-search page limits.",
+      "required": false,
+      "default": true
+    }
+  },
   "mcpServers": {
     "sanctions-screening-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/sanctions-screening-mcp-server"],
       "env": {
-        "MCP_TRANSPORT_TYPE": "stdio"
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "SANCTIONS_NORMALIZE_INPUTS": "${user_config.sanctions_normalize_inputs}"
       }
     }
   }

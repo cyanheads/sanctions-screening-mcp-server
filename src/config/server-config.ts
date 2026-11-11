@@ -10,6 +10,15 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
+const InputNormalizationSchema = z.object({ normalizeInputs: z.stringbool().default(true) });
+
+/** Read the startup flag that determines the advertised input schemas. */
+export function readInputNormalization(): boolean {
+  return parseEnvConfig(InputNormalizationSchema, {
+    normalizeInputs: 'SANCTIONS_NORMALIZE_INPUTS',
+  }).normalizeInputs;
+}
+
 /** Default upstream source endpoints, all verified official paths (see docs/design.md). */
 export const DEFAULT_SOURCE_URLS = {
   ofacSdn:

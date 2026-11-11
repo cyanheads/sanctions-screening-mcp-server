@@ -14,9 +14,10 @@
  */
 
 import { once } from 'node:events';
-import { existsSync } from 'node:fs';
+import { watch } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
@@ -93,9 +94,9 @@ beforeEach(async () => {
     }
     res.writeHead(200, { 'content-type': 'application/xml' });
     if (path === '/un.xml' && stallUn) {
-      whenUnStalls?.();
       // Headers and part of the body, then silence — the connection stays open.
       res.write(feed[1].slice(0, feed[1].indexOf('</INDIVIDUAL>')));
+      whenUnStalls?.();
       return;
     }
     res.end(feed[1]);
@@ -158,23 +159,27 @@ describe('scheduled sanctions refresh', () => {
       entry: fileURLToPath(new URL('./fixtures/refresh-child.mjs', import.meta.url)),
       graceMs: 50,
     });
+    const marker = `${process.env.SANCTIONS_MIRROR_PATH}.child.locked`;
+    const locked = Promise.withResolvers<void>();
+    // Observe before spawning: readiness is the acquired lock, not startup latency.
+    const watcher = watch(dirname(marker), (_event, name) => {
+      if (name === basename(marker)) locked.resolve();
+    });
+    watcher.on('error', locked.reject);
     process.env.TEST_REFRESH_MODE = 'partial';
     const interrupted = writer.run(
       new AbortController().signal,
       requestContextService.createRequestContext({ operation: 'interrupted' }),
     );
-    const failed = expect(interrupted).rejects.toThrow('SIGKILL');
     try {
-      await vi.waitFor(() =>
-        expect(existsSync(`${process.env.SANCTIONS_MIRROR_PATH}.child.locked`)).toBe(true),
-      );
-      await writer.stop();
-      await failed;
-      expect(await indexedDesignations()).toEqual([]);
+      await Promise.race([locked.promise, interrupted]);
     } finally {
+      watcher.close();
       await writer.stop();
       delete process.env.TEST_REFRESH_MODE;
     }
+    await expect(interrupted).rejects.toThrow('SIGKILL');
+    expect(await indexedDesignations()).toEqual([]);
     stallUn = false;
     process.env.SANCTIONS_REFRESH_SKIP_GLEIF = '1';
     await scheduleSanctionsRefresh();
@@ -203,8 +208,10 @@ describe('scheduled sanctions refresh', () => {
     delete process.env.SANCTIONS_REFRESH_SKIP_GLEIF;
   });
   it('rebuilds committed pages after cancellation through the shared refresh contract', async () => {
+    const controller = new AbortController();
+    whenUnStalls = () => controller.abort(new DOMException('Transfer deadline.', 'TimeoutError'));
     await expect(
-      refreshMirrors(harness.service, AbortSignal.timeout(300), {
+      refreshMirrors(harness.service, controller.signal, {
         context: requestContextService.createRequestContext({ operation: 'characterization' }),
         loadMissingExceptions: false,
       }),
@@ -252,22 +259,17 @@ describe('scheduled sanctions refresh', () => {
     const errors = vi.spyOn(logger, 'error');
     const controller = new AbortController();
     let firstRun = true;
-    // Bound the stalled transfer itself; child startup is measured separately.
-    whenUnStalls = () =>
-      setTimeout(
-        () => controller.abort(new DOMException('Transfer deadline.', 'TimeoutError')),
-        500,
-      );
+    // End the stalled transfer at its I/O boundary, independent of child startup.
+    whenUnStalls = () => controller.abort(new DOMException('Transfer deadline.', 'TimeoutError'));
     await scheduleSanctionsRefresh(() => {
-      if (!firstRun) return AbortSignal.timeout(10_000);
+      if (!firstRun) return new AbortController().signal;
       firstRun = false;
       return controller.signal;
     });
 
     // First tick: UN's transfer stalls after its headers. The time bound ends the run.
-    const started = performance.now();
     await job().task.execute();
-    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(controller.signal.aborted).toBe(true);
     expect(job().isRunning).toBe(false);
     expect(errors).toHaveBeenCalledWith(
       `Job '${SANCTIONS_REFRESH_JOB}' failed.`,
@@ -469,20 +471,16 @@ describe('scheduled refresh — the GLEIF leg', () => {
           const body = week.lei2.LastDay;
           res.writeHead(200, { 'content-type': 'application/xml' });
           res.write(body.slice(0, body.indexOf('<lei:LEIRecords>')));
-          setTimeout(
-            () => controller.abort(new DOMException('GLEIF transfer deadline.', 'TimeoutError')),
-            1_500,
-          );
+          controller.abort(new DOMException('GLEIF transfer deadline.', 'TimeoutError'));
         },
       },
     );
     const errors = vi.spyOn(logger, 'error');
     await scheduleSanctionsRefresh(() => controller.signal);
 
-    const started = performance.now();
     await job().task.execute();
 
-    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(controller.signal.aborted).toBe(true);
     expect(errors).toHaveBeenCalledWith(
       `Job '${SANCTIONS_REFRESH_JOB}' failed.`,
       expect.objectContaining({ code: JsonRpcErrorCode.Timeout }),

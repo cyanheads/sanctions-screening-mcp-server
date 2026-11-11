@@ -10,6 +10,8 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { clampPageLimit, pageLimitSchema } from '@/mcp-server/normalize-inputs.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { fold, tokenize } from '@/services/screening/text-matching.js';
 import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
@@ -18,10 +20,12 @@ import {
   HitSourcesSchema,
   MAX_NAME_CHARS,
   MAX_NAME_WORDS,
+  renderNotice,
   SCREENING_CAVEAT,
 } from './_shared.js';
 
 const SOURCE_ENUM = z.enum(SOURCE_CODES);
+const PAGE_LIMIT = 100;
 
 /** The query words a completion candidate need not cover — `FUZZY_STOPLIST` in words. */
 const UNCOUNTED_WORDS =
@@ -84,7 +88,31 @@ const HitSchema = z
       .string()
       .optional()
       .describe(
-        "The source's own designation date as YYYY-MM-DD; absent when unpublished. For an OFAC party both OFAC lists publish, the date of the source record: each OFAC file dates the party from its own lists, so the two often differ, and sanctions_get_designation under the other list returns that record's date.",
+        "Designation date in YYYY-MM-DD when known to day precision, or published date text otherwise; absent when unpublished. For grouped OFAC parties, this is the source record's date; sanctions_get_designation under the other list returns that record's date.",
+      ),
+    birthDates: z
+      .array(
+        z
+          .object({
+            date: z.string().describe('Stored birth date with its original precision or range.'),
+            circa: z
+              .literal(true)
+              .optional()
+              .describe('Present when the source marks the date approximate.'),
+          })
+          .describe('One published birth date.'),
+      )
+      .optional()
+      .describe('Birth dates from the source record, omitted when none are published.'),
+    nationalities: z
+      .array(z.string())
+      .optional()
+      .describe('Published nationalities from the source record, omitted when absent.'),
+    addressCountries: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Distinct countries from published addresses on the source record, omitted when absent.',
       ),
   })
   .describe('One potential match — a candidate to verify, never a determination.');
@@ -103,7 +131,9 @@ export const screenNameTool = tool('sanctions_screen_name', {
     entityType: z
       .enum(['any', 'person', 'organization', 'vessel', 'aircraft'])
       .default('any')
-      .describe('Restrict to one entity class, or "any" (default) to screen across all.'),
+      .describe(
+        'Restrict to one entity class, or "any" (default) to screen across all. A class filter excludes records whose known type differs; unknown types remain eligible.',
+      ),
     matchMode: z
       .enum(['strict', 'fuzzy'])
       .default('strict')
@@ -122,13 +152,11 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .array(SOURCE_ENUM)
       .optional()
       .describe('Restrict to specific source lists. Omit to screen all loaded lists.'),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
-      .default(25)
-      .describe('Maximum number of potential matches to return in one page.'),
+    limit: pageLimitSchema(
+      PAGE_LIMIT,
+      25,
+      'Maximum number of potential matches to return in one page.',
+    ),
     offset: z
       .number()
       .int()
@@ -187,11 +215,12 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .string()
       .optional()
       .describe(
-        'Guidance when no candidate matched — how to broaden, and what an empty result does NOT mean — when the requested offset sits past the end of the result set, or when the fuzzy pass reached its candidate bound and a more distinctive word would narrow it.',
+        'Guidance when no candidate matched — how to broaden, and what an empty result does NOT mean — when the requested offset sits past the end of the result set, or when the fuzzy pass reached its candidate bound and a more distinctive word would narrow it. It also reports a clamped page limit.',
       ),
   },
   enrichmentTrailer: {
     fuzzySources: { render: (sources) => `**fuzzySources:** ${(sources ?? []).join(', ')}` },
+    notice: { render: renderNotice },
   },
   errors: [
     {
@@ -218,6 +247,8 @@ export const screenNameTool = tool('sanctions_screen_name', {
   ],
 
   async handler(input, ctx) {
+    const notices: string[] = [];
+    const limit = clampPageLimit(input.limit, PAGE_LIMIT, 'sanctions_screen_name', ctx, notices);
     const words = tokenize(fold(input.name)).length;
     if (words === 0) {
       throw ctx.fail('name_not_searchable', 'The name contains no letter or digit to match on.');
@@ -241,8 +272,9 @@ export const screenNameTool = tool('sanctions_screen_name', {
         matchMode: input.matchMode,
         ...(input.minScore !== undefined ? { minScore: input.minScore } : {}),
         sources,
-        limit: input.limit,
+        limit,
         offset: input.offset,
+        includeDetails: true,
       },
       ctx,
     );
@@ -262,7 +294,6 @@ export const screenNameTool = tool('sanctions_screen_name', {
     // hide an out-of-range offset or read a paging artifact as "nothing is listed".
     // An empty result always follows a fuzzy pass (an empty strict pass falls
     // back), so the notice never suggests one.
-    const notices: string[] = [];
     if (result.totalAvailable === 0) {
       notices.push(
         `No potential match for "${input.name}" across the selected lists (mode: ${result.modeUsed}). ` +
@@ -297,6 +328,9 @@ export const screenNameTool = tool('sanctions_screen_name', {
         ...(h.queryTokenCoverage ? { queryTokenCoverage: h.queryTokenCoverage } : {}),
         ...(h.program ? { program: h.program } : {}),
         ...(h.designationDate ? { designationDate: h.designationDate } : {}),
+        ...(h.birthDates?.length ? { birthDates: h.birthDates } : {}),
+        ...(h.nationalities?.length ? { nationalities: h.nationalities } : {}),
+        ...(h.addressCountries?.length ? { addressCountries: h.addressCountries } : {}),
       })),
       caveat: SCREENING_CAVEAT,
     };
@@ -323,7 +357,21 @@ export const screenNameTool = tool('sanctions_screen_name', {
         if (h.program) lines.push(`**Program:** ${h.program}`);
         if (h.designationDate) {
           lines.push(
-            `**Designated:** ${h.designationDate}${also ? ` (the \`${h.source}\` record)` : ''}`,
+            `**Designated:** ${escapeMarkdownInline(h.designationDate)}${also ? ` (the \`${h.source}\` record)` : ''}`,
+          );
+        }
+        if (h.birthDates?.length) {
+          const dates = h.birthDates.map(
+            ({ date, circa }) => `${circa ? 'circa ' : ''}${escapeMarkdownInline(date)}`,
+          );
+          lines.push(`**Birth dates:** ${dates.join(', ')}`);
+        }
+        if (h.nationalities?.length) {
+          lines.push(`**Nationalities:** ${h.nationalities.map(escapeMarkdownInline).join(', ')}`);
+        }
+        if (h.addressCountries?.length) {
+          lines.push(
+            `**Address countries:** ${h.addressCountries.map(escapeMarkdownInline).join(', ')}`,
           );
         }
         lines.push('');

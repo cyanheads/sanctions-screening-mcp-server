@@ -83,6 +83,8 @@ It aggregates eleven sanctions/export-control lists and GLEIF behind one screeni
 
 CSL `id` remains verbatim as `sourceEntryId`, not a derived or guaranteed permanent hash; missing type stays `unknown`. Published license requirements/policies, Federal Register notices, standard-order flags, end dates, country and provenance URLs remain labeled `features`, never inferred legal status. Membership derives from `SOURCE_CODES` across default screens, cross-references and listings. Successful local sync time differs from export time and upstream publication freshness.
 
+Typed name screens retain unknown-type records because missing source classification cannot rule a candidate out. Returned page hits carry available birth dates at published precision, nationalities, and distinct address countries from their own source designation, after ranking, grouping and paging. CSL `start_date` is calendar-validated and normalized from US numeric form to ISO; unparseable text remains published text. End dates and birth dates retain their existing meanings.
+
 One service per source (each owns its own fetch + parse + normalize), plus one screening/index service that owns the shared mirror and the matching engine. Tools compose across services; the agent never sees the service boundary.
 
 | Service | Wraps | Used By |
@@ -104,6 +106,7 @@ Each sanctions service is a `sync` ingester for the MirrorService: it fetches th
 | `SANCTIONS_REFRESH_CRON` | No (default `0 4 * * *`) | Cron for the scheduled refresh (HTTP transport only): a supervised child refreshes sanctions and their indexes, then GLEIF deltas under a fresh 4-hour bound. A gap that needs `mirror:init` is logged; golden copies are never loaded on the schedule. |
 | `SANCTIONS_REFRESH_SKIP_GLEIF` | No | `1` skips the GLEIF leg of the scheduled refresh and of `mirror:refresh`. |
 | `SANCTIONS_FUZZY_MIN_SCORE` | No (default `0.85`) | Default Jaro-Winkler similarity floor for fuzzy matches when the caller omits `minScore`. |
+| `SANCTIONS_NORMALIZE_INPUTS` | No (default `true`) | Uppercase mixed-case LEIs before lookup and cursor binding; clamp name-screen and entity-resolution limits to 100 and 50. False restores uppercase-only schemas and maximum-limit rejection. Startup loads `.env` before constructing schemas; normalization logs and counts each operation. |
 | `OFAC_SDN_URL` | No (default official SLS URL) | Override for the OFAC SDN advanced-XML file. |
 | `OFAC_CONSOLIDATED_URL` | No (default official SLS URL) | Override for the OFAC Consolidated advanced-XML file. |
 | `EU_FSF_URL` | No (default official `webgate` URL incl. public token) | Override for the EU consolidated XML file. |
@@ -189,7 +192,7 @@ Auxiliary `name` table (the matching index) — one row **per name and per alias
 
 Two FTS5 indexes (`unicode61 remove_diacritics 2`) cover the table, each kept in lockstep by its own triggers. `name_fts` indexes `normalized` alone, in the shape every release has read; `name_blocking_fts` indexes `normalized`, `suffix_terms`, and `phonetic` for fuzzy blocking. The one-row `name_index_stamp` records the sync run the index was last rebuilt after. On the 102,467 names of the 2026-10-03 lists, `name_fts` takes 3.0 MiB and `name_blocking_fts` 4.9 MiB, and the rebuild on first open takes 3.5 s.
 
-Auxiliary `designation_identifier` table (the exact-lookup index) — one row per published identifier, rewritten with `name` by every ingest and every post-sync rebuild; the one-row `designation_identifier_stamp` beside it records the sync run the index was last rebuilt after:
+Auxiliary `designation_identifier` table (the exact-lookup index) — one row per published identifier, rewritten with `name` by every ingest and every post-sync rebuild; the one-row `designation_identifier_stamp` beside it records the classifier version and sync run the index was last rebuilt after, so a classifier change rebuilds existing indexes:
 
 | Column | Type | Notes |
 |:-------|:-----|:------|
@@ -200,7 +203,7 @@ Auxiliary `designation_identifier` table (the exact-lookup index) — one row pe
 
 | Category | Published labels |
 |:--|:--|
-| `imo` | OFAC `Vessel Registration Identification`, UK `IMO Number`, EU `IMO (vessel identification)` |
+| `imo` | OFAC `Vessel Registration Identification`, UK `IMO Number`, EU `IMO (vessel identification)`; an otherwise unclassified label (including `IMO Company Number`) whose folded value is `IMO` plus seven digits |
 | `swift_bic` | OFAC `SWIFT/BIC`, EU `SWIFT BIC` |
 | `digital_currency_address` | OFAC `Digital Currency Address - <code>` |
 | `passport` | `Passport`, `Diplomatic Passport`, `British National Overseas Passport`, `Stateless Person Passport`, EU `National passport`, UN `Número de pasaporte`, `Numéro de passeport` |
@@ -250,7 +253,9 @@ Steps 1–2 are the ~90% path and need no fuzzy library. On `sanctions_screen_na
 
 ## Design Decisions
 
-- **Multi-source, workflow-organized surface — not per-source tools.** The agent's goal is "screen this entity" / "resolve this entity," not "query OFAC" + "query EU." `sanctions_screen_name` fans out across all four sanctions lists internally; sources surface only as provenance on each hit and via `sanctions_list_sources`. This is the difference between a screening server and four list-wrapper servers.
+- **Status defaults remain restrictive without hiding excluded candidates.** Resolution defaults to `issued`. Only when an active status filter finds no strict matches, a second strict scan drops that predicate while preserving jurisdiction; a notice counts distinct LEIs by status, labeling capped counts as lower bounds. This explains a status exclusion without mixing excluded records into the result or changing fuzzy fallback.
+
+- **Multi-source, workflow-organized surface.** `sanctions_screen_name` searches all eleven loaded lists; sources appear as provenance on each hit and through `sanctions_list_sources`.
 
 - **UK source is the UK Sanctions List (UKSL), not the OFSI Consolidated List.** The OFSI Consolidated List **closed on 28 January 2026**; UKSL (FCDO, `sanctionslist.fcdo.gov.uk`, OGL v3.0) is now the single authoritative UK source. The original idea brief and the catalog frontmatter both said "OFSI Consolidated List" — that source is retired and must not be the ingest target. (Catalog/idea wording should be corrected to UKSL.)
 

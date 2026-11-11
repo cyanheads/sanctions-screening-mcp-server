@@ -1,6 +1,6 @@
 /**
  * @fileoverview `mirror:init` — full out-of-band initialization of the local
- * mirror from the live upstream sources. Harvests all five sanctions lists in
+ * mirror from the live upstream sources. Harvests all eleven sanctions lists in
  * full (via the MirrorService `init` sync), rebuilds the per-alias name index and
  * the identifier index, then streams the GLEIF golden copies (Level 1 entities,
  * Level 2 relationships, and reporting exceptions), recording each file's
