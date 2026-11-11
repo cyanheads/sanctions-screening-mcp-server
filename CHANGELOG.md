@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-11-11
+
+Screening keeps more potential matches visible and accepts common LEI and page-limit inputs.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-31
 
 Screen BIS and State export-control lists and continue ownership investigations across bounded pages.

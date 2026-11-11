@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "sanctions-screening-mcp-server",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Screen names against eleven OFAC, EU, UK, UN, BIS, and State sanctions and export-control lists and resolve legal entities against GLEIF, matched offline over a local SQLite + FTS5 mirror. A screening aid, not a compliance determination.",
   "author": {
     "name": "cyanheads",
