@@ -13,7 +13,8 @@
  * Also the reader for a date a document publishes on its root: the root start
  * tag the check hands over, and `startTagAttribute` over it, timed on worst-case
  * input (#88). `isoDocumentDate`, which reads that date, is tested with
- * `ingest-validation`.
+ * `ingest-validation`. And `scanRecordFragments`: a self-closing record, records
+ * split across chunks, and its cost, linear in document size.
  * @module tests/services/xml-stream.test
  */
 
@@ -285,7 +286,7 @@ describe('scanRecordFragments — a self-closing record', () => {
   });
 });
 
-describe('scanRecordFragments — a record that spans many chunks', () => {
+describe('scanRecordFragments — records split across chunks', () => {
   async function fragments(
     chunks: AsyncIterable<string>,
     names: readonly string[] = ['Party'],
@@ -349,10 +350,11 @@ describe('scanRecordFragments — a record that spans many chunks', () => {
 });
 
 /**
- * One record grown to `n` characters, for the scanner fed in 64-character chunks:
- * a long body that closes, a record or open tag that never closes, repeated
- * openers, repeated prefixes of the closing tag, and the two line-break shapes,
- * each within 80,000 characters; a digit run carries the full 64× span.
+ * Worst cases for the record scan, each grown to `n` characters and fed in
+ * 64-character chunks: a long body that closes, a record or open tag that never
+ * closes, repeated openers, repeated prefixes of the closing tag, and the two
+ * line-break shapes, each within 80,000 characters; a digit run carries the full
+ * 64× span.
  */
 const RECORD_WORST_CASES: [label: string, build: (n: number) => string, max: number][] = [
   ['a long record body', (n) => `<Party ID="1">${'x'.repeat(n)}</Party>`, 80_000],
@@ -372,7 +374,7 @@ async function scanIn64CharChunks(text: string): Promise<number> {
   return count;
 }
 
-describe('scanRecordFragments — linear in the length of a record that spans many chunks', () => {
+describe('scanRecordFragments — linear in document size', () => {
   it.each(RECORD_WORST_CASES)(
     'scans %s in time linear in its length',
     async (_label, build, max) => {

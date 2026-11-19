@@ -380,11 +380,10 @@ export function startTagAttribute(startTag: string, name: string): string | unde
  * complete, empty fragment: waiting for a closing tag it never has would
  * buffer, and drop, every record after it.
  *
- * Linear in the stream however many chunks a record spans: while a record waits
- * for the end of its open tag or for its closing tag, each arriving chunk is
- * searched only with the few characters before it, and set aside rather than
- * appended, so the buffered record is neither searched nor copied again until
- * that terminator arrives.
+ * Linear in document size: while a record waits for the end of its open tag or
+ * for its closing tag, each arriving chunk is set aside and searched together
+ * with only the few characters before it, and the record is rejoined and
+ * scanned once that terminator arrives.
  *
  * @param textChunks Decoded source text, in arrival order.
  * @param recordNames Local element names to lift out, longest-first internally
