@@ -38,6 +38,7 @@ import {
   type GleifDataset,
   type LeiAlternateName,
   type LeiRelationshipChange,
+  type LeiSuccessor,
   type NormalizedLeiEntity,
   type ReportingExceptionChange,
   UNKNOWN_NAME_TYPE,
@@ -187,8 +188,9 @@ function isZip(buf: Buffer): boolean {
 /**
  * Parse an LEI-CDF Level 1 XML document into normalized entity records. The
  * record root is `<LEIRecords><LEIRecord>`; each carries an `<LEI>`, an
- * `<Entity>` (legal name, other names, addresses, jurisdiction, status), and a
- * `<Registration>` (registration status, last-update, RA). The whole-document
+ * `<Entity>` (legal name, other names, addresses, jurisdiction, RA, entity
+ * status, successor entities), and a `<Registration>` (registration status,
+ * last-update). The whole-document
  * oracle the streaming path is tested against.
  */
 export function parseLeiLevel1(
@@ -221,12 +223,28 @@ function typedNames(
 }
 
 /**
+ * The `SuccessorEntity` elements under one `<Entity>`, which repeat: each with its
+ * `SuccessorLEI`, its `SuccessorEntityName` (text only — its `xml:lang` is not
+ * kept), or both. One that names neither is dropped.
+ */
+function successorsOf(entity: Record<string, unknown> | undefined): LeiSuccessor[] {
+  return asArray(entity?.SuccessorEntity).flatMap((node) => {
+    const successor = node as Record<string, unknown>;
+    const lei = asText(successor.SuccessorLEI);
+    const name = asText(successor.SuccessorEntityName);
+    return lei || name ? [{ ...opt('lei', lei), ...opt('name', name) }] : [];
+  });
+}
+
+/**
  * Normalize one `<LEIRecord>`. Null when the record publishes no LEI or no
  * usable legal name — the mirror key and the searchable name respectively.
  *
- * `status` is `RegistrationStatus` alone. `EntityStatus` is a different
- * vocabulary (ACTIVE / INACTIVE / NULL), so a record without a registration
- * status stores none rather than borrowing it.
+ * Two statuses are read, each into its own field and never one in place of the
+ * other: `status` is `RegistrationStatus`, the state of the LEI's registration,
+ * and `entityStatus` is `EntityStatus` (ACTIVE / INACTIVE / NULL), the state of
+ * the legal entity. A record missing either stores none of that one. Every
+ * `SuccessorEntity` is stored as `successors`, absent when none is published.
  */
 function parseOneLei(
   r: Record<string, unknown>,
@@ -257,6 +275,7 @@ function parseOneLei(
   const hqAddr = renderAddress(entity?.HeadquartersAddress as Record<string, unknown> | undefined);
   const jurisdiction = asText(entity?.LegalJurisdiction);
   const ra = entity?.RegistrationAuthority as Record<string, unknown> | undefined;
+  const successors = successorsOf(entity);
 
   return {
     lei,
@@ -265,6 +284,8 @@ function parseOneLei(
     ...(alternateNames.length > 0 ? { alternateNames } : {}),
     ...opt('jurisdiction', jurisdiction),
     ...opt('status', asText(registration?.RegistrationStatus)),
+    ...opt('entityStatus', asText(entity?.EntityStatus)),
+    ...(successors.length > 0 ? { successors } : {}),
     ...opt('legalAddress', legalAddr),
     ...opt('headquartersAddress', hqAddr),
     ...opt('registrationAuthorityId', asText(ra?.RegistrationAuthorityID)),

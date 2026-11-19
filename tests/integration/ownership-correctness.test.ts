@@ -400,6 +400,55 @@ describe('ownership segment pagination', () => {
   });
   const trace = (input: Record<string, unknown>) =>
     traceOwnershipTool.handler(traceOwnershipTool.input.parse(input), ctx());
+  type TracePage = Parameters<typeof render>[0];
+
+  /** Stream identities of one page, in emission order: nodes, then edges, then boundaries. */
+  const recordsOf = (page: TracePage): string[] => [
+    ...page.nodes.map((n) => `node:${n.lei}`),
+    ...page.edges.map((e) => `edge:${e.childLei}|${e.parentLei}|${e.relationshipType}`),
+    ...page.boundaries.map((b) => `boundary:${b.lei}|${b.direction}|${b.reason}`),
+  ];
+
+  /** Every value a page's structuredContent carries is also in its content[] text. */
+  const expectSurfaceParity = (page: TracePage): void => {
+    const text = render(page);
+    expect(text).toContain(`# Ownership graph for \`${page.rootLei}\``);
+    expect(text).toContain(`**${page.nodes.length} node(s), ${page.edges.length} edge(s).**`);
+    expect(text).toContain(
+      `totalAvailable: ${page.totalAvailable} records (nodes + edges + boundaries); totalAvailableBasis: ${page.totalAvailableBasis}; hasMore: ${page.hasMore}; missingEntityCount: ${page.missingEntityCount}; truncationReasons: ${JSON.stringify(page.truncationReasons)}.`,
+    );
+    if (page.nextCursor) expect(text).toContain(`cursor: ${page.nextCursor}`);
+    else expect(text).not.toContain('Continue sanctions_trace_ownership');
+    expect(text).toContain(
+      page.complete ? '**Graph coverage:** complete' : '**Graph coverage:** incomplete',
+    );
+    for (const node of page.nodes) {
+      expect(text).toContain(
+        `- **${node.legalName}** \`${node.lei}\` — ${node.role}, depth ${node.depth}`,
+      );
+      for (const hit of node.sanctionsHits ?? [])
+        expect(text).toContain(`entry ${hit.sourceEntryId}`);
+    }
+    for (const edge of page.edges) {
+      expect(text).toContain(`\`${edge.childLei}\` ${edge.relationshipType} \`${edge.parentLei}\``);
+    }
+    for (const b of page.boundaries) {
+      expect(text).toContain(
+        `- ${b.reason}: sanctions_trace_ownership ${JSON.stringify({ lei: b.lei, direction: b.direction, depth: b.depth })}`,
+      );
+    }
+    for (const missing of page.missingEntityLeis) expect(text).toContain(`\`${missing}\``);
+    expect(text).toContain(
+      page.screeningStatus === 'screened'
+        ? `screened ${page.screenedNodeCount} node(s); ${page.flaggedNodeCount} had potential matches`
+        : page.screeningStatus === 'not_requested'
+          ? 'not requested'
+          : 'NOT run',
+    );
+    expect(text).toContain(page.caveat);
+    expect(page).not.toHaveProperty('byteTargetExceeded');
+    expect(text).not.toContain('byteTargetExceeded');
+  };
 
   it('reconstructs a deterministic multi-level cycle without repeating nodes or edges', async () => {
     const a = lei('PAGEA');
@@ -559,6 +608,21 @@ describe('ownership segment pagination', () => {
     });
   });
 
+  it('rejects a cursor carrying a key the server never wrote, at the top level or inside query', async () => {
+    const query = { lei: ROOT, limit: 1 };
+    const first = await trace(query);
+    const issued = JSON.parse(Buffer.from(first.nextCursor!, 'base64url').toString());
+    const encode = (payload: unknown) => Buffer.from(JSON.stringify(payload)).toString('base64url');
+    await expect(
+      trace({ ...query, cursor: encode({ ...issued, note: 'added' }) }),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_cursor' } });
+    await expect(
+      trace({ ...query, cursor: encode({ ...issued, query: { ...issued.query, note: 'added' } }) }),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_cursor' } });
+    const resumed = await trace({ ...query, cursor: first.nextCursor });
+    expect(resumed.nodes.map((n) => n.lei)).toEqual([PARENT]);
+  });
+
   it.each(['', ' \n\t'])(
     'treats a blank optional cursor %j as an initial request',
     async (cursor) => {
@@ -614,9 +678,9 @@ describe('ownership segment pagination', () => {
       boundaries: [],
       hasMore: false,
       complete: true,
-      byteTargetExceeded: false,
     });
     expect(render(first)).toContain('hasMore: false');
+    expectSurfaceParity(first);
     // Obtain a well-shaped cursor for this topology by the public read-only cursor format.
     // A caller may request its terminal offset; there are no remaining records to repeat.
     const query = { lei: ROOT, limit: 1 };
@@ -636,34 +700,132 @@ describe('ownership segment pagination', () => {
       screenedNodeCount: 0,
     });
     expect(render(terminal)).toContain('**0 node(s), 0 edge(s).**');
+    expectSurfaceParity(terminal);
   });
 
-  it('emits an oversized screened record intact before stopping, never screening an omitted node', async () => {
+  it('returns a page past 64 KiB whole: an oversized first record, then the rest of its limit, screening only page nodes', async () => {
     const name = 'Z'.repeat(40_000);
-    await global.service.ingestLeiEntities([entity(ROOT, name)]);
-    const batch = vi.spyOn(global.service, 'getLeiEntitiesBatch');
-    const result = await trace({ lei: ROOT, screenNodes: true });
-    expect(result).toMatchObject({ byteTargetExceeded: true, screenedNodeCount: 1, hasMore: true });
-    expect(result.nodes).toHaveLength(1);
-    expect(result.nodes[0]?.legalName).toBe(name);
-    expect(batch.mock.calls.flatMap((c) => c[0])).toEqual([ROOT]);
-    expect(render(result)).toContain(name);
-    expect(render(result)).toContain('byteTargetExceeded: true');
-    const clamped = await runToolContract(traceOwnershipTool, {
-      lei: ROOT,
+    const root = lei('OVERSIZEDROOT');
+    const children = [0, 1, 2].map((i) => lei(`OVERSIZEDC${i}`));
+    await global.service.ingestLeiEntities([
+      entity(root, name),
+      ...children.map((id, i) => entity(id, `Oversized Child ${i}`)),
+    ]);
+    await global.service.ingestLeiRelationships(children.map((id) => relationship(id, root)));
+    const query = {
+      lei: root,
+      direction: 'children' as const,
+      depth: 1,
       screenNodes: true,
-      limit: 500,
-    });
-    expect(clamped.structuredContent).toMatchObject({
-      byteTargetExceeded: true,
-      screenedNodeCount: 1,
-      notice: 'Requested limit 500 clamped to 100 records.',
-    });
+      limit: 3,
+    };
+    const hydration = vi.spyOn(global.service, 'getLeiEntitiesBatch');
+    const lookups = vi.spyOn(global.service, 'screenIdentifier');
+    const page = await runToolContract(traceOwnershipTool, query);
+    const result = traceOwnershipTool.output.parse(page.structuredContent);
     expect(
       Buffer.byteLength(
-        JSON.stringify({ structuredContent: clamped.structuredContent, content: clamped.content }),
+        JSON.stringify({ structuredContent: page.structuredContent, content: page.content }),
       ),
     ).toBeGreaterThan(65536);
+    // Exactly limit records, the oversized one first; the fourth node waits for the next page.
+    expect(recordsOf(result)).toEqual([
+      `node:${root}`,
+      `node:${children[0]}`,
+      `node:${children[1]}`,
+    ]);
+    expect(result.nodes.map((n) => n.legalName)).toEqual([
+      name,
+      'Oversized Child 0',
+      'Oversized Child 1',
+    ]);
+    expect(result).toMatchObject({ screenedNodeCount: 3, hasMore: true, totalAvailable: 7 });
+    expect(JSON.parse(Buffer.from(result.nextCursor!, 'base64url').toString()).offset).toBe(3);
+    expect(hydration.mock.calls.flatMap((c) => c[0])).toEqual([root, children[0], children[1]]);
+    expect(lookups.mock.calls.map(([input]) => input.value)).toEqual([
+      root,
+      children[0],
+      children[1],
+    ]);
+    expect(page.structuredContent).not.toHaveProperty('byteTargetExceeded');
+    expect(render(result)).toContain(name);
+    expectSurfaceParity(result);
+
+    hydration.mockClear();
+    lookups.mockClear();
+    const rest = [await trace({ ...query, cursor: result.nextCursor })];
+    while (rest.at(-1)?.hasMore)
+      rest.push(await trace({ ...query, cursor: rest.at(-1)?.nextCursor }));
+    const edge = (child: string) => `edge:${child}|${root}|IS_DIRECTLY_CONSOLIDATED_BY`;
+    // Every page but the last holds exactly limit records; the last holds the remainder.
+    expect(rest.map(recordsOf)).toEqual([
+      [`node:${children[2]}`, edge(children[0]!), edge(children[1]!)],
+      [edge(children[2]!)],
+    ]);
+    expect(rest.map((p) => p.screenedNodeCount)).toEqual([1, 0]);
+    expect(rest.at(-1)).toMatchObject({ hasMore: false, complete: true });
+    expect(hydration.mock.calls.flatMap((c) => c[0])).toEqual([children[2]]);
+    expect(lookups.mock.calls.map(([input]) => input.value)).toEqual([children[2]]);
+    for (const p of rest) expectSurfaceParity(p);
+
+    const clamped = await runToolContract(traceOwnershipTool, { ...query, limit: 500 });
+    expect(clamped.structuredContent).toMatchObject({
+      screenedNodeCount: 4,
+      hasMore: false,
+      notice: 'Requested limit 500 clamped to 100 records.',
+    });
+    expect(recordsOf(traceOwnershipTool.output.parse(clamped.structuredContent))).toEqual([
+      ...recordsOf(result),
+      ...rest.flatMap(recordsOf),
+    ]);
+    expect(clamped.structuredContent).not.toHaveProperty('byteTargetExceeded');
+  });
+
+  it('resumes a 0.6.1 cursor issued at a byte cut at that record, skipping and repeating nothing', async () => {
+    /**
+     * The cursor 0.6.1 issued for this fixture's first page, which its 64-KiB target
+     * cut after the oversized second node (offset 2 of 7). Cursors keep that shape:
+     * version 1, the effective query, the topology fingerprint, an absolute offset.
+     */
+    const CURSOR_0_6_1 =
+      'eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6eyJsZWkiOiJCWVRFQ1VUUk9PVDAwMDAwMDAwMCIsImRpcmVjdGlvbiI6ImNoaWxkcmVuIiwiZGVwdGgiOjEsInNjcmVlbk5vZGVzIjp0cnVlLCJsaW1pdCI6NTB9LCJ0b3BvbG9neSI6IjliZjA1MmQxZTk4MWM4YTllMGU4NjY0M2E5OTZlMmM1NmQ0NjcyNzJjZjE4MjQ0YzdhYzI0ZjZkNWZkYjE0MDQiLCJvZmZzZXQiOjJ9';
+    const root = lei('BYTECUTROOT');
+    const children = [0, 1, 2].map((i) => lei(`BYTECUTC${i}`));
+    expect(JSON.parse(Buffer.from(CURSOR_0_6_1, 'base64url').toString())).toEqual({
+      version: 1,
+      query: { lei: root, direction: 'children', depth: 1, screenNodes: true, limit: 50 },
+      topology: '9bf052d1e981c8a9e0e86643a996e2c56d467272cf18244c7ac24f6d5fdb1404',
+      offset: 2,
+    });
+    await global.service.ingestLeiEntities([
+      entity(root, 'Byte Cut Root'),
+      entity(children[0]!, 'Z'.repeat(40_000)),
+      entity(children[1]!, 'Byte Cut Child One'),
+      entity(children[2]!, 'Byte Cut Child Two'),
+    ]);
+    await global.service.ingestLeiRelationships(children.map((id) => relationship(id, root)));
+    const query = { lei: root, direction: 'children', depth: 1, screenNodes: true, limit: 50 };
+
+    const whole = await trace(query);
+    expect(whole).toMatchObject({ totalAvailable: 7, hasMore: false, screenedNodeCount: 4 });
+    const stream = recordsOf(whole);
+    expect(stream).toHaveLength(7);
+
+    const hydration = vi.spyOn(global.service, 'getLeiEntitiesBatch');
+    const lookups = vi.spyOn(global.service, 'screenIdentifier');
+    const resumed = await trace({ ...query, cursor: CURSOR_0_6_1 });
+    // 0.6.1's first page carried records 0–1; the resumed page carries 2–6, once each.
+    expect(recordsOf(resumed)).toEqual(stream.slice(2));
+    expect([...stream.slice(0, 2), ...recordsOf(resumed)]).toEqual(stream);
+    expect(resumed.nodes.map((n) => n.legalName)).toEqual([
+      'Byte Cut Child One',
+      'Byte Cut Child Two',
+    ]);
+    expect(resumed).toMatchObject({ hasMore: false, complete: true, screenedNodeCount: 2 });
+    expect(resumed).not.toHaveProperty('nextCursor');
+    expect(hydration.mock.calls.flatMap((c) => c[0])).toEqual([children[1], children[2]]);
+    expect(lookups.mock.calls.map(([input]) => input.value)).toEqual([children[1], children[2]]);
+    expectSurfaceParity(resumed);
   });
 
   it('keeps ultimate-leaf recovery actionable on edge-only and boundary-only pages', async () => {
@@ -757,12 +919,9 @@ describe('ownership segment pagination', () => {
       .filter((b) => b.type === 'text')
       .map((b) => b.text)
       .join('\n');
-    expect(text).toContain('Requested limit 500 clamped to 100 records.');
-    expect(domain.byteTargetExceeded).toBe(
-      Buffer.byteLength(
-        JSON.stringify({ structuredContent: capped.structuredContent, content: capped.content }),
-      ) > 65536,
-    );
+    expect(text).toContain('\n\n> Requested limit 500 clamped to 100 records.');
+    expect(capped.structuredContent).not.toHaveProperty('byteTargetExceeded');
+    expect(text).not.toContain('byteTargetExceeded');
     expect(() => traceOwnershipTool.input.parse({ lei: ROOT, limit: 0 })).toThrow();
   });
 });

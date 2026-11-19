@@ -11,7 +11,7 @@
  */
 
 import { deflateRawSync, gzipSync } from 'node:zlib';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   openGleifFileFromBytes,
   parseLeiLevel1,
@@ -23,6 +23,7 @@ import {
 } from '@/services/screening/gleif-ingest.js';
 import { createRejections } from '@/services/screening/ingest-validation.js';
 import {
+  buildSanctionsIngesters,
   createHarvestState,
   type HarvestState,
   parseEu,
@@ -33,10 +34,12 @@ import {
   streamOfacFromText,
   streamUkFromText,
   streamUnFromText,
+  toDesignationRow,
 } from '@/services/screening/sanctions-ingest.js';
 import type { NormalizedDesignation } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 import { leiFile, repexFile, rrFile } from './_gleif-publication.js';
+import { expectLinearTime } from './_linear-time.js';
 
 // ─── OFAC advanced schema (attribute-driven) ────────────────────────────────────
 
@@ -243,6 +246,296 @@ describe('EU parser', () => {
   });
 });
 
+// ─── EU primary name (issue #93) ────────────────────────────────────────────────
+//
+// The EU file publishes no primary name: every name is a `<nameAlias>`, in the
+// languages the list translates it into, in no fixed language order. The entities
+// below are the published ones (aliases trimmed, document order kept); the last is
+// eu 181035 without its `function` alias.
+
+/** One published `<nameAlias>`, with the attributes the list always writes. */
+const euAlias = (
+  wholeName: string,
+  {
+    language = '',
+    fn = '',
+    strong = 'true',
+  }: { fn?: string; language?: string; strong?: string } = {},
+) =>
+  `<nameAlias firstName="" middleName="" lastName="" wholeName="${wholeName}" function="${fn}" title="" nameLanguage="${language}" strong="${strong}" regulationLanguage="en"/>`;
+
+const euEntity = (id: string, subject: 'person' | 'enterprise', aliases: string[]) =>
+  `<sanctionEntity designationDetails="" unitedNationId="" logicalId="${id}">
+    <subjectType code="${subject}" classificationCode="${subject === 'person' ? 'P' : 'E'}"/>
+    ${aliases.join('\n    ')}
+  </sanctionEntity>`;
+
+const PRIMARY_EU_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<export xmlns="http://eu.europa.ec/fpi/fsd/export">
+  ${euEntity('327', 'enterprise', [
+    euAlias('Αφγανική Επιτροπή Στήριξης', { language: 'EL' }),
+    euAlias('Comité de soutien afghan', { language: 'FR' }),
+    euAlias('Afghan Support Committee', {
+      language: 'EN',
+      fn: 'Associated with the Revival of Islamic Heritage Society.',
+    }),
+    euAlias('ASC', { language: 'EN' }),
+  ])}
+  ${euEntity('135909', 'person', [
+    euAlias('Влади́мир Влади́мирович ПУ́ТИН'),
+    euAlias('Vladimir Vladimirovitj PUTIN', { language: 'SV' }),
+    euAlias('Vladimir Vladimirovich POUTINE', { language: 'FR' }),
+    euAlias('Vladimir Vladimirovich PUTIN', { fn: 'President of the Russian Federation' }),
+  ])}
+  ${euEntity('7341', 'person', [
+    euAlias('Ігор Миколайович БЕЗЛЕР', { language: 'UK' }),
+    euAlias('Игорь Николаевич БЕЗЛЕР', { language: 'RU' }),
+    euAlias('Igor Nikolaevich BEREGOVOY'),
+    euAlias('Ihor Mykolayovych BEZLER'),
+    euAlias('Bes (le diable)', { language: 'FR' }),
+    euAlias('Igor Nikolaevich BEZLER', {
+      fn: 'One of the former leaders of the self-proclaimed militia of Horlivka.',
+    }),
+    euAlias('Bes (devil)', { language: 'EN' }),
+  ])}
+  ${euEntity('154265', 'person', [
+    euAlias('Leonid Vladimirovitj CHARTJENKO', { language: 'SV' }),
+    euAlias('Leonid Vladimirovič CHARČENKO', { language: 'SK' }),
+    euAlias('Крот', { language: 'RU' }),
+    euAlias('Krot', { language: 'EN' }),
+    euAlias('Leonid Vladimirovich KHARCHENKO', {
+      fn: 'Head of the Krot Reconnaissance Battalion',
+    }),
+  ])}
+  ${euEntity('160143', 'enterprise', [
+    euAlias('АО НПО “Курганприбор”', { language: 'RU' }),
+    euAlias('Kurganpribor Kutató- és Termelőtársaság Rt.', { language: 'HU' }),
+    euAlias('JSC NPO Kurganpribor', { language: 'EN' }),
+  ])}
+  ${euEntity('202', 'enterprise', [
+    euAlias('Ταξιαρχία Μαρτύρων του Al-Aqsa', { language: 'EL' }),
+    euAlias('Brigade des martyrs d’Al-Aqsa', { language: 'FR' }),
+    euAlias('Бригади на мъчениците от Ал-Акса', { language: 'BG' }),
+    euAlias("Al-Aqsa Martyrs' Brigade"),
+    euAlias('Al-Aqsa-martyrernas brigad', { language: 'SV' }),
+  ])}
+  ${euEntity('205', 'enterprise', [
+    euAlias('Μπάμπαρ Χαλσά', { language: 'EL' }),
+    euAlias('Babbar Khalsa', { language: 'PA' }),
+    euAlias('Бабар Калса', { language: 'BG' }),
+    euAlias('Μπάμπαρ Χαλσά', { language: 'EL' }),
+    euAlias('Babbar Jalsa', { language: 'ES' }),
+  ])}
+  ${euEntity('154674', 'enterprise', [
+    euAlias('ЧВК “Патриот”', { language: 'RU' }),
+    euAlias('empresa militar privada Patriot'),
+    euAlias('Prywatna Firma Wojskowa Patriot', { language: 'PL' }),
+    euAlias('PMC Patriot', { language: 'EN' }),
+  ])}
+  ${euEntity('150133', 'enterprise', [
+    euAlias('Российская Национальная Перестраховочная Компания', { language: 'RU' }),
+    euAlias('Rosyjski Państwowy Zakład Reasekuracji S.A.', { language: 'PL' }),
+    euAlias('RNPK'),
+    euAlias('Russian National Reinsurance Company JSC', { language: 'EN' }),
+  ])}
+  ${euEntity('206', 'enterprise', [
+    euAlias("Gama'a al-Islamiyya"),
+    euAlias('Jamaat al-islamiyya', { language: 'SV' }),
+    euAlias("Al-Gama'a al-Islamiyya"),
+    euAlias('IG', { language: 'EN' }),
+    euAlias('Ισλαμική Ομάδα', { language: 'EL' }),
+    euAlias('Islamic Group', { language: 'EN' }),
+  ])}
+  ${euEntity('3187', 'person', [
+    euAlias('Sylvestre Mudacumura', {
+      fn: 'a) FDLR-FOCA Commander, b) FDLR-FOCA Lieutenant General',
+    }),
+    euAlias('Radja'),
+    euAlias('Pharaoh', { language: 'EN' }),
+    euAlias('Bernard Mupenzi', { fn: 'FDLR-FOCA Commander' }),
+  ])}
+  ${euEntity('119656', 'person', [
+    euAlias('Руслан Александрович РОМАШКИН'),
+    euAlias('Ruslan Alexandrovich ROMASHKІN', {
+      fn: 'Head of the Service of the Control Point of the Federal Security Service.',
+    }),
+  ])}
+  ${euEntity('181035', 'enterprise', [
+    euAlias('АО “СНПЗ”', { language: 'EN' }),
+    euAlias('Open Joint-Stock Oil And Gas Company Syzran', { language: 'EN' }),
+    euAlias('OJSC Syzran Refinery', { language: 'EN' }),
+    euAlias('Акционерное общество “Сызранский нефтеперерабатывающий завод”', { language: 'RU' }),
+  ])}
+</export>`;
+
+/** Every name the fixture publishes per entity, in document order. */
+function publishedEuNames(xml: string): Map<string, string[]> {
+  const root = parseXml<{ export: { sanctionEntity: Record<string, unknown>[] } }>(xml).export;
+  return new Map(
+    root.sanctionEntity.map((e) => [
+      String(e['@_logicalId']),
+      (e.nameAlias as Record<string, string>[]).map((a) => a['@_wholeName']!),
+    ]),
+  );
+}
+
+describe('EU primary name (issue #93)', () => {
+  const parsed = () => parseEu(parseXml(PRIMARY_EU_XML));
+  const primaryOf = (id: string) => byEntryId(parsed(), id).primaryName;
+
+  it.each([
+    ['327', 'Afghan Support Committee'],
+    ['135909', 'Vladimir Vladimirovich PUTIN'],
+    ['7341', 'Igor Nikolaevich BEZLER'],
+    // The first alias is Latin, but the function names the main entry.
+    ['154265', 'Leonid Vladimirovich KHARCHENKO'],
+  ])('eu %s leads with the Latin-script alias that carries a function: %s', (id, name) => {
+    expect(primaryOf(id)).toBe(name);
+  });
+
+  it.each([
+    // Each step alone: EN over a first Latin alias, untagged over one, then the first Latin alias.
+    ['160143', 'JSC NPO Kurganpribor'],
+    ['202', "Al-Aqsa Martyrs' Brigade"],
+    ['205', 'Babbar Khalsa'],
+    // EN over an untagged alias published before it.
+    ['154674', 'PMC Patriot'],
+    // EN over both an untagged alias and an earlier Latin alias in another language.
+    ['150133', 'Russian National Reinsurance Company JSC'],
+  ])(
+    'eu %s, whose first alias is not Latin and no alias carries a function: EN, then untagged, then first Latin — %s',
+    (id, name) => {
+      expect(primaryOf(id)).toBe(name);
+    },
+  );
+
+  it.each([
+    ['206', "Gama'a al-Islamiyya"],
+    ['3187', 'Sylvestre Mudacumura'],
+  ])('eu %s keeps its Latin first alias over an EN nickname or acronym: %s', (id, name) => {
+    expect(primaryOf(id)).toBe(name);
+  });
+
+  it('keeps the first alias of an entity with no Latin-script alias, a homoglyph spelling included', () => {
+    // `ROMASHKІN` carries a Cyrillic `І`, so it is not a Latin-script name.
+    expect(primaryOf('119656')).toBe('Руслан Александрович РОМАШКИН');
+  });
+
+  it('reads the script from the name, never from its language tag', () => {
+    // The first alias is tagged EN but written in Cyrillic.
+    expect(primaryOf('181035')).toBe('Open Joint-Stock Oil And Gas Company Syzran');
+  });
+
+  it('keeps every published name: the former first alias stays an alias, the rest in document order', () => {
+    const published = publishedEuNames(PRIMARY_EU_XML);
+    const records = parsed();
+    expect(records).toHaveLength(published.size);
+    for (const record of records) {
+      const names = published.get(record.sourceEntryId)!;
+      const picked = names.indexOf(record.primaryName);
+      expect(picked, record.sourceEntryId).toBeGreaterThanOrEqual(0);
+      expect(
+        record.payload.aliases.map((a) => a.name),
+        record.sourceEntryId,
+      ).toEqual(names.filter((_, i) => i !== picked));
+    }
+    expect(byEntryId(records, '205').payload.aliases).toEqual([
+      { name: 'Μπάμπαρ Χαλσά', nameType: 'aka' },
+      { name: 'Бабар Калса', nameType: 'aka' },
+      { name: 'Μπάμπαρ Χαλσά', nameType: 'aka' },
+      { name: 'Babbar Jalsa', nameType: 'aka' },
+    ]);
+  });
+
+  it('types the demoted first alias by its own strength', () => {
+    const [d] = parseEu(
+      parseXml(
+        `<export>${euEntity('9', 'enterprise', [
+          euAlias('ПАО “Пример”', { strong: 'false' }),
+          euAlias('Primer PJSC', { language: 'EN' }),
+        ])}</export>`,
+      ),
+    );
+    expect(d?.primaryName).toBe('Primer PJSC');
+    expect(d?.payload.aliases).toEqual([{ name: 'ПАО “Пример”', nameType: 'low-quality-aka' }]);
+  });
+
+  it('streams the same primary names the buffered parser picks, at every chunk size', async () => {
+    const oracle = parsed();
+    for (const size of CHUNK_SIZES) {
+      const { records } = await streamAll(streamEuFromText, PRIMARY_EU_XML, size);
+      expect(records, `chunk size ${size}`).toEqual(oracle);
+    }
+  });
+});
+
+describe('EU primary-name selection CPU', () => {
+  /*
+   * Selection tests the script of every alias's text. Each shape keeps every
+   * alias usable and in play: no letter at all, a Latin run that ends in a
+   * Cyrillic letter (so no alias qualifies and every tier scans every alias), and
+   * the two line-break shapes.
+   */
+  const entityOf = (name: string) => ({
+    export: {
+      sanctionEntity: {
+        '@_logicalId': '1',
+        nameAlias: [
+          { '@_wholeName': name },
+          { '@_wholeName': name, '@_function': 'Director' },
+          { '@_wholeName': name, '@_nameLanguage': 'EN' },
+          { '@_wholeName': name },
+        ],
+      },
+    },
+  });
+  it.each([
+    { label: 'a digit run', make: (n: number) => '1'.repeat(n), largest: 320_000 },
+    {
+      label: 'a Latin run ending in Cyrillic',
+      make: (n: number) => `${'x'.repeat(n)}я`,
+      largest: 80_000,
+    },
+    {
+      label: 'one long line ending in a break',
+      make: (n: number) => `${'x'.repeat(n)}\ny`,
+      largest: 80_000,
+    },
+    {
+      label: 'breaks throughout',
+      make: (n: number) => `x${'  \r\n'.repeat(n / 4)}y`,
+      largest: 80_000,
+    },
+  ])(
+    'bounds CPU on $label across increasing input sizes',
+    ({ make, largest }) => {
+      const baseline = entityOf(make(5_000));
+      const measure = (doc: Record<string, unknown>, repeats: number): number => {
+        const start = process.threadCpuUsage();
+        for (let i = 0; i < repeats; i++) parseEu(doc);
+        const elapsed = process.threadCpuUsage(start);
+        return (elapsed.user + elapsed.system) / repeats;
+      };
+      measure(baseline, 64);
+      for (let size = 10_000; size <= largest; size *= 2) {
+        const doc = entityOf(make(size));
+        const samples = Array.from({ length: 5 }, () => {
+          const small = measure(baseline, 32);
+          const large = measure(doc, 4);
+          return { large, growth: large / small };
+        });
+        expect(Math.min(...samples.map(({ large }) => large)), `CPU µs at ${size}`).toBeLessThan(
+          100_000,
+        );
+        expect(Math.min(...samples.map(({ growth }) => growth)), `growth at ${size}`).toBeLessThan(
+          256,
+        );
+      }
+    },
+    0,
+  );
+});
+
 // ─── UK (element-based) ─────────────────────────────────────────────────────────
 
 const UK_XML = `<?xml version="1.0" encoding="utf-8"?>
@@ -316,6 +609,188 @@ describe('UN parser', () => {
     expect(org?.entityType).toBe('organization');
     expect(org?.primaryName).toBe('EXAMPLE UN ENTITY');
   });
+});
+
+// ─── UK and UN native-script names (issue #87) ──────────────────────────────────
+//
+// Published records, trimmed to their names. UK RUS1644 also publishes an empty
+// <NonLatinName>; SHK0001 carries the leading line break the list writes on some
+// names, and U+FFFD what a lossy decode leaves of an undecodable byte.
+
+const NATIVE_UK_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Designations>
+  <Designation>
+    <UniqueID>GAC0076</UniqueID><OFSIGroupID>16850</OFSIGroupID>
+    <Names><Name><Name1>Levan</Name1><Name6>Murusidze</Name6><NameType>Primary Name</NameType></Name></Names>
+    <NonLatinNames>
+      <NonLatinName>
+        <NameNonLatinScript>ლევან მურუსიძე</NameNonLatinScript>
+        <NonLatinScriptType>Georgian</NonLatinScriptType>
+        <NonLatinScriptLanguage>Georgian</NonLatinScriptLanguage>
+      </NonLatinName>
+    </NonLatinNames>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+  </Designation>
+  <Designation>
+    <UniqueID>GHR0179</UniqueID>
+    <Names>
+      <Name><Name1>Zhi</Name1><Name6>Chen</Name6><NameType>Primary Name</NameType></Name>
+      <Name><Name1>Zhi</Name1><Name6>CHEN</Name6><NameType>Primary Name</NameType></Name>
+      <Name><Name6>Vincent</Name6><NameType>Alias</NameType></Name>
+    </Names>
+    <NonLatinNames>
+      <NonLatinName><NameNonLatinScript>ចេន ហ្ស៊ី</NameNonLatinScript><NonLatinScriptType>Khmer</NonLatinScriptType></NonLatinName>
+      <NonLatinName><NameNonLatinScript>陈志</NameNonLatinScript><NonLatinScriptType>Chinese</NonLatinScriptType></NonLatinName>
+    </NonLatinNames>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+  </Designation>
+  <Designation>
+    <UniqueID>AQD0007</UniqueID>
+    <Names>
+      <Name><Name6>AL MOULATHAMOUN</Name6><NameType>Primary name</NameType></Name>
+      <Name><Name6>Les Enturbannes</Name6><NameType>Alias</NameType></Name>
+    </Names>
+    <NonLatinNames>
+      <NonLatinName><NameNonLatinScript>الملثمون</NameNonLatinScript></NonLatinName>
+      <NonLatinName><NameNonLatinScript>Les Enturbannés</NameNonLatinScript></NonLatinName>
+    </NonLatinNames>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+  </Designation>
+  <Designation>
+    <UniqueID>RUS1644</UniqueID>
+    <Names><Name><Name1>God</Name1><Name2>Semenovich</Name2><Name6>NISANOV</Name6><NameType>Primary Name</NameType></Name></Names>
+    <NonLatinNames>
+      <NonLatinName>
+        <NameNonLatinScript>Год Семёнович Нисанов </NameNonLatinScript>
+        <NonLatinScriptType>Cyrillic</NonLatinScriptType>
+      </NonLatinName>
+      <NonLatinName><NonLatinScriptType>Cyrillic</NonLatinScriptType><NonLatinScriptLanguage>Russian</NonLatinScriptLanguage></NonLatinName>
+    </NonLatinNames>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+  </Designation>
+  <Designation>
+    <UniqueID>SHK0001</UniqueID>
+    <Names><Name><Name1>Adalbi</Name1><Name6>SHKHAGOSHEV</Name6><NameType>Primary name</NameType></Name></Names>
+    <NonLatinNames>
+      <NonLatinName><NameNonLatinScript>
+Шхагошев Адальби Люлевич</NameNonLatinScript></NonLatinName>
+      <NonLatinName><NameNonLatinScript>Шхаго�ев</NameNonLatinScript></NonLatinName>
+      <NonLatinName><NameNonLatinScript>   </NameNonLatinScript></NonLatinName>
+    </NonLatinNames>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+  </Designation>
+  <Designation>
+    <UniqueID>AFG0001</UniqueID>
+    <Names><Name><Name6>HAJI KHAIRULLAH MONEY EXCHANGE</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+  </Designation>
+</Designations>`;
+
+const NATIVE_UN_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<CONSOLIDATED_LIST>
+  <INDIVIDUALS>
+    <INDIVIDUAL>
+      <DATAID>6908048</DATAID>
+      <FIRST_NAME>SADDAM</FIRST_NAME><SECOND_NAME>HUSSEIN</SECOND_NAME><THIRD_NAME>AL-TIKRITI</THIRD_NAME>
+      <REFERENCE_NUMBER>IQi.001</REFERENCE_NUMBER>
+      <NAME_ORIGINAL_SCRIPT>صدام حسين التكريتي</NAME_ORIGINAL_SCRIPT>
+      <COMMENTS1/>
+      <INDIVIDUAL_ALIAS><QUALITY>Low</QUALITY><ALIAS_NAME>Abu Ali</ALIAS_NAME></INDIVIDUAL_ALIAS>
+    </INDIVIDUAL>
+    <INDIVIDUAL>
+      <DATAID>6907993</DATAID>
+      <FIRST_NAME>ERIC</FIRST_NAME><SECOND_NAME>BADEGE</SECOND_NAME>
+      <INDIVIDUAL_ALIAS><QUALITY>Good</QUALITY><ALIAS_NAME>Eric Badegé</ALIAS_NAME></INDIVIDUAL_ALIAS>
+    </INDIVIDUAL>
+  </INDIVIDUALS>
+  <ENTITIES>
+    <ENTITY>
+      <DATAID>113236</DATAID>
+      <FIRST_NAME>EGYPTIAN ISLAMIC JIHAD</FIRST_NAME>
+      <REFERENCE_NUMBER>QDe.003</REFERENCE_NUMBER>
+      <NAME_ORIGINAL_SCRIPT>الجهاد الاسلامي المصري</NAME_ORIGINAL_SCRIPT>
+      <ENTITY_ALIAS><QUALITY>Good</QUALITY><ALIAS_NAME>Egyptian Al-Jihad</ALIAS_NAME></ENTITY_ALIAS>
+    </ENTITY>
+    <ENTITY>
+      <DATAID>113237</DATAID>
+      <FIRST_NAME>UNDECODED ORIGINAL</FIRST_NAME>
+      <NAME_ORIGINAL_SCRIPT>الجهاد�</NAME_ORIGINAL_SCRIPT>
+    </ENTITY>
+  </ENTITIES>
+</CONSOLIDATED_LIST>`;
+
+describe('UK and UN native-script names (issue #87)', () => {
+  it('UK: appends each NameNonLatinScript as an aka after the Names block, primary unchanged', () => {
+    const records = parseUk(parseXml(NATIVE_UK_XML));
+    expect(byEntryId(records, 'GAC0076')).toMatchObject({
+      primaryName: 'Levan Murusidze',
+      payload: { aliases: [{ name: 'ლევან მურუსიძე', nameType: 'aka' }] },
+    });
+    expect(byEntryId(records, 'GHR0179').payload.aliases).toEqual([
+      { name: 'Zhi CHEN', nameType: 'aka' },
+      { name: 'Vincent', nameType: 'aka' },
+      { name: 'ចេន ហ្ស៊ី', nameType: 'aka' },
+      { name: '陈志', nameType: 'aka' },
+    ]);
+  });
+
+  it('UK: stores a Latin spelling the Names block strips of its diacritics, as published', () => {
+    expect(byEntryId(parseUk(parseXml(NATIVE_UK_XML)), 'AQD0007').payload.aliases).toEqual([
+      { name: 'Les Enturbannes', nameType: 'aka' },
+      { name: 'الملثمون', nameType: 'aka' },
+      { name: 'Les Enturbannés', nameType: 'aka' },
+    ]);
+  });
+
+  it('UK: adds nothing for an empty, blank, or undecodable NameNonLatinScript, and trims a published line break', () => {
+    const records = parseUk(parseXml(NATIVE_UK_XML));
+    expect(byEntryId(records, 'RUS1644').payload.aliases).toEqual([
+      { name: 'Год Семёнович Нисанов', nameType: 'aka' },
+    ]);
+    expect(byEntryId(records, 'SHK0001').payload.aliases).toEqual([
+      { name: 'Шхагошев Адальби Люлевич', nameType: 'aka' },
+    ]);
+    expect(byEntryId(records, 'AFG0001').payload.aliases).toEqual([]);
+  });
+
+  it('UN: appends NAME_ORIGINAL_SCRIPT typed primary after the aliases, primary unchanged', () => {
+    const records = parseUn(parseXml(NATIVE_UN_XML));
+    expect(byEntryId(records, '6908048')).toMatchObject({
+      primaryName: 'SADDAM HUSSEIN AL-TIKRITI',
+      payload: {
+        aliases: [
+          { name: 'Abu Ali', nameType: 'low-quality-aka' },
+          { name: 'صدام حسين التكريتي', nameType: 'primary' },
+        ],
+      },
+    });
+    expect(byEntryId(records, '113236').payload.aliases).toEqual([
+      { name: 'Egyptian Al-Jihad', nameType: 'aka' },
+      { name: 'الجهاد الاسلامي المصري', nameType: 'primary' },
+    ]);
+  });
+
+  it('UN: a record without the element, or with an undecodable one, parses as before', () => {
+    const records = parseUn(parseXml(NATIVE_UN_XML));
+    expect(byEntryId(records, '6907993').payload.aliases).toEqual([
+      { name: 'Eric Badegé', nameType: 'aka' },
+    ]);
+    expect(byEntryId(records, '113237').payload.aliases).toEqual([]);
+  });
+
+  it.each([
+    ['UK', NATIVE_UK_XML, parseUk, streamUkFromText],
+    ['UN', NATIVE_UN_XML, parseUn, streamUnFromText],
+  ] as const)(
+    '%s: streams the same native-script names the buffered parser reads',
+    async (_label, xml, parse, stream) => {
+      const oracle = parse(parseXml(xml));
+      for (const size of CHUNK_SIZES) {
+        const { records } = await streamAll(stream, xml, size);
+        expect(records, `chunk size ${size}`).toEqual(oracle);
+      }
+    },
+  );
 });
 
 describe('sanctions parser sparsity and alias quality', () => {
@@ -2320,7 +2795,10 @@ const FEATURE_OFAC_XML = `<?xml version="1.0" encoding="utf-8"?>
   </DistinctParties>
 </Sanctions>`;
 
-/** UK ship DPR0075 as published (its owner with a trailing space), and RUS2000 with an IMO number only. */
+/**
+ * UK ship DPR0075 as published (its owner with a trailing space; its designation
+ * source and measure ahead of its ship details), and RUS2000 with an IMO number only.
+ */
 const FEATURE_UK_XML = `<?xml version="1.0" encoding="utf-8"?>
 <Designations>
   <Designation>
@@ -2328,6 +2806,8 @@ const FEATURE_UK_XML = `<?xml version="1.0" encoding="utf-8"?>
     <Names><Name><Name6>Petrel 8</Name6><NameType>Primary name</NameType></Name></Names>
     <RegimeName>The Democratic People's Republic of Korea (Sanctions) (EU Exit) Regulations 2019</RegimeName>
     <IndividualEntityShip>Ship</IndividualEntityShip>
+    <DesignationSource>UN</DesignationSource>
+    <SanctionsImposed>Prohibition of port entry</SanctionsImposed>
     <ShipDetails>
       <Ship>
         <IMONumbers><IMONumber>IMO9562233</IMONumber></IMONumbers>
@@ -2423,10 +2903,12 @@ describe('descriptive features (issue #64)', () => {
     },
   );
 
-  it('UK DPR0075: every ship detail but the IMO number, typed by element, the IMO number still an identifier', () => {
+  it('UK DPR0075: every ship detail but the IMO number, typed by element, after its designation source and measure; the IMO number still an identifier', () => {
     const records = parseUk(parseXml(FEATURE_UK_XML));
     const ship = byEntryId(records, 'DPR0075');
     expect(ship.payload.features).toEqual([
+      { type: 'DesignationSource', value: 'UN' },
+      { type: 'SanctionsImposed', value: 'Prohibition of port entry' },
       { type: 'CurrentOwnerOperator', value: 'Global United Shipping India' },
       { type: 'CurrentBelievedFlagOfShip', value: 'Comoros' },
       { type: 'PreviousFlag', value: 'India' },
@@ -2826,6 +3308,151 @@ describe('sanctions streaming ingest — equivalence with the buffered parsers',
         const { records, state } = await streamAll(stream, xml, size);
         expect(records, `chunk size ${size}`).toEqual(oracle);
         expect(state.rejections, `chunk size ${size}`).toEqual(rejections);
+      }
+    },
+  );
+});
+
+describe("sanctions streaming ingest — the document's own date (#88)", () => {
+  const streamOfac = (chunks: AsyncIterable<string>, state: HarvestState) =>
+    streamOfacFromText(chunks, 'ofac_sdn', state);
+  /** The OFAC fixture with its `<DateOfIssue>` replaced by `dateOfIssue`. */
+  const ofacIssuedOn = (dateOfIssue: string) =>
+    MULTI_OFAC_ADVANCED_XML.replace(/<DateOfIssue>[\s\S]*?<\/DateOfIssue>/, dateOfIssue);
+  /** The UK fixture with its `<DateGenerated>` replaced by `dateGenerated`. */
+  const ukGeneratedOn = (dateGenerated: string) =>
+    MULTI_UK_XML.replace(/<DateGenerated>[\s\S]*?<\/DateGenerated>/, dateGenerated);
+
+  it('OFAC: reads <DateOfIssue> as a zero-padded ISO date at every chunk size, and still streams every party', async () => {
+    for (const size of CHUNK_SIZES) {
+      const { records, state } = await streamAll(streamOfac, MULTI_OFAC_ADVANCED_XML, size);
+      expect(state.publishedAt, `chunk size ${size}`).toBe('2026-07-27');
+      expect(records.map((d) => d.sourceEntryId)).toEqual(['2674', '4238']);
+    }
+  });
+
+  it.each([
+    [
+      'an unpadded day, as CONS_ADVANCED.XML publishes it',
+      '<DateOfIssue CalendarTypeID="1"><Year>2026</Year><Month>11</Month><Day>4</Day></DateOfIssue>',
+      '2026-11-04',
+    ],
+    [
+      'a year and month only, at that precision',
+      '<DateOfIssue><Year>2026</Year><Month>11</Month></DateOfIssue>',
+      '2026-11',
+    ],
+    [
+      'a day with no month, at the year alone',
+      '<DateOfIssue><Year>2026</Year><Day>4</Day></DateOfIssue>',
+      '2026',
+    ],
+  ])('OFAC: reads %s', async (_label, dateOfIssue, publishedAt) => {
+    const { state } = await streamAll(streamOfac, ofacIssuedOn(dateOfIssue), 7);
+    expect(state.publishedAt).toBe(publishedAt);
+  });
+
+  it.each([
+    [
+      'an impossible day',
+      '<DateOfIssue><Year>2026</Year><Month>2</Month><Day>30</Day></DateOfIssue>',
+    ],
+    ['no year', '<DateOfIssue><Month>11</Month><Day>4</Day></DateOfIssue>'],
+    ['an empty element', '<DateOfIssue/>'],
+    ['no element at all', ''],
+  ])('OFAC: reads no date from %s, and still streams every party', async (_label, dateOfIssue) => {
+    const { records, state } = await streamAll(streamOfac, ofacIssuedOn(dateOfIssue), 64);
+    expect(state.publishedAt).toBeUndefined();
+    expect(records.map((d) => d.sourceEntryId)).toEqual(['2674', '4238']);
+  });
+
+  it('OFAC standard schema: dates nothing (its publish date is out of scope)', async () => {
+    const { state } = await streamAll(streamOfac, MULTI_OFAC_STANDARD_XML, 64);
+    expect(state.publishedAt).toBeUndefined();
+  });
+
+  it('UK: reads <DateGenerated> DD/MM/YYYY as YYYY-MM-DD at every chunk size', async () => {
+    for (const size of CHUNK_SIZES) {
+      const { records, state } = await streamAll(streamUkFromText, MULTI_UK_XML, size);
+      expect(state.publishedAt, `chunk size ${size}`).toBe('2026-06-10');
+      expect(records.map((d) => d.sourceEntryId)).toEqual(['AFG0001', 'UK-GRP-2']);
+    }
+  });
+
+  it.each([
+    ['a month that does not exist', '<DateGenerated>17/13/2026</DateGenerated>'],
+    ['text', '<DateGenerated>yesterday</DateGenerated>'],
+    ['an empty element', '<DateGenerated></DateGenerated>'],
+    ['a self-closing element', '<DateGenerated/>'],
+    ['no element at all', ''],
+  ])(
+    'UK: reads no date from %s, and still streams every designation',
+    async (_label, dateGenerated) => {
+      const { records, state } = await streamAll(
+        streamUkFromText,
+        ukGeneratedOn(dateGenerated),
+        64,
+      );
+      expect(state.publishedAt).toBeUndefined();
+      expect(records.map((d) => d.sourceEntryId)).toEqual(['AFG0001', 'UK-GRP-2']);
+    },
+  );
+
+  it('UK: keeps a date already published as ISO 8601', async () => {
+    const { state } = await streamAll(
+      streamUkFromText,
+      ukGeneratedOn('<DateGenerated>2026-11-17</DateGenerated>'),
+      64,
+    );
+    expect(state.publishedAt).toBe('2026-11-17');
+  });
+});
+
+describe("sanctions ingester — a re-harvest reports its own document's date (#88)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Serve `body` for every download the ingester opens. */
+  const serve = (body: string) =>
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(body, { status: 200 })),
+    );
+
+  const EU_ROOT = '<export xmlns="http://eu.europa.ec/fpi/fsd/export">';
+
+  it.each([
+    [
+      'eu',
+      'its root generationDate',
+      MULTI_EU_XML.replace(
+        EU_ROOT,
+        '<export xmlns="http://eu.europa.ec/fpi/fsd/export" generationDate="2026-10-23T17:05:43.888+02:00" globalFileId="185833">',
+      ),
+      MULTI_EU_XML,
+      '2026-10-23T17:05:43.888+02:00',
+    ],
+    [
+      'uk',
+      'its <DateGenerated> header',
+      MULTI_UK_XML,
+      MULTI_UK_XML.replace(/<DateGenerated>[\s\S]*?<\/DateGenerated>/, ''),
+      '2026-06-10',
+    ],
+  ] as const)(
+    '%s: reports no date for a document without %s, harvested after one that had it',
+    async (source, _dateCarrier, dated, undated, publishedAt) => {
+      const ingesters = buildSanctionsIngesters();
+      try {
+        const ingester = ingesters.find((candidate) => candidate.source === source)!;
+        serve(dated);
+        await collect(ingester.harvest(new AbortController().signal));
+        expect(ingester.report().publishedAt).toBe(publishedAt);
+
+        serve(undated);
+        expect(await collect(ingester.harvest(new AbortController().signal))).not.toHaveLength(0);
+        expect(ingester.report().publishedAt).toBeUndefined();
+      } finally {
+        ingesters.dispose();
       }
     },
   );
@@ -3425,6 +4052,7 @@ describe('openGleifFileFromBytes — header dates, then records', () => {
         otherNames: [],
         jurisdiction: 'GB',
         status: 'ISSUED',
+        entityStatus: 'ACTIVE',
       },
     ]);
   });
@@ -3646,8 +4274,9 @@ describe('XML entity references are decoded at parse time (issue #21)', () => {
 
   it('EU: attribute values, whole names and first/last-name parts alike', () => {
     const [d] = parseEu(parseXml(ENTITY_EU_XML));
-    expect(d?.primaryName).toBe('ПАО "КАМАЗ"');
-    expect(d?.payload.aliases.map((a) => a.name)).toEqual(['KAMAZ & Partners', 'Anna & "Co"']);
+    // The Cyrillic first alias yields to the first untagged Latin-script one (#93).
+    expect(d?.primaryName).toBe('KAMAZ & Partners');
+    expect(d?.payload.aliases.map((a) => a.name)).toEqual(['ПАО "КАМАЗ"', 'Anna & "Co"']);
   });
 
   it('UK: names, the regime, and the remarks', () => {
@@ -3756,24 +4385,17 @@ describe('entity decoding cost on caller-sized text', () => {
     ['dense valid references', (n) => '&amp;'.repeat(n / 5)],
   ];
 
-  it.each(shapes)('grows linearly on %s', (_label, make) => {
-    const time = (n: number): number => {
-      const text = make(n);
-      const xml = `<r a="${text}">${text}</r>`;
-      let best = Number.POSITIVE_INFINITY;
-      for (let run = 0; run < 5; run++) {
-        const start = performance.now();
-        parseXml(xml);
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    time(5_000); // warm the parser
-    const t5k = Math.max(time(5_000), 0.05);
-    const t80k = time(80_000);
-    expect(t80k / t5k).toBeLessThan(64);
-    expect(t80k).toBeLessThan(250);
-  });
+  it.each(shapes)(
+    'grows linearly on %s',
+    async (_label, make) => {
+      const element = (n: number): string => {
+        const text = make(n);
+        return `<r a="${text}">${text}</r>`;
+      };
+      await expectLinearTime(parseXml, element, 80_000, 250);
+    },
+    0,
+  );
 });
 
 // ─── Published list reference numbers (issue #42) ───────────────────────────────
@@ -3820,6 +4442,224 @@ describe('published list reference numbers', () => {
   });
 });
 
+// ─── UK measures and designation source; UK and EU UN references (issue #89) ────
+
+/**
+ * UK designations as published, but for GUB0009's UN reference, padded here to
+ * show the trim. AFG0001 implements UN `TAe.010`; AQD0031's reference differs
+ * from the UN's in case; SYR0200 publishes the `N/A` placeholder; GUB0009 is a
+ * `UK|UN` designation; RUS0238's measures carry one separator written with
+ * spaces and a narrow no-break space inside a measure; LIB0079 is a shipping
+ * sanction whose every indicator is false; RUS3686 publishes none of the three
+ * elements; TST0001 is synthetic, with an empty part and placeholders.
+ */
+const UN_LINK_UK_XML = `<?xml version="1.0" encoding="utf-8"?>
+<Designations>
+  <Designation>
+    <UniqueID>AFG0001</UniqueID>
+    <OFSIGroupID>12703</OFSIGroupID>
+    <UNReferenceNumber>TAe.010</UNReferenceNumber>
+    <Names><Name><Name6>HAJI KHAIRULLAH HAJI SATTAR MONEY EXCHANGE</Name6><NameType>Primary Name</NameType></Name></Names>
+    <RegimeName>The Afghanistan (Sanctions) (EU Exit) Regulations 2020</RegimeName>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+    <DesignationSource>UN</DesignationSource>
+    <SanctionsImposed>Asset freeze</SanctionsImposed>
+    <SanctionsImposedIndicators><AssetFreeze>true</AssetFreeze><ArmsEmbargo>false</ArmsEmbargo><TravelBan>false</TravelBan></SanctionsImposedIndicators>
+  </Designation>
+  <Designation>
+    <UniqueID>AQD0031</UniqueID>
+    <OFSIGroupID>13169</OFSIGroupID>
+    <UNReferenceNumber>QDE.145</UNReferenceNumber>
+    <Names><Name><Name6>Ansar Al Charia Derna</Name6><NameType>Primary name</NameType></Name></Names>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+    <DesignationSource>UN</DesignationSource>
+    <SanctionsImposed>Asset freeze|Arms embargo</SanctionsImposed>
+  </Designation>
+  <Designation>
+    <UniqueID>SYR0200</UniqueID>
+    <OFSIGroupID>13410</OFSIGroupID>
+    <UNReferenceNumber>N/A</UNReferenceNumber>
+    <Names><Name><Name6>Sa'ad</Name6><NameType>Primary name</NameType></Name></Names>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+    <DesignationSource>UK</DesignationSource>
+    <SanctionsImposed>Asset freeze|Travel Ban|Director Disqualification Sanction</SanctionsImposed>
+  </Designation>
+  <Designation>
+    <UniqueID>GUB0009</UniqueID>
+    <UNReferenceNumber> GBi.005 </UNReferenceNumber>
+    <Names><Name><Name6>Injai</Name6><NameType>Primary name</NameType></Name></Names>
+    <IndividualEntityShip>Individual</IndividualEntityShip>
+    <DesignationSource>UK|UN</DesignationSource>
+    <SanctionsImposed>Asset freeze|Travel Ban|Director Disqualification Sanction</SanctionsImposed>
+  </Designation>
+  <Designation>
+    <UniqueID>RUS0238</UniqueID>
+    <Names><Name><Name6>Rostec</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+    <DesignationSource>UK</DesignationSource>
+    <SanctionsImposed>Asset freeze|Internet Services Sanctions: see "Other Information" | Correspondent Banking Sanctions and processing payments</SanctionsImposed>
+  </Designation>
+  <Designation>
+    <UniqueID>LIB0079</UniqueID>
+    <UNReferenceNumber>LYe.006</UNReferenceNumber>
+    <Names><Name><Name6>IMO 9058713 ("AVAX")</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Ship</IndividualEntityShip>
+    <DesignationSource>UN</DesignationSource>
+    <SanctionsImposed>Shipping sanctions: (see "Other information")</SanctionsImposed>
+    <SanctionsImposedIndicators><AssetFreeze>false</AssetFreeze><ArmsEmbargo>false</ArmsEmbargo><ProhibitionOfPortEntry>false</ProhibitionOfPortEntry><TravelBan>false</TravelBan></SanctionsImposedIndicators>
+    <ShipDetails><Ship><IMONumbers><IMONumber>IMO9058713</IMONumber></IMONumbers><CurrentOwnerOperators><CurrentOwnerOperator>Nazar Maritime SA</CurrentOwnerOperator></CurrentOwnerOperators><CurrentBelievedFlagOfShips><CurrentBelievedFlagOfShip>Cameroon</CurrentBelievedFlagOfShip></CurrentBelievedFlagOfShips></Ship></ShipDetails>
+  </Designation>
+  <Designation>
+    <UniqueID>RUS3686</UniqueID>
+    <Names><Name><Name6>TM HAI HA 568</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Ship</IndividualEntityShip>
+  </Designation>
+  <Designation>
+    <UniqueID>TST0001</UniqueID>
+    <UNReferenceNumber> </UNReferenceNumber>
+    <Names><Name><Name6>Example Placeholder Holdings</Name6><NameType>Primary Name</NameType></Name></Names>
+    <IndividualEntityShip>Entity</IndividualEntityShip>
+    <DesignationSource></DesignationSource>
+    <SanctionsImposed>Asset freeze||N/A| </SanctionsImposed>
+  </Designation>
+</Designations>`;
+
+/** EU entities as published: 118593's UN reference unpadded, 112309's the one 112314 also carries, 13's empty. */
+const UN_LINK_EU_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<export>
+  <sanctionEntity designationDetails="" unitedNationId="LYi.28" euReferenceNumber="EU.4801.12" logicalId="118593"><subjectType code="person"/><nameAlias wholeName="Salah Badi" strong="true"/></sanctionEntity>
+  <sanctionEntity designationDate="2017-06-02" designationDetails="" unitedNationId="KPi.045" euReferenceNumber="EU.4075.27" logicalId="112309"><subjectType code="person"/><nameAlias wholeName="Kyong Ok Kim" strong="true"/></sanctionEntity>
+  <sanctionEntity designationDetails="" unitedNationId="" euReferenceNumber="EU.27.28" logicalId="13"><subjectType code="person"/><nameAlias wholeName="Saddam Hussein Al-Tikriti" strong="true"/></sanctionEntity>
+  <sanctionEntity euReferenceNumber="EU.1.1" logicalId="14"><subjectType code="enterprise"/><nameAlias wholeName="Example Unlinked Trading" strong="true"/></sanctionEntity>
+</export>`;
+
+describe('UK measures and designation source; UK and EU UN references (issue #89)', () => {
+  const uk = () => parseUk(parseXml(UN_LINK_UK_XML));
+  const eu = () => parseEu(parseXml(UN_LINK_EU_XML));
+
+  it('UK AFG0001: its designation source and measure as features, its UN reference beside its Group ID', () => {
+    const afg = byEntryId(uk(), 'AFG0001');
+    expect(afg.payload.features).toEqual([
+      { type: 'DesignationSource', value: 'UN' },
+      { type: 'SanctionsImposed', value: 'Asset freeze' },
+    ]);
+    expect(afg).toMatchObject({ referenceNumber: '12703', unReferenceNumber: 'TAe.010' });
+  });
+
+  it('UK: one feature per |-separated part, trimmed, in published order; UK|UN is two', () => {
+    const features = (entryId: string) => byEntryId(uk(), entryId).payload.features;
+    expect(features('SYR0200')).toEqual([
+      { type: 'DesignationSource', value: 'UK' },
+      { type: 'SanctionsImposed', value: 'Asset freeze' },
+      { type: 'SanctionsImposed', value: 'Travel Ban' },
+      { type: 'SanctionsImposed', value: 'Director Disqualification Sanction' },
+    ]);
+    expect(features('GUB0009')?.slice(0, 2)).toEqual([
+      { type: 'DesignationSource', value: 'UK' },
+      { type: 'DesignationSource', value: 'UN' },
+    ]);
+    expect(features('RUS0238')).toEqual([
+      { type: 'DesignationSource', value: 'UK' },
+      { type: 'SanctionsImposed', value: 'Asset freeze' },
+      { type: 'SanctionsImposed', value: 'Internet Services Sanctions: see "Other Information"' },
+      // "Sanctions" and "and" are joined by a literal U+202F (narrow no-break space), here and in the XML above, as the list publishes it.
+      {
+        type: 'SanctionsImposed',
+        value: 'Correspondent Banking Sanctions and processing payments',
+      },
+    ]);
+  });
+
+  it('UK LIB0079: reads the measure string, not the indicators, whose every value is false; its ship details follow', () => {
+    expect(byEntryId(uk(), 'LIB0079').payload.features).toEqual([
+      { type: 'DesignationSource', value: 'UN' },
+      { type: 'SanctionsImposed', value: 'Shipping sanctions: (see "Other information")' },
+      { type: 'CurrentOwnerOperator', value: 'Nazar Maritime SA' },
+      { type: 'CurrentBelievedFlagOfShip', value: 'Cameroon' },
+    ]);
+  });
+
+  it('UK UN references as published, trimmed; the N/A placeholder is absent', () => {
+    const records = uk();
+    expect(byEntryId(records, 'AQD0031').unReferenceNumber).toBe('QDE.145');
+    expect(byEntryId(records, 'GUB0009').unReferenceNumber).toBe('GBi.005');
+    expect(byEntryId(records, 'LIB0079').unReferenceNumber).toBe('LYe.006');
+    expect(byEntryId(records, 'SYR0200')).not.toHaveProperty('unReferenceNumber');
+  });
+
+  it('UK: nothing from a designation that publishes none of the three, an empty element, an empty part, or a placeholder', () => {
+    const records = uk();
+    const none = byEntryId(records, 'RUS3686');
+    expect(none.payload.features).toEqual([]);
+    expect(none).not.toHaveProperty('unReferenceNumber');
+    const placeholders = byEntryId(records, 'TST0001');
+    expect(placeholders.payload.features).toEqual([
+      { type: 'SanctionsImposed', value: 'Asset freeze' },
+    ]);
+    expect(placeholders).not.toHaveProperty('unReferenceNumber');
+  });
+
+  it('EU: unitedNationId as published, absent when empty or unpublished; still no features', () => {
+    const records = eu();
+    expect(byEntryId(records, '118593')).toMatchObject({
+      referenceNumber: 'EU.4801.12',
+      unReferenceNumber: 'LYi.28',
+    });
+    expect(byEntryId(records, '112309').unReferenceNumber).toBe('KPi.045');
+    expect(byEntryId(records, '13')).not.toHaveProperty('unReferenceNumber');
+    expect(byEntryId(records, '14')).not.toHaveProperty('unReferenceNumber');
+    expect(records.map((d) => d.payload.features)).toEqual(records.map(() => []));
+  });
+
+  it('UN and OFAC carry no UN reference of their own: the UN list publishes its reference as referenceNumber', () => {
+    for (const records of [
+      parseUn(parseXml(DETAIL_UN_XML)),
+      parseOfac(parseXml(PAIR_OFAC_STANDARD_XML), 'ofac_sdn'),
+    ]) {
+      expect(records.length).toBeGreaterThan(0);
+      for (const d of records) expect(d).not.toHaveProperty('unReferenceNumber');
+    }
+  });
+
+  it('no measure, designation source, or UN reference reaches names or identifiers', () => {
+    const records = [...uk(), ...eu()];
+    const published = records.flatMap((d) => [
+      ...(d.payload.features ?? []).map((f) => f.value),
+      ...(d.unReferenceNumber ? [d.unReferenceNumber] : []),
+    ]);
+    expect(published.length).toBeGreaterThan(20);
+    for (const d of records) {
+      const indexed = new Set([
+        d.primaryName,
+        ...d.payload.aliases.map((a) => a.name),
+        ...d.payload.identifiers.map((i) => i.value),
+      ]);
+      for (const value of published) expect(indexed.has(value), `${d.id} ${value}`).toBe(false);
+    }
+  });
+
+  it('writes the UN reference to its own row column, and NULL where none is published', () => {
+    const records = [...uk(), ...eu()];
+    expect(toDesignationRow(byEntryId(records, 'AFG0001'))).toMatchObject({
+      reference_number: '12703',
+      un_reference_number: 'TAe.010',
+    });
+    expect(toDesignationRow(byEntryId(records, '118593')).un_reference_number).toBe('LYi.28');
+    for (const entryId of ['SYR0200', 'RUS3686', 'TST0001', '13', '14']) {
+      expect(toDesignationRow(byEntryId(records, entryId)).un_reference_number, entryId).toBeNull();
+    }
+  });
+
+  it('streams the same UK and EU records at every chunk size', async () => {
+    for (const size of CHUNK_SIZES) {
+      const { records: ukStreamed } = await streamAll(streamUkFromText, UN_LINK_UK_XML, size);
+      expect(ukStreamed, `UK chunk size ${size}`).toEqual(uk());
+      const { records: euStreamed } = await streamAll(streamEuFromText, UN_LINK_EU_XML, size);
+      expect(euStreamed, `EU chunk size ${size}`).toEqual(eu());
+    }
+  });
+});
+
 describe('the synthetic fixture uses the identifier labels the parsers emit', () => {
   it('labels the UK vessel IMO number and ship details as the UK parser does', async () => {
     const { FIXTURE_DESIGNATIONS } = await import('@/services/screening/fixtures.js');
@@ -3848,6 +4688,7 @@ describe('parseLeiLevel1 — record shape', () => {
       ],
       jurisdiction: 'US',
       status: 'ISSUED',
+      entityStatus: 'ACTIVE',
       legalAddress: '99 Commerce Way, Testopolis, US-NY, 10001, US',
       headquartersAddress: '1 HQ Plaza, Testopolis, US',
       registrationAuthorityId: 'RA000665',
@@ -3908,6 +4749,7 @@ describe('parseLeiLevel1 — record shape', () => {
       ],
       jurisdiction: 'HK',
       status: 'LAPSED',
+      entityStatus: 'ACTIVE',
     });
     // A transliteration alone still reaches the record; it is not an "other" name.
     expect(translitOnly).toEqual({
@@ -3915,6 +4757,7 @@ describe('parseLeiLevel1 — record shape', () => {
       legalName: 'ООО "Ромашка"',
       otherNames: [],
       alternateNames: [{ name: 'OOO "Romashka"', type: 'AUTO_ASCII_TRANSLITERATED_LEGAL_NAME' }],
+      entityStatus: 'ACTIVE',
     });
   });
 
@@ -3922,5 +4765,146 @@ describe('parseLeiLevel1 — record shape', () => {
     expect(
       await collect(streamLeiLevel1FromBytes(chunkBytes(Buffer.from(TRANSLITERATED_L1_XML), 5))),
     ).toEqual(parseLeiLevel1(parseXml(TRANSLITERATED_L1_XML)));
+  });
+});
+
+// ─── GLEIF entity status and successor entities (issue #94) ─────────────────────
+//
+// `lei:EntityStatus` sits on every published record, beside the registration
+// status it is never read in place of. `lei:SuccessorEntity` repeats under
+// `lei:Entity` and names the successor by `lei:SuccessorLEI`, by
+// `lei:SuccessorEntityName` (which carries `xml:lang`), or both. The first three
+// records are real GLEIF records, trimmed to the elements read here.
+
+const SUCCESSION_L1_XML = `<lei:LEIData xmlns:lei="http://www.gleif.org/data/schema/leidata/2016">
+  <lei:LEIRecords>
+    <lei:LEIRecord>
+      <lei:LEI>549300506SI9CRFV9Z86</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="en">CREDIT SUISSE GROUP AG</lei:LegalName>
+        <lei:LegalJurisdiction>CH</lei:LegalJurisdiction>
+        <lei:EntityStatus>INACTIVE</lei:EntityStatus>
+        <lei:SuccessorEntity>
+          <lei:SuccessorLEI>549300SZJ9VS8SGXAN81</lei:SuccessorLEI>
+        </lei:SuccessorEntity>
+      </lei:Entity>
+      <lei:Registration><lei:RegistrationStatus>RETIRED</lei:RegistrationStatus></lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>353800MJOUNWM4MY4B07</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="ja">ラクスル株式会社</lei:LegalName>
+        <lei:LegalJurisdiction>JP</lei:LegalJurisdiction>
+        <lei:EntityStatus>INACTIVE</lei:EntityStatus>
+        <lei:SuccessorEntity>
+          <lei:SuccessorEntityName xml:lang="ja">Ｒ１株式会社</lei:SuccessorEntityName>
+        </lei:SuccessorEntity>
+      </lei:Entity>
+      <lei:Registration><lei:RegistrationStatus>RETIRED</lei:RegistrationStatus></lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>969500SN2TREMP15IH21</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="fr">OBJECTIF RENDEMENT EURO</lei:LegalName>
+        <lei:LegalJurisdiction>FR</lei:LegalJurisdiction>
+        <lei:EntityStatus>NULL</lei:EntityStatus>
+        <lei:SuccessorEntity>
+          <lei:SuccessorLEI>894500D9GU3YMJSRJN83</lei:SuccessorLEI>
+        </lei:SuccessorEntity>
+      </lei:Entity>
+      <lei:Registration><lei:RegistrationStatus>DUPLICATE</lei:RegistrationStatus></lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>213800SPLITSUCCESS07</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="en">Split Holdings Ltd</lei:LegalName>
+        <lei:EntityStatus>INACTIVE</lei:EntityStatus>
+        <lei:SuccessorEntity>
+          <lei:SuccessorLEI>213800NORTHHALF00011</lei:SuccessorLEI>
+          <lei:SuccessorEntityName xml:lang="en">North Half Ltd</lei:SuccessorEntityName>
+        </lei:SuccessorEntity>
+        <lei:SuccessorEntity>
+          <lei:SuccessorLEI>213800SOUTHHALF00022</lei:SuccessorLEI>
+        </lei:SuccessorEntity>
+        <lei:SuccessorEntity/>
+      </lei:Entity>
+      <lei:Registration><lei:RegistrationStatus>RETIRED</lei:RegistrationStatus></lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>549300SZJ9VS8SGXAN81</lei:LEI>
+      <lei:Entity>
+        <lei:LegalName xml:lang="en">UBS Group AG</lei:LegalName>
+        <lei:LegalJurisdiction>CH</lei:LegalJurisdiction>
+        <lei:EntityStatus>ACTIVE</lei:EntityStatus>
+      </lei:Entity>
+      <lei:Registration><lei:RegistrationStatus>ISSUED</lei:RegistrationStatus></lei:Registration>
+    </lei:LEIRecord>
+    <lei:LEIRecord>
+      <lei:LEI>213800NOSTATUS000019</lei:LEI>
+      <lei:Entity><lei:LegalName xml:lang="en">No Entity Status Ltd</lei:LegalName></lei:Entity>
+      <lei:Registration><lei:RegistrationStatus>ISSUED</lei:RegistrationStatus></lei:Registration>
+    </lei:LEIRecord>
+  </lei:LEIRecords>
+</lei:LEIData>`;
+
+describe('parseLeiLevel1 — entity status and successor entities (#94)', () => {
+  const byLei = () =>
+    new Map(parseLeiLevel1(parseXml(SUCCESSION_L1_XML)).map((record) => [record.lei, record]));
+
+  it('stores a successor published by LEI, beside the registration status', () => {
+    expect(byLei().get('549300506SI9CRFV9Z86')).toMatchObject({
+      status: 'RETIRED',
+      entityStatus: 'INACTIVE',
+      successors: [{ lei: '549300SZJ9VS8SGXAN81' }],
+    });
+  });
+
+  it('keeps the text of a successor published by name alone, its xml:lang aside', () => {
+    const record = byLei().get('353800MJOUNWM4MY4B07');
+    expect(record?.entityStatus).toBe('INACTIVE');
+    expect(record?.successors).toEqual([{ name: 'Ｒ１株式会社' }]);
+  });
+
+  it('stores the NULL entity status as published, never as an absent one', () => {
+    expect(byLei().get('969500SN2TREMP15IH21')).toMatchObject({
+      status: 'DUPLICATE',
+      entityStatus: 'NULL',
+      successors: [{ lei: '894500D9GU3YMJSRJN83' }],
+    });
+  });
+
+  it('keeps every successor in document order, LEI and name together, and drops an empty one', () => {
+    expect(byLei().get('213800SPLITSUCCESS07')?.successors).toEqual([
+      { lei: '213800NORTHHALF00011', name: 'North Half Ltd' },
+      { lei: '213800SOUTHHALF00022' },
+    ]);
+  });
+
+  it('stores no successors for an entity that publishes none', () => {
+    const record = byLei().get('549300SZJ9VS8SGXAN81');
+    expect(record?.entityStatus).toBe('ACTIVE');
+    expect(record).not.toHaveProperty('successors');
+  });
+
+  it('stores neither field for a record without an EntityStatus element', () => {
+    const record = byLei().get('213800NOSTATUS000019');
+    expect(record).toMatchObject({ legalName: 'No Entity Status Ltd', status: 'ISSUED' });
+    expect(record).not.toHaveProperty('entityStatus');
+    expect(record).not.toHaveProperty('successors');
+  });
+
+  it('streams the same records as the DOM parse, across chunk boundaries', async () => {
+    const oracle = parseLeiLevel1(parseXml(SUCCESSION_L1_XML));
+    expect(oracle).toHaveLength(6);
+    for (const size of [1, 7, 100_000]) {
+      expect(await collect(streamLeiLevel1FromText(chunkStr(SUCCESSION_L1_XML, size)))).toEqual(
+        oracle,
+      );
+    }
+    expect(
+      await collect(
+        streamLeiLevel1FromBytes(chunkBytes(buildDeflateZip(Buffer.from(SUCCESSION_L1_XML)), 16)),
+      ),
+    ).toEqual(oracle);
   });
 });

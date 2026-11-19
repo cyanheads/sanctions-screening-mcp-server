@@ -1,6 +1,7 @@
 /**
  * @fileoverview `sanctions_get_designation` — the full record for one sanctions
- * entry by source list + entry ID or published reference number. The drill-in
+ * entry by source list + entry ID, published reference number, or (UK and EU)
+ * the UN reference number the entry implements. The drill-in
  * after sanctions_screen_name surfaces a candidate: all aliases, identifiers,
  * addresses, dates/places of birth, nationalities, descriptive features, program,
  * legal basis, and designation date. Still a screening aid — the record is what
@@ -18,7 +19,7 @@ import { SCREENING_CAVEAT } from './_shared.js';
 export const getDesignationTool = tool('sanctions_get_designation', {
   title: 'sanctions-screening-mcp-server: get designation',
   description:
-    "Fetch the full record for one sanctions designation by source list + entry ID or the list's published reference number — the drill-in after sanctions_screen_name or sanctions_screen_identifier surfaces a candidate, or the lookup for a reference a notice cites (UN QDe.004, EU EU.27.28, UK OFSI Group ID). Returns all published aliases, identifiers (passport, national ID, tax and registration numbers, SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, websites), addresses, dates and places of birth at the precision the source published, nationalities, descriptive features (a vessel's flag, type, and tonnage; an aircraft's model and operator; a title or gender; sanctions notes), sanctioning program, legal basis, and designation date. The record reflects exactly what the source published; missing fields mean the source omitted them. This is a screening aid — the designation record supports a compliance review, it is not itself a determination.",
+    "Fetch the full record for one sanctions designation by source list + entry ID, the list's published reference number, or, for a UK or EU designation, the UN reference number it implements — the drill-in after sanctions_screen_name or sanctions_screen_identifier surfaces a candidate, or the lookup for a reference a notice cites (UN QDe.004, EU EU.27.28, UK OFSI Group ID, or UN TAe.010 on the UK list). Returns all published aliases, identifiers (passport, national ID, tax and registration numbers, SWIFT/BIC codes, digital-currency addresses, vessel call signs, aircraft tail and serial numbers, phone numbers, email addresses, websites), addresses, dates and places of birth at the precision the source published, nationalities, descriptive features (a vessel's flag, type, and tonnage; an aircraft's model and operator; a title or gender; sanctions notes; the UK measures imposed and designation source), sanctioning program, legal basis, designation date, and the UN reference number a UK or EU designation implements. The record reflects exactly what the source published; missing fields mean the source omitted them. This is a screening aid — the designation record supports a compliance review, it is not itself a determination.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     source: z.enum(SOURCE_CODES).describe('Which source list the entry belongs to.'),
@@ -26,7 +27,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       .string()
       .min(1)
       .describe(
-        "The source list's own entry ID (the sourceEntryId from sanctions_screen_name), or the reference number the list publishes for the entry (UN QDe.004, EU EU.27.28, UK OFSI Group ID 14196). Matched trimmed and case-insensitive, entry ID first.",
+        "The source list's own entry ID (the sourceEntryId from sanctions_screen_name), the reference number the list publishes for the entry (UN QDe.004, EU EU.27.28, UK OFSI Group ID 14196), or, on uk and eu, the UN reference number the entry implements (TAe.010). Matched trimmed and case-insensitive: entry ID first, then reference number, then UN reference number, then a UN reference number in another zero padding (LYi.28, LYi.028).",
       ),
   }),
   output: z.object({
@@ -38,6 +39,12 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       .optional()
       .describe(
         "The list's published reference number (UN, EU, UK OFSI Group ID); absent when the list publishes none for the entry. OFAC publishes none — its entry ID is its published number.",
+      ),
+    unReferenceNumber: z
+      .string()
+      .optional()
+      .describe(
+        "The UN reference number this UK or EU designation implements, as the list publishes it; absent when it publishes none. Never corrected: it can differ from the UN list's own in case or padding, name no current UN listing, or be carried by two designations — a link to check against the un record, not proof of identity.",
       ),
     entityType: z
       .enum(['person', 'organization', 'vessel', 'aircraft', 'unknown'])
@@ -141,7 +148,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
           .describe('One published descriptive value.'),
       )
       .describe(
-        "Values the source publishes to describe the party rather than identify it, in published order: OFAC's vessel flag, type, and tonnage, aircraft model and operator, title, gender, and sanctions notes; the UK list's ship details. Empty when the source publishes none. Screening never matches on them.",
+        "Values the source publishes to describe the party rather than identify it, in published order: OFAC's vessel flag, type, and tonnage, aircraft model and operator, title, gender, and sanctions notes; the UK list's designation source and measures imposed (DesignationSource, SanctionsImposed), then its ship details. Empty when the source publishes none. Screening never matches on them.",
       ),
     remarks: z
       .string()
@@ -157,14 +164,14 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     {
       reason: 'designation_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No designation in the given source has that entry ID or reference number in the mirror.',
+      when: 'No designation in the given source has that entry ID, reference number, or UN reference number (in any zero padding) in the mirror.',
       recovery:
-        'Verify the source and entryId via sanctions_screen_name, which returns the exact sourceEntryId for each hit.',
+        'Verify the source and entryId via sanctions_screen_name, which returns the exact sourceEntryId for each hit; for a UN reference number on a source other than un, look it up with source un to get the party to screen.',
     },
     {
       reason: 'reference_ambiguous',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'The entry ID is a reference number more than one designation in the source publishes.',
+      when: 'The entry ID is a reference number or UN reference number more than one designation in the source carries.',
       recovery:
         'Call again with one of the sourceEntryIds this error names; each one identifies a single designation.',
     },
@@ -185,16 +192,20 @@ export const getDesignationTool = tool('sanctions_get_designation', {
 
     const lookup = await svc.resolveDesignation(input.source as SourceCode, input.entryId);
     if (lookup.kind === 'ambiguous') {
+      const held =
+        lookup.key === 'referenceNumber'
+          ? `Reference number "${input.entryId.trim()}" is published by`
+          : `UN reference number "${input.entryId.trim()}" is carried by`;
       throw ctx.fail(
         'reference_ambiguous',
-        `Reference number "${input.entryId.trim()}" is published by ${lookup.sourceEntryIds.length} ${input.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
+        `${held} ${lookup.sourceEntryIds.length} ${input.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
         { sourceEntryIds: lookup.sourceEntryIds },
       );
     }
     if (lookup.kind === 'not_found') {
       throw ctx.fail(
         'designation_not_found',
-        `No ${input.source} designation with entry ID or reference number "${input.entryId}".`,
+        `No ${input.source} designation with entry ID, reference number, or UN reference number "${input.entryId}".`,
       );
     }
 
@@ -204,6 +215,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       sourceLabel: SOURCE_LABELS[d.source],
       sourceEntryId: d.sourceEntryId,
       ...(d.referenceNumber ? { referenceNumber: d.referenceNumber } : {}),
+      ...(d.unReferenceNumber ? { unReferenceNumber: d.unReferenceNumber } : {}),
       entityType: d.entityType,
       primaryName: d.primaryName,
       ...(d.program ? { program: d.program } : {}),
@@ -224,7 +236,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
   format: (r) => {
     const lines = [`# ${r.primaryName}`, ''];
     lines.push(
-      `**List:** ${r.sourceLabel} (\`${r.source}\`) | **Entry ID:** ${r.sourceEntryId}${r.referenceNumber ? ` | **Reference:** ${r.referenceNumber}` : ''}`,
+      `**List:** ${r.sourceLabel} (\`${r.source}\`) | **Entry ID:** ${r.sourceEntryId}${r.referenceNumber ? ` | **Reference:** ${r.referenceNumber}` : ''}${r.unReferenceNumber ? ` | **UN reference:** ${escapeMarkdownInline(r.unReferenceNumber)}` : ''}`,
     );
     lines.push(`**Type:** ${r.entityType}`);
     if (r.program) lines.push(`**Program:** ${r.program}`);

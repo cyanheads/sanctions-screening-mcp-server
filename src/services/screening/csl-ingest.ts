@@ -16,6 +16,7 @@ import {
   componentText,
   createRejections,
   type IngestRejections,
+  isoDocumentDate,
   isUsableName,
 } from '@/services/screening/ingest-validation.js';
 import type { SanctionsIngester } from '@/services/screening/sanctions-ingest.js';
@@ -229,7 +230,8 @@ function normalize(
 export function createCslPreparation() {
   let directory: string | undefined;
   let prepared: Promise<string> | undefined;
-  const metadata = new Set<string>();
+  /** Each `sources_used` label → its `source_last_updated`, when that reads as ISO 8601. */
+  const metadata = new Map<string, string | undefined>();
   const states = CSL_SOURCE_CODES.map((source) => ({
     source,
     accepted: 0,
@@ -306,7 +308,7 @@ export function createCslPreparation() {
           if (key === 'sources_used')
             for (const source of MetadataSchema.parse(value)) {
               if (metadata.has(source.source)) throw new Error('CSL repeats source metadata.');
-              metadata.add(source.source);
+              metadata.set(source.source, isoDocumentDate(source.source_last_updated ?? undefined));
             }
           if (key === 'search_performed_at') z.string().parse(value);
         }
@@ -378,7 +380,15 @@ export function createCslPreparation() {
       url: () => getServerConfig().cslUrl,
       deferredFields: () => new Map(),
       defersFields: () => false,
-      report: () => ({ source, accepted, rejected: state.rejected }),
+      report: () => {
+        const publishedAt = metadata.get(SOURCE_LABELS[source]);
+        return {
+          source,
+          accepted,
+          rejected: state.rejected,
+          ...(publishedAt ? { publishedAt } : {}),
+        };
+      },
       async *harvest(signal) {
         accepted = 0;
         prepared ??= prepare(signal);

@@ -11,9 +11,11 @@ import type { ErrorContract } from '@cyanheads/mcp-ts-core/errors';
 import type { ListExtra } from '@cyanheads/mcp-ts-core/resources';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_SOURCE_URLS } from '@/config/server-config.js';
 import { designationResource } from '@/mcp-server/resources/definitions/designation.resource.js';
 import { entityResource } from '@/mcp-server/resources/definitions/entity.resource.js';
 import { sourcesResource } from '@/mcp-server/resources/definitions/sources.resource.js';
+import type { SourcesPayload } from '@/mcp-server/tools/definitions/_shared.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
@@ -22,12 +24,19 @@ import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
 import { FUZZY_POOL_BUDGET } from '@/services/screening/candidate-pool.js';
 import { FIXTURE_LEI_ENTITIES, FIXTURE_LEI_RELATIONSHIPS } from '@/services/screening/fixtures.js';
-import type { NormalizedDesignation } from '@/services/screening/types.js';
+import {
+  type NormalizedDesignation,
+  SOURCE_CODES,
+  type SourceCode,
+} from '@/services/screening/types.js';
 import {
   emptyGlobalService,
+  holdRebuild,
+  restartGlobalService,
   type SeededService,
   seededGlobalService,
 } from '../services/_helpers.js';
+import { LOOKUP_DOCUMENTS, serveLookupCorpus } from '../services/_lookup-corpus.js';
 
 /**
  * A mock context whose typed `ctx.fail` is wired against a definition's error
@@ -222,13 +231,16 @@ describe('per-list fuzzy completion on both surfaces (#59)', () => {
     const [source, sourceEntryId] = id.split(':') as [NormalizedDesignation['source'], string];
     return { ...partialDesignation, id, source, sourceEntryId, entityType: 'person', primaryName };
   };
-  const screen = async (input: Record<string, unknown>) => {
-    global = await seededGlobalService();
-    await global.service.ingestDesignations([
+  const screen = async (
+    input: Record<string, unknown>,
+    designations: NormalizedDesignation[] = [
       person('eu:POU-1', 'Vladimir Vladimirovich POUTINE'),
       person('ofac_sdn:PUT-1', 'Putin Vladimir Vladimirovich'),
       person('uk:PUT-UK', 'Vladimir Vladimirovich PUTIN'),
-    ]);
+    ],
+  ) => {
+    global = await seededGlobalService();
+    await global.service.ingestDesignations(designations);
     const result = await runToolContract(screenNameTool, input as never);
     expect(result.isError).toBeFalsy();
     return {
@@ -278,11 +290,42 @@ describe('per-list fuzzy completion on both surfaces (#59)', () => {
     expect(structured).toMatchObject({ matchModeUsed: 'fuzzy', fuzzySources: ['eu', 'un'] });
   });
 
-  it('states the per-list rule in the tool and matchMode descriptions', () => {
-    expect(screenNameTool.description).toMatch(/each selected list strict finds nothing on/);
-    expect(screenNameTool.input.shape.matchMode.description).toMatch(
-      /each selected list strict finds nothing on/,
+  it('completes the list a native-script strict hit reached, on both surfaces', async () => {
+    const cyrillic = 'Александр Васильевич БОРТНИКОВ';
+    const rus0084 = person('uk:RUS0084', 'Aleksandr Vasilyevich BORTNIKOV');
+    const { structured, text } = await screen({ name: cyrillic }, [
+      {
+        ...rus0084,
+        payload: { ...rus0084.payload, aliases: [{ name: cyrillic, nameType: 'aka' }] },
+      },
+      person('uk:CHW0014', 'Aleksandr Vasilyevich BORTNIKOV'),
+    ]);
+    expect(
+      structured.hits.map((hit) => `${hit.source}:${hit.sourceEntryId} ${hit.matchType}`),
+    ).toEqual(['uk:RUS0084 exact', 'uk:CHW0014 approximate']);
+    expect(structured).toMatchObject({
+      matchModeUsed: 'strict',
+      fuzzySources: [...SOURCE_CODES],
+      totalAvailable: 2,
+      totalAvailableBasis: 'lower_bound',
+    });
+    expect(text).toContain(`**fuzzySources:** ${SOURCE_CODES.join(', ')}`);
+    expect(text).toContain('### Aleksandr Vasilyevich BORTNIKOV — approximate');
+    expect(text.indexOf('**Entry ID:** RUS0084')).toBeLessThan(
+      text.indexOf('**Entry ID:** CHW0014'),
     );
+  });
+
+  it('states the per-list rule in the tool and matchMode descriptions', () => {
+    for (const description of [
+      screenNameTool.description,
+      screenNameTool.input.shape.matchMode.description,
+    ]) {
+      expect(description).toMatch(/each selected list strict finds nothing on/);
+      expect(description).toMatch(
+        /over the UK and UN lists either way for a name holding a letter outside the Latin script/,
+      );
+    }
   });
 });
 
@@ -373,6 +416,275 @@ describe('source state and freshness', () => {
     expect(result.leiReady).toBe(false);
     expect(result.sources.find((source) => source.code === 'uk')?.recordCount).toBe(0);
     expect(render(listSourcesTool, result)).toContain('2026-06-01T12:00:00.000Z');
+  });
+});
+
+describe('per-list harvest and the last refresh in sanctions_list_sources (#88)', () => {
+  let global: SeededService | undefined;
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    await global?.cleanup();
+    global = undefined;
+  });
+
+  const T0 = '2026-11-18T04:00:00.000Z';
+  const T1 = '2026-11-19T04:00:00.000Z';
+  const T2 = '2026-11-20T04:00:00.000Z';
+
+  /** The lookup corpus with the EU, UK, and UN documents dated the way each publisher dates them. */
+  const datedCorpus = (eu: string) => ({
+    eu: LOOKUP_DOCUMENTS.eu.replace('<export>', `<export generationDate="${eu}">`),
+    uk: LOOKUP_DOCUMENTS.uk.replace(
+      '<Designations>',
+      '<Designations><DateGenerated>17/11/2026</DateGenerated>',
+    ),
+    un: LOOKUP_DOCUMENTS.un.replace(
+      '<CONSOLIDATED_LIST>',
+      '<CONSOLIDATED_LIST dateGenerated="2026-11-19T00:00:03.388Z">',
+    ),
+  });
+  const EU_DATE = '2026-10-23T17:05:43.888+02:00';
+  /** The document date each dated list reports; OFAC's legacy files and the CSL fixture carry none. */
+  const DOCUMENT_DATES: Partial<Record<SourceCode, string>> = {
+    eu: EU_DATE,
+    uk: '2026-11-17',
+    un: '2026-11-19T00:00:03.388Z',
+  };
+
+  /**
+   * Run a sanctions sync with the clock at `time`. `fail` answers one list's URL
+   * with a 404, or aborts the run when that URL is requested. Resolves to the
+   * run's error, or undefined when it succeeded.
+   */
+  async function syncAt(
+    service: SeededService['service'],
+    time: string,
+    mode: 'init' | 'refresh',
+    options: { eu?: string; fail?: { url: string; abort?: boolean } } = {},
+  ): Promise<Error | undefined> {
+    vi.setSystemTime(new Date(time));
+    serveLookupCorpus(datedCorpus(options.eu ?? EU_DATE));
+    const served = globalThis.fetch;
+    const controller = new AbortController();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url !== options.fail?.url) return served(input, init);
+        if (options.fail.abort) {
+          controller.abort();
+          init?.signal?.throwIfAborted();
+        }
+        return new Response('not found', { status: 404 });
+      }),
+    );
+    const error = await service.syncSanctions(mode, controller.signal).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    vi.unstubAllGlobals();
+    return error;
+  }
+
+  /** A global service the dated corpus initialized at T0. */
+  async function initializedAtT0(): Promise<SeededService> {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const state = await emptyGlobalService();
+    expect(await syncAt(state.service, T0, 'init')).toBeUndefined();
+    return state;
+  }
+
+  /** sanctions_list_sources through output validation: its structuredContent and content[] text. */
+  async function listSources(): Promise<{ payload: SourcesPayload; text: string }> {
+    const result = await runToolContract(listSourcesTool, {});
+    expect(result.isError).toBeFalsy();
+    return { payload: result.structuredContent as SourcesPayload, text: contentText(result) };
+  }
+
+  /** The sanctions rows — every row but the GLEIF dataset's. */
+  const listRows = (payload: SourcesPayload) =>
+    payload.sources.filter((source) => source.code !== 'gleif');
+  const rowOf = (payload: SourcesPayload, code: SourceCode) =>
+    payload.sources.find((source) => source.code === code);
+
+  it.each([
+    ['never refreshed', emptyGlobalService],
+    [
+      'complete, written without per-list outcomes as an earlier release writes it',
+      seededGlobalService,
+    ],
+  ] as const)(
+    'reports neither date and no refresh on a mirror %s, and says how to read the absence',
+    async (_state, build) => {
+      global = await build();
+      const { payload, text } = await listSources();
+
+      expect(payload).not.toHaveProperty('lastRefresh');
+      expect(listRows(payload).map((row) => row.code)).toEqual([...SOURCE_CODES]);
+      for (const row of payload.sources) {
+        expect(row, row.code).not.toHaveProperty('lastHarvestedAt');
+        expect(row, row.code).not.toHaveProperty('publishedAt');
+      }
+      expect(text).toContain('**Per-list harvest:** not recorded yet for any list — ');
+      expect(text.match(/\*\*Last harvested:\*\* not recorded\n/g)).toHaveLength(
+        SOURCE_CODES.length,
+      );
+      // The mirror-wide as-of is never copied down as a list's own date.
+      if (payload.sanctionsAsOf) {
+        expect(text).not.toContain(`**Last harvested:** ${payload.sanctionsAsOf}`);
+      }
+    },
+  );
+
+  it('dates each list from its own harvest and document after a refresh in which every list succeeded', async () => {
+    global = await initializedAtT0();
+    const { payload, text } = await listSources();
+
+    expect(payload).not.toHaveProperty('lastRefresh');
+    expect(payload.sanctionsAsOf).toBe(T0);
+    for (const row of listRows(payload)) {
+      const published = DOCUMENT_DATES[row.code as SourceCode];
+      expect(row, row.code).toMatchObject({ lastHarvestedAt: T0 });
+      if (published) expect(row.publishedAt, row.code).toBe(published);
+      else expect(row, row.code).not.toHaveProperty('publishedAt');
+    }
+    expect(text).toContain(`**Last harvested:** ${T0} | **Document date:** 2026-11-17\n`);
+    expect(text).toContain(`**Last harvested:** ${T0} | **Document date:** ${EU_DATE}\n`);
+    expect(text).toContain(
+      `**Last harvested:** ${T0} | **Document date:** none read from the document\n`,
+    );
+    expect(text).not.toContain('**Last sanctions refresh:**');
+    expect(text).not.toContain('**Per-list harvest:**');
+  });
+
+  it('keeps a failed list at its previous harvest and names it, then a clean refresh clears the failure', async () => {
+    global = await initializedAtT0();
+    const failed = await syncAt(global.service, T1, 'refresh', {
+      eu: '2026-11-20T09:00:00.000+01:00',
+      fail: { url: DEFAULT_SOURCE_URLS.ukSanctions },
+    });
+    expect(failed?.message).toMatch(/Sanctions harvest failed for uk \(1 of 11 sources\)/);
+
+    const after = await listSources();
+    expect(after.payload.lastRefresh).toStrictEqual({
+      status: 'error',
+      startedAt: T1,
+      failedSources: ['uk'],
+    });
+    expect(after.payload.sanctionsAsOf).toBe(T0);
+    expect(rowOf(after.payload, 'uk')).toMatchObject({
+      lastHarvestedAt: T0,
+      publishedAt: '2026-11-17',
+    });
+    for (const row of listRows(after.payload).filter((r) => r.code !== 'uk')) {
+      expect(row.lastHarvestedAt, row.code).toBe(T1);
+    }
+    expect(rowOf(after.payload, 'eu')?.publishedAt).toBe('2026-11-20T09:00:00.000+01:00');
+    expect(after.text).toContain(
+      `**Last sanctions refresh:** error, started ${T1} — the harvest failed for \`uk\`; each keeps its previous harvest below. sanctionsAsOf stays at the last refresh in which every list harvested.\n`,
+    );
+
+    expect(await syncAt(global.service, T2, 'refresh')).toBeUndefined();
+    const cleared = await listSources();
+    expect(cleared.payload).not.toHaveProperty('lastRefresh');
+    expect(cleared.payload.sanctionsAsOf).toBe(T2);
+    for (const row of listRows(cleared.payload)) expect(row.lastHarvestedAt, row.code).toBe(T2);
+    expect(rowOf(cleared.payload, 'uk')?.publishedAt).toBe('2026-11-17');
+    expect(cleared.text).not.toContain('**Last sanctions refresh:**');
+  });
+
+  it("reports a running refresh beside each list's last finished harvest", async () => {
+    global = await initializedAtT0();
+    // What a refresh writes as it starts, and what one killed mid-run leaves behind.
+    const state = await global.service.designations.store.readState();
+    await global.service.designations.store.writeState({
+      ...state,
+      status: 'in_progress',
+      mode: 'refresh',
+      startedAt: T1,
+    });
+
+    const { payload, text } = await listSources();
+    expect(payload.lastRefresh).toStrictEqual({ status: 'in_progress', startedAt: T1 });
+    expect(payload.sanctionsAsOf).toBe(T0);
+    for (const row of listRows(payload)) expect(row.lastHarvestedAt, row.code).toBe(T0);
+    expect(text).toContain(
+      `**Last sanctions refresh:** in_progress, started ${T1} — each list below shows its last finished harvest until this run ends; a run killed before it finished also reads as in_progress.\n`,
+    );
+  });
+
+  it('reports a failed refresh as running until its index rebuild records the failed list', async () => {
+    global = await initializedAtT0();
+    const { held, release } = holdRebuild(global.service);
+    const run = syncAt(global.service, T1, 'refresh', {
+      fail: { url: DEFAULT_SOURCE_URLS.ukSanctions },
+    });
+    await held;
+    expect((await global.service.designations.store.readState()).status).toBe('error');
+
+    const during = await listSources();
+    expect(during.payload.lastRefresh).toStrictEqual({ status: 'in_progress', startedAt: T1 });
+    for (const row of listRows(during.payload)) expect(row.lastHarvestedAt, row.code).toBe(T0);
+    expect(during.text).toContain(`**Last sanctions refresh:** in_progress, started ${T1} — `);
+    expect(during.text).not.toContain('which lists failed is unknown');
+
+    release();
+    expect((await run)?.message).toMatch(/Sanctions harvest failed for uk \(1 of 11 sources\)/);
+    const after = await listSources();
+    expect(after.payload.lastRefresh).toStrictEqual({
+      status: 'error',
+      startedAt: T1,
+      failedSources: ['uk'],
+    });
+    expect(after.text).toContain(
+      `**Last sanctions refresh:** error, started ${T1} — the harvest failed for \`uk\`;`,
+    );
+  });
+
+  it('says no list failed when a refresh stopped after some lists finished', async () => {
+    global = await initializedAtT0();
+    const stopped = await syncAt(global.service, T1, 'refresh', {
+      fail: { url: DEFAULT_SOURCE_URLS.euFsf, abort: true },
+    });
+    expect(stopped).toBeDefined();
+
+    const { payload, text } = await listSources();
+    expect(payload.lastRefresh).toStrictEqual({
+      status: 'error',
+      startedAt: T1,
+      failedSources: [],
+    });
+    for (const row of listRows(payload)) {
+      expect(row.lastHarvestedAt, row.code).toBe(row.code.startsWith('ofac_') ? T1 : T0);
+    }
+    expect(text).toContain(
+      `**Last sanctions refresh:** error, started ${T1} — no list's harvest failed: the run stopped before it finished`,
+    );
+  });
+
+  it('says which lists failed is unknown for a failed refresh that recorded no outcome', async () => {
+    global = await initializedAtT0();
+    // An earlier release's failed refresh: an error state for a run no outcome was recorded under.
+    const state = await global.service.designations.store.readState();
+    await global.service.designations.store.writeState({
+      ...state,
+      status: 'error',
+      mode: 'refresh',
+      startedAt: T1,
+      error: 'Sanctions harvest failed for uk (1 of 11 sources)',
+    });
+    // This release's server starting on that mirror.
+    global = await restartGlobalService(global);
+
+    const { payload, text } = await listSources();
+    expect(payload.lastRefresh).toStrictEqual({ status: 'error', startedAt: T1 });
+    for (const row of listRows(payload)) expect(row.lastHarvestedAt, row.code).toBe(T0);
+    expect(text).toContain(
+      `**Last sanctions refresh:** error, started ${T1} — no list's outcome is recorded for this run, so which lists failed is unknown.`,
+    );
   });
 });
 

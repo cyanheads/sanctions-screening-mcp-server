@@ -251,8 +251,9 @@ export async function refreshGleif(
  * leaves no checkpoint for a refresh to apply deltas onto; the mirror stays ready
  * on its last completed load meanwhile. Level 2 and the exceptions are cleared
  * once and refilled; Level 1 upserts by LEI, each entity with its name-index rows,
- * and the final commit records the name index as built — the one place a mirror
- * an earlier release wrote gains it.
+ * entity status, and successors, and the final commit records the name index as
+ * built and entity status as loaded — the one place a mirror an earlier release
+ * wrote gains either. A load that fails or is aborted records neither.
  */
 export async function loadGleifGoldenCopies(
   service: ScreeningService,
@@ -295,9 +296,11 @@ export async function loadGleifGoldenCopies(
     rr: relationships.contentDate,
     repex: exceptions.contentDate,
   };
-  // Every entity was just rewritten through ingestLeiEntities, names included, so
-  // this commit is also the name index's recorded build.
+  // Every entity was just rewritten through ingestLeiEntities, names, entity
+  // status, and successors included, so this commit is also the name index's
+  // recorded build and the record that entity status is loaded.
   await service.markLeiReady((await service.leiReadiness()).entityCount, checkpoint, {
+    entityStatusLoaded: true,
     namesIndexed: true,
   });
   return {

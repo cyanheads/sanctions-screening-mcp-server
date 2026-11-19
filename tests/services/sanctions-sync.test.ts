@@ -16,6 +16,7 @@
 import type { SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SOURCE_URLS, resetServerConfig } from '@/config/server-config.js';
+import { CSL_SOURCE_CODES } from '@/services/screening/csl-ingest.js';
 import {
   buildSanctionsIngesters,
   createSanctionsSync,
@@ -23,10 +24,20 @@ import {
   type SourceSyncReport,
   toDesignationRow,
 } from '@/services/screening/sanctions-ingest.js';
-import { IDENTIFIER_TABLE, NAME_TABLE } from '@/services/screening/schema.js';
-import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
-import { cslDocument } from './_csl-fixture.js';
-import { freshService, type SeededService } from './_helpers.js';
+import { IDENTIFIER_TABLE, NAME_TABLE, SOURCE_HARVEST_TABLE } from '@/services/screening/schema.js';
+import {
+  buildScreeningService,
+  type SanctionsFreshness,
+  type ScreeningService,
+} from '@/services/screening/screening-service.js';
+import {
+  type NormalizedDesignation,
+  SOURCE_CODES,
+  SOURCE_LABELS,
+  type SourceCode,
+} from '@/services/screening/types.js';
+import { CSL_RECORDS, cslDocument } from './_csl-fixture.js';
+import { freshService, holdRebuild, type SeededService, seededService } from './_helpers.js';
 
 // ─── Source fixtures, one record per source ────────────────────────────────────
 
@@ -117,6 +128,26 @@ function stubSourceFetch(bodies: Map<string, string> = SOURCE_BODIES): ReturnTyp
   });
   vi.stubGlobal('fetch', fetch);
   return fetch;
+}
+
+/**
+ * Serve `bodies`, and have the caller give up (the returned controller aborts)
+ * as the `abortOn` document is requested, as a real fetch sees it.
+ */
+function stubFetchAbortedOn(bodies: Map<string, string>, abortOn: string): AbortController {
+  const controller = new AbortController();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url === abortOn) {
+        controller.abort();
+        init?.signal?.throwIfAborted();
+      }
+      return new Response(bodies.get(url) as string, { status: 200 });
+    }),
+  );
+  return controller;
 }
 
 /** A response body a test feeds by hand, so the tail can be held open. */
@@ -258,6 +289,7 @@ describe('createSanctionsSync — harvest loop contract', () => {
       legal_basis: null,
       designation_date: '2020-05-06',
       reference_number: 'EU.1.1',
+      un_reference_number: null,
       payload: expect.any(String),
     });
     expect(JSON.parse(String(eu?.payload)).aliases).toEqual([
@@ -1190,5 +1222,476 @@ describe('rebuildSearchIndexes', () => {
     // An unbounded `SELECT … FROM designation` materializes the whole corpus.
     expect(designationReads.every((sql) => /\bLIMIT\b/i.test(sql))).toBe(true);
     expect(designationReads[0]).toMatch(/WHERE id > \?/);
+  });
+});
+
+// ─── Per-list harvest outcomes (issue #88) ─────────────────────────────────────
+
+/** Each CSL list's `source_last_updated`, as the staged trade.gov document publishes them. */
+const CSL_LAST_UPDATED: Record<(typeof CSL_SOURCE_CODES)[number], string> = {
+  bis_el: '2026-08-21T20:19:33+00:00',
+  bis_dpl: '2026-04-28T12:39:28+00:00',
+  bis_uvl: '2026-02-10T23:02:53+00:00',
+  bis_meu: '2026-02-20T18:34:52+00:00',
+  state_dtc: '2026-07-24T00:00:00+00:00',
+  state_acn: '2026-10-02T14:20:52+00:00',
+};
+
+/** Every source's body, each dated the way its publisher dates it; `eu` sets the EU `generationDate`. */
+function datedBodies(eu = '2026-10-23T17:05:43.888+02:00'): Map<string, string> {
+  const issued = (day: number) =>
+    `<Sanctions><DateOfIssue CalendarTypeID="1"><Year>2026</Year><Month>11</Month><Day>${day}</Day></DateOfIssue>`;
+  return new Map([
+    [
+      DEFAULT_SOURCE_URLS.csl,
+      JSON.stringify({
+        results: CSL_RECORDS,
+        offset: 0,
+        total: CSL_RECORDS.length,
+        sources_used: CSL_SOURCE_CODES.map((source) => ({
+          source: SOURCE_LABELS[source],
+          source_last_updated: CSL_LAST_UPDATED[source],
+        })),
+      }),
+    ],
+    [DEFAULT_SOURCE_URLS.ofacSdn, ofacDocument('SDN').replace('<Sanctions>', issued(18))],
+    [DEFAULT_SOURCE_URLS.ofacConsolidated, ofacDocument('CONS').replace('<Sanctions>', issued(4))],
+    [
+      DEFAULT_SOURCE_URLS.euFsf,
+      `<?xml version="1.0"?><export xmlns="http://eu.europa.ec/fpi/fsd/export" generationDate="${eu}" globalFileId="1">${EU_ENTITY}</export>`,
+    ],
+    [
+      DEFAULT_SOURCE_URLS.ukSanctions,
+      `<?xml version="1.0"?><Designations><DateGenerated>17/11/2026</DateGenerated>${UK_DESIGNATION}</Designations>`,
+    ],
+    [
+      DEFAULT_SOURCE_URLS.unSc,
+      `<?xml version="1.0"?><CONSOLIDATED_LIST dateGenerated="2026-11-19T00:00:03.388Z"><INDIVIDUALS>${UN_INDIVIDUAL}</INDIVIDUALS></CONSOLIDATED_LIST>`,
+    ],
+  ]);
+}
+
+/** The publisher's date each list's {@link datedBodies} document carries, as `publishedAt` reports it. */
+const PUBLISHED_AT: Record<SourceCode, string> = {
+  ofac_sdn: '2026-11-18',
+  ofac_consolidated: '2026-11-04',
+  eu: '2026-10-23T17:05:43.888+02:00',
+  uk: '2026-11-17',
+  un: '2026-11-19T00:00:03.388Z',
+  ...CSL_LAST_UPDATED,
+};
+
+/** The sync state's `startedAt` — the run a refresh's outcomes are recorded under. */
+async function runStartedAt(service: ScreeningService): Promise<string> {
+  const { startedAt } = await service.designations.store.readState();
+  expect(startedAt).toBeDefined();
+  return startedAt as string;
+}
+
+/** A freshness row by source code. */
+function row(freshness: SanctionsFreshness, code: SourceCode) {
+  return freshness.sources.find((source) => source.code === code);
+}
+
+/** Run a sanctions sync, returning its error (or undefined when it resolved). */
+async function syncError(
+  service: ScreeningService,
+  mode: 'init' | 'refresh',
+  signal = new AbortController().signal,
+): Promise<Error | undefined> {
+  return service.syncSanctions(mode, signal).then(
+    () => undefined,
+    (err: Error) => err,
+  );
+}
+
+describe('sanctionsFreshness — per-list harvest outcomes', () => {
+  let harness: SeededService | undefined;
+  afterEach(async () => {
+    await harness?.cleanup();
+    harness = undefined;
+  });
+
+  it('reports nothing per list on a mirror no run has recorded, never refreshed or written by an earlier release', async () => {
+    harness = await freshService();
+    expect(await harness.service.sanctionsFreshness()).toEqual({
+      lastRefresh: { status: 'pending' },
+      sources: SOURCE_CODES.map((code) => ({ code })),
+    });
+    await harness.cleanup();
+
+    // A seeded mirror stands in for one an earlier release wrote: complete, populated, no outcomes.
+    harness = await seededService();
+    expect(await harness.service.sanctionsFreshness()).toEqual({
+      lastRefresh: { status: 'complete' },
+      sources: SOURCE_CODES.map((code) => ({ code })),
+    });
+  });
+
+  it("records every list's harvest and its document's own date after a run in which each succeeds", async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    expect(await syncError(harness.service, 'init')).toBeUndefined();
+    const startedAt = await runStartedAt(harness.service);
+
+    const freshness = await harness.service.sanctionsFreshness();
+    expect(freshness.lastRefresh).toEqual({ status: 'complete', startedAt });
+    expect(freshness.sources.map((source) => source.code)).toEqual([...SOURCE_CODES]);
+    for (const source of freshness.sources) {
+      expect(source.publishedAt, source.code).toBe(PUBLISHED_AT[source.code]);
+      expect(source.lastHarvestedAt! >= startedAt, source.code).toBe(true);
+      expect(source.lastHarvestedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    }
+  });
+
+  it('keeps a failed list at its last harvest while the others advance, and names it in the failed refresh', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+    const asOf = (await harness.service.sanctionsReadiness()).completedAt;
+
+    // The next run: the UK document is gone, and the EU publishes a new one.
+    const bodies = datedBodies('2026-11-20T09:00:00.000+01:00');
+    bodies.delete(DEFAULT_SOURCE_URLS.ukSanctions);
+    stubSourceFetch(bodies);
+    expect((await syncError(harness.service, 'refresh'))?.message).toMatch(
+      /Sanctions harvest failed for uk \(1 of 11 sources\)/,
+    );
+    const startedAt = await runStartedAt(harness.service);
+
+    const after = await harness.service.sanctionsFreshness();
+    expect(after.lastRefresh).toEqual({ status: 'error', startedAt, failedSources: ['uk'] });
+    expect(row(after, 'uk')).toEqual(row(before, 'uk'));
+    expect(row(after, 'uk')?.publishedAt).toBe('2026-11-17');
+    for (const code of SOURCE_CODES.filter((c) => c !== 'uk')) {
+      expect(row(after, code)!.lastHarvestedAt! >= startedAt, code).toBe(true);
+    }
+    expect(row(after, 'eu')?.publishedAt).toBe('2026-11-20T09:00:00.000+01:00');
+    // The mirror's as-of is the last run in which every list refreshed.
+    expect((await harness.service.sanctionsReadiness()).completedAt).toBe(asOf);
+  });
+
+  it("drops a list's publisher date when the document it is next harvested from carries none that reads", async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+    expect(row(before, 'eu')?.publishedAt).toBe(PUBLISHED_AT.eu);
+    expect(row(before, 'uk')?.publishedAt).toBe(PUBLISHED_AT.uk);
+
+    // The next run: the EU root carries no generationDate, and the UK header no date that reads.
+    const bodies = datedBodies();
+    const eu = bodies.get(DEFAULT_SOURCE_URLS.euFsf) as string;
+    const uk = bodies.get(DEFAULT_SOURCE_URLS.ukSanctions) as string;
+    bodies.set(DEFAULT_SOURCE_URLS.euFsf, eu.replace(/ generationDate="[^"]*"/, ''));
+    bodies.set(
+      DEFAULT_SOURCE_URLS.ukSanctions,
+      uk.replace(
+        '<DateGenerated>17/11/2026</DateGenerated>',
+        '<DateGenerated>yesterday</DateGenerated>',
+      ),
+    );
+    stubSourceFetch(bodies);
+    expect(await syncError(harness.service, 'refresh')).toBeUndefined();
+    const startedAt = await runStartedAt(harness.service);
+
+    const after = await harness.service.sanctionsFreshness();
+    for (const code of ['eu', 'uk'] as const) {
+      expect(row(after, code)!.lastHarvestedAt! >= startedAt, code).toBe(true);
+      expect(row(after, code), code).not.toHaveProperty('publishedAt');
+    }
+    for (const code of SOURCE_CODES.filter((c) => c !== 'eu' && c !== 'uk')) {
+      expect(row(after, code)?.publishedAt, code).toBe(PUBLISHED_AT[code]);
+    }
+  });
+
+  it('records a failure of the one CSL document for each of its six lists', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+
+    const bodies = datedBodies();
+    bodies.delete(DEFAULT_SOURCE_URLS.csl);
+    stubSourceFetch(bodies);
+    await syncError(harness.service, 'refresh');
+    const startedAt = await runStartedAt(harness.service);
+
+    const after = await harness.service.sanctionsFreshness();
+    expect(after.lastRefresh).toEqual({
+      status: 'error',
+      startedAt,
+      failedSources: [...CSL_SOURCE_CODES],
+    });
+    for (const code of CSL_SOURCE_CODES) expect(row(after, code)).toEqual(row(before, code));
+    expect(row(after, 'un')!.lastHarvestedAt! >= startedAt).toBe(true);
+  });
+
+  it('serves the last finished run per list while a refresh runs, beside that run’s start', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+
+    // Hold the EU document open, so the refresh is mid-run when it is read.
+    const bodies = datedBodies('2026-11-20T09:00:00.000+01:00');
+    const eu = pushStream();
+    let euRequested: () => void = () => {};
+    const requested = new Promise<void>((resolve) => {
+      euRequested = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url === DEFAULT_SOURCE_URLS.euFsf) {
+          euRequested();
+          return new Response(eu.stream, { status: 200 });
+        }
+        return new Response(bodies.get(url) as string, { status: 200 });
+      }),
+    );
+    const refresh = syncError(harness.service, 'refresh');
+    await requested;
+
+    const during = await harness.service.sanctionsFreshness();
+    expect(during.lastRefresh).toEqual({
+      status: 'in_progress',
+      startedAt: await runStartedAt(harness.service),
+    });
+    // The OFAC lists have already finished in this run; nothing is recorded until it ends.
+    expect(during.sources).toEqual(before.sources);
+
+    eu.push(bodies.get(DEFAULT_SOURCE_URLS.euFsf) as string);
+    eu.close();
+    expect(await refresh).toBeUndefined();
+    expect(row(await harness.service.sanctionsFreshness(), 'eu')?.publishedAt).toBe(
+      '2026-11-20T09:00:00.000+01:00',
+    );
+  });
+
+  it.each([
+    ['every list harvests', undefined, undefined],
+    ['the UK document is gone', DEFAULT_SOURCE_URLS.ukSanctions, ['uk']],
+  ] as const)(
+    'reads in_progress until the run’s index rebuild commits, then that run’s outcomes, when %s',
+    async (_case, missing, failedSources) => {
+      harness = await freshService();
+      stubSourceFetch(datedBodies());
+      await syncError(harness.service, 'init');
+      const before = await harness.service.sanctionsFreshness();
+      // A second connection opened before the run: a long-running server beside the refresh process.
+      const reader = buildScreeningService();
+      try {
+        expect((await reader.sanctionsFreshness()).sources).toEqual(before.sources);
+
+        const bodies = datedBodies('2026-11-20T09:00:00.000+01:00');
+        if (missing) bodies.delete(missing);
+        stubSourceFetch(bodies);
+        const { held, release } = holdRebuild(harness.service);
+        const refresh = syncError(harness.service, 'refresh');
+        await held;
+        // The sync has written its final state; the outcomes are not recorded yet.
+        const state = await harness.service.designations.store.readState();
+        expect(state.status).toBe(missing ? 'error' : 'complete');
+        const startedAt = state.startedAt as string;
+        for (const view of [harness.service, reader]) {
+          expect(await view.sanctionsFreshness()).toEqual({
+            lastRefresh: { status: 'in_progress', startedAt },
+            sources: before.sources,
+          });
+        }
+
+        release();
+        const error = await refresh;
+        if (missing) expect(error?.message).toMatch(/Sanctions harvest failed for uk \(1 of 11/);
+        else expect(error).toBeUndefined();
+        for (const view of [harness.service, reader]) {
+          const after = await view.sanctionsFreshness();
+          expect(after.lastRefresh).toEqual(
+            failedSources
+              ? { status: 'error', startedAt, failedSources }
+              : { status: 'complete', startedAt },
+          );
+          for (const code of SOURCE_CODES) {
+            if (code === 'uk' && failedSources) expect(row(after, code)).toEqual(row(before, code));
+            else expect(row(after, code)!.lastHarvestedAt! >= startedAt, code).toBe(true);
+          }
+        }
+      } finally {
+        await reader.close();
+      }
+    },
+  );
+
+  it('records the lists a caller abort let finish, none as failed, and nothing for the rest', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+
+    const controller = stubFetchAbortedOn(datedBodies(), DEFAULT_SOURCE_URLS.euFsf);
+    expect(await syncError(harness.service, 'refresh', controller.signal)).toBeDefined();
+    const startedAt = await runStartedAt(harness.service);
+
+    const after = await harness.service.sanctionsFreshness();
+    expect(after.lastRefresh).toEqual({ status: 'error', startedAt, failedSources: [] });
+    for (const code of ['ofac_sdn', 'ofac_consolidated'] as const) {
+      expect(row(after, code)!.lastHarvestedAt! >= startedAt, code).toBe(true);
+    }
+    for (const code of SOURCE_CODES.filter((c) => !c.startsWith('ofac_'))) {
+      expect(row(after, code), code).toEqual(row(before, code));
+    }
+  });
+
+  it('records each run under its own start alone: a list a later run never reached keeps the earlier run’s attempt', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+
+    // The first refresh fails OFAC Consolidated and the UK.
+    const failing = datedBodies();
+    failing.delete(DEFAULT_SOURCE_URLS.ofacConsolidated);
+    failing.delete(DEFAULT_SOURCE_URLS.ukSanctions);
+    stubSourceFetch(failing);
+    expect((await syncError(harness.service, 'refresh'))?.message).toMatch(
+      /Sanctions harvest failed for ofac_consolidated, uk \(2 of 11 sources\)/,
+    );
+    const firstRun = await runStartedAt(harness.service);
+    const afterFirst = await harness.service.sanctionsFreshness();
+
+    // The second refresh harvests both OFAC lists; its caller ends it as the EU document is requested.
+    const controller = stubFetchAbortedOn(datedBodies(), DEFAULT_SOURCE_URLS.euFsf);
+    expect(await syncError(harness.service, 'refresh', controller.signal)).toBeDefined();
+    const secondRun = await runStartedAt(harness.service);
+    expect(secondRun).not.toBe(firstRun);
+
+    const after = await harness.service.sanctionsFreshness();
+    expect(after.lastRefresh).toEqual({ status: 'error', startedAt: secondRun, failedSources: [] });
+    expect(row(after, 'ofac_consolidated')!.lastHarvestedAt! >= secondRun).toBe(true);
+    expect(row(after, 'uk')).toEqual(row(afterFirst, 'uk'));
+
+    const handle = (await harness.service.designations.raw()) as SqliteHandle;
+    const attempts = new Map(
+      handle
+        .prepare<{ attempt_started_at: string; attempt_status: string; source: string }>(
+          `SELECT source, attempt_started_at, attempt_status FROM ${SOURCE_HARVEST_TABLE}`,
+        )
+        .all()
+        .map(({ source, ...attempt }) => [source, attempt]),
+    );
+    for (const code of ['ofac_sdn', 'ofac_consolidated'] as const) {
+      expect(attempts.get(code), code).toEqual({
+        attempt_started_at: secondRun,
+        attempt_status: 'harvested',
+      });
+    }
+    expect(attempts.get('uk')).toEqual({ attempt_started_at: firstRun, attempt_status: 'failed' });
+    for (const code of SOURCE_CODES.filter((c) => !c.startsWith('ofac_') && c !== 'uk')) {
+      expect(attempts.get(code), code).toEqual({
+        attempt_started_at: firstRun,
+        attempt_status: 'harvested',
+      });
+    }
+  });
+
+  it('records nothing for a run that lost its lease, and the next run carries none of its outcomes', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+    const leases = harness.service.designations.store.syncLease;
+    if (!leases) throw new Error('The SQLite store must provide a sync lease.');
+
+    /**
+     * The first refresh harvests OFAC SDN and fails OFAC Consolidated. As it
+     * requests the EU document its lease has lapsed (the claim reads a clock a day
+     * on) and another process takes it over, so the EU page's commit is refused.
+     */
+    const bodies = datedBodies();
+    bodies.delete(DEFAULT_SOURCE_URLS.ofacConsolidated);
+    let releaseTakeover: (() => Promise<void>) | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url === DEFAULT_SOURCE_URLS.euFsf) {
+          const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 86_400_000);
+          try {
+            const takeover = await leases.claim('takeover', 60_000);
+            if (takeover) releaseTakeover = () => leases.release(takeover);
+          } finally {
+            clock.mockRestore();
+          }
+        }
+        const body = bodies.get(url);
+        return body === undefined
+          ? new Response('not found', { status: 404 })
+          : new Response(body, { status: 200 });
+      }),
+    );
+    expect(await syncError(harness.service, 'refresh')).toMatchObject({
+      data: { reason: 'sync_lease_lost' },
+    });
+    expect(releaseTakeover).toBeDefined();
+    await releaseTakeover?.();
+    expect((await harness.service.sanctionsFreshness()).sources).toEqual(before.sources);
+
+    // The next refresh: its caller ends it as the first document is requested, before any list finishes.
+    const controller = stubFetchAbortedOn(bodies, DEFAULT_SOURCE_URLS.ofacSdn);
+    expect(await syncError(harness.service, 'refresh', controller.signal)).toBeDefined();
+    const startedAt = await runStartedAt(harness.service);
+
+    expect(await harness.service.sanctionsFreshness()).toEqual({
+      lastRefresh: { status: 'error', startedAt },
+      sources: before.sources,
+    });
+  });
+
+  it('names no failed list for a failed run no outcome was recorded under, such as one an earlier release made', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+    const state = await harness.service.designations.store.readState();
+
+    // What an earlier release's failed refresh leaves: the error state of a run this table never saw.
+    await harness.service.designations.store.writeState({
+      ...state,
+      status: 'error',
+      mode: 'refresh',
+      startedAt: '2099-01-01T00:00:00.000Z',
+      error: 'Sanctions harvest failed for uk (1 of 11 sources)',
+    });
+
+    // A server starting on the mirror that run left: its open rebuilds the name index under this state.
+    await harness.service.close();
+    const reopened = buildScreeningService();
+    try {
+      expect(await reopened.sanctionsFreshness()).toEqual({
+        lastRefresh: { status: 'error', startedAt: '2099-01-01T00:00:00.000Z' },
+        sources: before.sources,
+      });
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it('marks no list harvested when the index rebuild that follows the run fails', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    await syncError(harness.service, 'init');
+    const before = await harness.service.sanctionsFreshness();
+
+    // Break the rebuild's first statement: its transaction then rolls back whole.
+    const handle = (await harness.service.designations.raw()) as SqliteHandle;
+    handle.exec(`DROP TRIGGER ${NAME_TABLE}_supplement_ai`);
+    stubSourceFetch(datedBodies('2026-11-20T09:00:00.000+01:00'));
+    expect((await syncError(harness.service, 'refresh'))?.message).toMatch(/no such trigger/);
+
+    expect((await harness.service.sanctionsFreshness()).sources).toEqual(before.sources);
   });
 });

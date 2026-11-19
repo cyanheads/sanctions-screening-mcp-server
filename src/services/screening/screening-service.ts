@@ -52,6 +52,7 @@ import {
   hasLeiNameNormalizedIndex,
   IDENTIFIER_STAMP_TABLE,
   IDENTIFIER_TABLE,
+  LEI_ENTITY_STATUS_STAMP_TABLE,
   LEI_ENTITY_TABLE,
   LEI_EXCEPTION_TABLE,
   LEI_NAME_FTS_TABLE,
@@ -68,17 +69,22 @@ import {
   NAME_INDEX_STAMP_TABLE,
   NAME_SUPPLEMENT_FTS_TABLE,
   NAME_TABLE,
+  SOURCE_HARVEST_TABLE,
 } from '@/services/screening/schema.js';
 import {
   buildFtsMatch,
+  buildLegalFormFtsMatch,
   comparisonForms,
   deletionSignatures,
   doubleMetaphone,
   fold,
+  foldLegalForms,
+  hasOtherScriptLetter,
   jaroWinkler,
   lengthRatio,
   scoreTokenPairs,
   scoringQuery,
+  soundKeys,
   splitOnStoplist,
   tokenize,
 } from '@/services/screening/text-matching.js';
@@ -121,6 +127,51 @@ export interface MirrorReadiness {
   total: number;
 }
 
+/** One sanctions list's recorded harvest, from {@link ScreeningService.sanctionsFreshness}. */
+export interface SourceFreshness {
+  code: SourceCode;
+  /**
+   * When the list's last successful harvest completed (UTC ISO 8601). Absent
+   * until a run of this release harvests the list — a mirror an earlier release
+   * wrote records none.
+   */
+  lastHarvestedAt?: string;
+  /**
+   * The publisher's date on the document that harvest read, ISO 8601 at the
+   * precision and offset published (a date stays `YYYY-MM-DD`). Absent with
+   * {@link lastHarvestedAt}, or when that document carried no date this server
+   * reads.
+   */
+  publishedAt?: string;
+}
+
+/**
+ * The last sanctions refresh, as the framework sync state records it: `pending`
+ * (never run), `in_progress` (running, until its index rebuild commits, or
+ * killed while running), `complete` (every list harvested), or `error`. `startedAt` is that run's start, present
+ * on every state a run wrote. On `error`, `failedSources` names the lists whose
+ * harvest failed in the run that started at `startedAt`, in registry order —
+ * empty when the run ended for another reason (a caller abort or time bound),
+ * and absent when no list's outcome was recorded for that run (one an earlier
+ * release made).
+ */
+export type SanctionsLastRefresh =
+  | { status: 'pending' }
+  | { startedAt?: string; status: 'complete' | 'in_progress' }
+  | { failedSources?: SourceCode[]; startedAt?: string; status: 'error' };
+
+/** Per-list freshness and the last refresh, from {@link ScreeningService.sanctionsFreshness}. */
+export interface SanctionsFreshness {
+  lastRefresh: SanctionsLastRefresh;
+  /** One row per {@link SOURCE_CODES} entry, in that order. */
+  sources: SourceFreshness[];
+}
+
+/** One list's result in the run under way, held until that run's index rebuild records it. */
+export type HarvestOutcome =
+  | { harvestedAt: string; publishedAt?: string; source: SourceCode; status: 'harvested' }
+  | { source: SourceCode; status: 'failed' };
+
 /**
  * How to read a `totalAvailable`. `exact` is the complete matching set the query
  * can reach; `lower_bound` means a bounded read produced it — a fuzzy pass, whose
@@ -130,11 +181,25 @@ export interface MirrorReadiness {
  */
 export type CountBasis = 'exact' | 'lower_bound';
 
+/**
+ * The lists a strict hit does not settle for a query holding a letter outside
+ * the Latin script: a strict screen completes them either way. Strict reads a
+ * name in the script it is written in, and the UK and UN lists publish a
+ * native-script name on only some records (the UK lists one person once per
+ * regime). Before those names were indexed every such screen completed both
+ * lists, so settling them would drop records it returned: the same person under
+ * another regime, or the party itself where the strict hit is a namesake. The
+ * other lists stay settled; completing them too was measured and added mostly
+ * unrelated names (see the Matching decision in `docs/design.md`).
+ */
+const NATIVE_NAME_COMPLETED: ReadonlySet<SourceCode> = new Set<SourceCode>(['uk', 'un']);
+
 /** Options for {@link ScreeningService.screenName}. */
 export interface ScreenNameOptions {
   /**
    * Whether strict mode runs a fuzzy pass over the selected lists it found
-   * nothing on: a full pass when it found nothing anywhere, otherwise a
+   * nothing on (and, for a query holding a letter outside the Latin script, the
+   * UK and UN lists either way): a full pass when it found nothing anywhere, otherwise a
    * full-coverage completion of those lists (see {@link ScreenNameResult.fuzzySources}).
    * Defaults to `true` for the user-facing `sanctions_screen_name` tool (an empty
    * strict result there is unhelpful). The internal cross-reference screens in
@@ -165,12 +230,16 @@ export interface ScreenNameResult {
   /**
    * The selected lists the fuzzy pass searched, in {@link SOURCE_CODES} order;
    * absent when none ran. Every selected list in fuzzy mode or after a strict
-   * pass that found nothing; otherwise the lists strict found nothing on, whose
-   * candidates are kept only when they cover every distinctive query word.
+   * pass that found nothing; otherwise the lists strict found nothing on, plus
+   * the UK and UN lists for a query holding a letter outside the Latin script,
+   * whose candidates are kept only when they cover every distinctive query word.
    */
   fuzzySources?: SourceCode[];
   hits: ScreeningHit[];
-  /** `fuzzy` when every selected list was fuzzy-searched, else `strict` (possibly completed). */
+  /**
+   * `fuzzy` when a full fuzzy pass searched every selected list, else `strict`
+   * (possibly completed).
+   */
   modeUsed: MatchMode;
   /** Folded query the server matched on. */
   normalizedQuery: string;
@@ -240,11 +309,12 @@ export interface ResolveEntityResult {
 
 /**
  * Where an entry ID resolved: to one designation, to several (a reference number
- * more than one designation publishes), or to none.
+ * or UN reference number more than one designation carries — `key` names which),
+ * or to none.
  */
 export type DesignationLookup =
   | { designation: NormalizedDesignation; kind: 'found' }
-  | { kind: 'ambiguous'; sourceEntryIds: string[] }
+  | { key: 'referenceNumber' | 'unReferenceNumber'; kind: 'ambiguous'; sourceEntryIds: string[] }
   | { kind: 'not_found' };
 
 /** Options for {@link ScreeningService.screenIdentifier}. */
@@ -280,12 +350,12 @@ interface NameJoinRow {
   name: string;
   name_type: string;
   normalized: string;
-  phonetic: string;
   primary_name: string;
   program: string | null;
   reference_number: string | null;
   source: string;
   source_entry_id: string;
+  un_reference_number: string | null;
 }
 
 /** Internal row shape from the `designation_identifier` join used by the identifier lookup. */
@@ -425,6 +495,13 @@ export class ScreeningService {
    * of those commits a new `completedAt` and checkpoint, so the key moves with them.
    */
   private exceptionCountByState: { count: number; state: string } | undefined;
+  /**
+   * Each list's result in the sanctions run under way, in harvest order. The sync
+   * reports a list as it finishes, but its outcome may be recorded only with the
+   * index rebuild that follows the run ({@link syncSanctions}), so a list is
+   * never marked harvested ahead of what screening serves.
+   */
+  private readonly harvestOutcomes: HarvestOutcome[] = [];
 
   constructor(private readonly config: ServerConfig) {
     // The two mirrors use SEPARATE database files. `mirror_sync_state` is a
@@ -445,6 +522,7 @@ export class ScreeningService {
         storedDeferredFields: (ids) => this.storedDeferredFields(ids),
         staleDesignationIds: (source, kept) => this.staleDesignationIds(source, kept),
         onSourceFailed: (failure) => {
+          this.harvestOutcomes.push({ source: failure.source, status: 'failed' });
           logger.error(
             'Sanctions harvest — source failed; nothing was removed for it, and the run continues with the next source.',
             requestContextService.createRequestContext({
@@ -454,11 +532,18 @@ export class ScreeningService {
           );
         },
         onSourceReport: (report) => {
+          this.harvestOutcomes.push({
+            source: report.source,
+            status: 'harvested',
+            harvestedAt: new Date().toISOString(),
+            ...(report.publishedAt ? { publishedAt: report.publishedAt } : {}),
+          });
           const context = requestContextService.createRequestContext({
             operation: 'mirror.sync.source',
             additionalContext: {
               source: report.source,
               accepted: report.accepted,
+              publishedAt: report.publishedAt,
               pruned: report.pruned,
               withheld: report.withheld,
               rejectedMissingIdentifier: report.rejected.missingIdentifier,
@@ -520,8 +605,8 @@ export class ScreeningService {
         ensureDesignationAuxSchema(raw);
         const built = nameIndexStamp(raw);
         if (
-          built?.startsWith('v2:') &&
-          (built === `v2:${stamp}` || state.status === 'in_progress')
+          built?.startsWith(NAME_STAMP_VERSION) &&
+          (built === `${NAME_STAMP_VERSION}${stamp}` || state.status === 'in_progress')
         ) {
           return false;
         }
@@ -593,6 +678,10 @@ export class ScreeningService {
    * replaced. The one entry point for `mirror:init`, `mirror:refresh`, and the
    * HTTP refresh cron.
    *
+   * The rebuild also records how each list's harvest ended in this run (see
+   * {@link rebuildSearchIndexes}); a list the run never finished — the one a
+   * caller abort interrupted, and every one after it — keeps what it had.
+   *
    * @throws The sync's failure, after the rebuild: one error naming every source
    *   that failed, or the caller's abort.
    */
@@ -605,10 +694,12 @@ export class ScreeningService {
         const reason = error.data?.reason;
         // The lease holder owns the writes and the ensuing index rebuild.
         if (reason === 'sync_locked' || reason === 'sync_lease_lost') rebuild = false;
+        // A run that lost its lease records nothing; a locked-out call leaves the running one's outcomes alone.
+        if (reason === 'sync_lease_lost') this.harvestOutcomes.length = 0;
       }
       throw error;
     } finally {
-      if (rebuild) await this.rebuildSearchIndexes();
+      if (rebuild) await this.rebuildSearchIndexes(this.harvestOutcomes.splice(0));
     }
   }
 
@@ -638,14 +729,16 @@ export class ScreeningService {
       const upsert = handle.prepare(
         `INSERT INTO designation
            (id, source, source_entry_id, entity_type, primary_name, normalized_name,
-            program, legal_basis, designation_date, reference_number, payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            program, legal_basis, designation_date, reference_number, un_reference_number,
+            payload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            source=excluded.source, source_entry_id=excluded.source_entry_id,
            entity_type=excluded.entity_type, primary_name=excluded.primary_name,
            normalized_name=excluded.normalized_name, program=excluded.program,
            legal_basis=excluded.legal_basis, designation_date=excluded.designation_date,
-           reference_number=excluded.reference_number, payload=excluded.payload`,
+           reference_number=excluded.reference_number,
+           un_reference_number=excluded.un_reference_number, payload=excluded.payload`,
       );
       const deleteNames = handle.prepare(`DELETE FROM ${NAME_TABLE} WHERE designation_id = ?`);
       const insertName = prepareNameInsert(handle);
@@ -666,6 +759,7 @@ export class ScreeningService {
           d.legalBasis ?? null,
           d.designationDate ?? null,
           d.referenceNumber ?? null,
+          d.unReferenceNumber ?? null,
           JSON.stringify(d.payload),
         );
 
@@ -783,10 +877,16 @@ export class ScreeningService {
    * it scales with the corpus. The walk still runs inside ONE transaction — a
    * half-rebuilt index would silently narrow every screen — and nothing writes
    * `designation` during it, so the keyset cursor sees a stable table.
+   *
+   * `outcomes` — each list's result in the run just ended — land in
+   * `source_harvest` in the same transaction, under the run's `startedAt`: a
+   * crash before it commits leaves no list marked harvested whose rows the index
+   * does not serve yet.
    */
-  async rebuildSearchIndexes(): Promise<void> {
+  async rebuildSearchIndexes(outcomes: readonly HarvestOutcome[] = []): Promise<void> {
     const handle = await this.designationHandle();
-    const stamp = syncStamp(await this.designationMirror.store.readState());
+    const state = await this.designationMirror.store.readState();
+    const stamp = syncStamp(state);
     handle.transaction(() => {
       /**
        * A full projection is cheaper as one FTS build than individual deletion
@@ -809,6 +909,7 @@ export class ScreeningService {
       ensureDesignationAuxSchema(handle);
       writeIdentifierStamp(handle, stamp);
       writeNameIndexStamp(handle, stamp);
+      writeHarvestOutcomes(handle, outcomes, state.startedAt);
     });
   }
 
@@ -1004,18 +1105,24 @@ export class ScreeningService {
    * checkpoint, or keeping the stored one when none is given. The store writes
    * every non-durable field it is handed and clears the rest, so the checkpoint is
    * always passed explicitly here: a write that omitted it would erase it.
+   * `namesIndexed` and `entityStatusLoaded` record that the caller just rewrote
+   * every entity; without them each stamp is carried only when it matched before.
    */
   async markLeiReady(
     total: number,
     checkpoint?: GleifCheckpoint,
-    options: { namesIndexed?: true } = {},
+    options: { entityStatusLoaded?: true; namesIndexed?: true } = {},
   ): Promise<void> {
     const kept = checkpoint ?? (await this.gleifCheckpoint());
     // The name index stays built across this commit when it was built before it —
     // every write since went through ingestLeiEntities — or when the caller just
     // rewrote every entity (a golden-copy load). The stamp follows the state write:
-    // a crash between the two reads as unbuilt, the safe direction.
+    // a crash between the two reads as unbuilt, the safe direction. Entity status
+    // and successors follow the same rule: every write since a recorded load went
+    // through parseOneLei, which stores both.
     const indexed = options.namesIndexed === true || (await this.leiNamesIndexed());
+    const statusLoaded =
+      options.entityStatusLoaded === true || (await this.leiEntityStatusLoaded());
     const signaturesIndexed = leiSignaturesIndexed(await this.leiHandle());
     const completedAt = new Date().toISOString();
     await this.leiMirror.store.writeState({
@@ -1028,6 +1135,7 @@ export class ScreeningService {
       writeLeiNameStamp(await this.leiHandle(), completedAt);
       if (signaturesIndexed) writeLeiSignatureStamp(await this.leiHandle(), completedAt);
     }
+    if (statusLoaded) writeLeiEntityStatusStamp(await this.leiHandle(), completedAt);
   }
 
   /**
@@ -1039,6 +1147,18 @@ export class ScreeningService {
    */
   async leiNamesIndexed(): Promise<boolean> {
     const stamp = leiNameStamp(await this.leiHandle());
+    return stamp !== undefined && stamp === leiStateStamp(await this.leiMirror.store.readState());
+  }
+
+  /**
+   * True when a completed golden-copy load (or the fixture seed) wrote entity
+   * status and successors for every entity in that copy: the stamp it writes is
+   * the sync state's current `completedAt`. Unlike the name index, never recorded
+   * on a mirror's first open; an earlier release's write after a rollback moves
+   * `completedAt` and clears it.
+   */
+  async leiEntityStatusLoaded(): Promise<boolean> {
+    const stamp = leiEntityStatusStamp(await this.leiHandle());
     return stamp !== undefined && stamp === leiStateStamp(await this.leiMirror.store.readState());
   }
 
@@ -1106,8 +1226,8 @@ export class ScreeningService {
 
   /**
    * Load a synthetic fixture into both mirrors, build the exact-name index as the
-   * mirror scripts do, and mark them ready, reporting exceptions recorded as
-   * loaded. For tests and a quick local smoke run — NOT the real corpus, which
+   * mirror scripts do, and mark them ready, reporting exceptions and entity status
+   * recorded as loaded. For tests and a quick local smoke run — NOT the real corpus, which
    * loads via `mirror:init`.
    */
   async seedFixtures(fixtures: {
@@ -1123,18 +1243,25 @@ export class ScreeningService {
     await this.indexLeiExactNames();
     await this.indexLeiFuzzyNames();
     await this.markSanctionsReady(fixtures.designations.length);
-    await this.markLeiReady(fixtures.leiEntities.length, { repex: new Date().toISOString() });
+    await this.markLeiReady(
+      fixtures.leiEntities.length,
+      { repex: new Date().toISOString() },
+      { entityStatusLoaded: true },
+    );
   }
 
   // ─── Matching engine: screen a name against the sanctions lists ────────────
 
   /**
    * Screen a name against the loaded sanctions lists. Strict mode runs exact
-   * then all-tokens-present (FTS5). A fuzzy pass adds Jaro-Winkler + phonetic
+   * then all-tokens-present (FTS5), a legal form counting in any spelling of
+   * the same form (`LEGAL_FORM_SPELLINGS`). A fuzzy pass adds Jaro-Winkler + phonetic
    * scoring against the per-alias index: over every selected list in fuzzy mode,
    * or in strict mode when strict found nothing on any of them, and otherwise
-   * over just the lists strict found nothing on, keeping only the candidates
-   * that cover every distinctive query word (see {@link ScreenNameResult.fuzzySources}).
+   * over just the lists strict found nothing on — and the UK and UN lists either
+   * way for a query holding a letter outside the Latin script — keeping only the candidates
+   * that cover every distinctive query word, by spelling or by sound (see
+   * {@link ScreenNameResult.fuzzySources}).
    */
   async screenName(opts: ScreenNameOptions, ctx: Context): Promise<ScreenNameResult> {
     const normalizedQuery = fold(opts.query);
@@ -1152,16 +1279,26 @@ export class ScreeningService {
         ? ''
         : ` AND d.entity_type IN ('${this.escapeLiteral(opts.entityType)}', 'unknown')`;
 
-    // Step 1+2: exact-normalized, then strict all-tokens-present (FTS5 AND).
+    // Step 1+2: exact-normalized, then strict all-tokens-present (FTS5 AND), a
+    // legal form matching any spelling of the same form.
     const strictHits = this.runStrict(handle, { normalizedQuery, sourceFilter, typeFilter });
 
     // The lists step 3 searches. Explicit fuzzy searches every selected list, and
     // so does strict when it found nothing on any of them. Otherwise strict is
-    // completed list by list: one fuzzy pass over the lists it found nothing on.
+    // completed list by list: one fuzzy pass over the lists no strict hit settles.
     // The pass pools each list on its own (see runFuzzy), so a list's candidates
     // never depend on which other lists were selected. The internal
     // cross-reference screens (autoFallback false) search none.
-    const strictLists = new Set(strictHits.map((hit) => hit.source));
+    //
+    // A strict hit settles its list, except the UK and UN lists for a query
+    // holding a letter of another script (see NATIVE_NAME_COMPLETED). The folded
+    // query is the one strict read.
+    const otherScript = hasOtherScriptLetter(normalizedQuery);
+    const settled = new Set(
+      strictHits
+        .map((hit) => hit.source)
+        .filter((code) => !(otherScript && NATIVE_NAME_COMPLETED.has(code))),
+    );
     const fuzzySources =
       queryTokens.length === 0
         ? []
@@ -1169,10 +1306,11 @@ export class ScreeningService {
           ? selected
           : opts.autoFallback === false
             ? []
-            : selected.filter((code) => !strictLists.has(code));
+            : selected.filter((code) => !settled.has(code));
     // A completion beside strict hits keeps only the candidates that cover every
-    // distinctive query word — the fuzzy analogue of strict's all-tokens rule:
-    // the same name, spelled differently, on a list strict missed.
+    // distinctive query word, by spelling or by sound — the fuzzy analogue of
+    // strict's all-tokens rule: the same name, spelled differently, on a list
+    // strict missed.
     const completion = opts.matchMode === 'strict' && strictHits.length > 0;
 
     // Step 3/3b: fuzzy (Jaro-Winkler) + phonetic over the candidate pool.
@@ -1232,8 +1370,11 @@ export class ScreeningService {
 
   /**
    * Strict pass: every name holding every query token, exact (normalized
-   * equality) or strong. Unbounded — the most common token on the lists reaches
-   * 6,940 of 102,467 alias rows — so the set it returns is the whole strict set.
+   * equality) or strong, and every name holding every token of the query's
+   * legal-form fold ({@link foldLegalForms}), strong — a legal form present in
+   * any spelling of the same form. Unbounded — the most common token on the
+   * lists reaches 6,940 of 102,467 alias rows — so the set it returns is the
+   * whole strict set.
    */
   private runStrict(
     handle: SqliteHandle,
@@ -1248,28 +1389,45 @@ export class ScreeningService {
     const match = buildFtsMatch(args.normalizedQuery);
     if (!match) return [];
 
-    // FTS over the name index; join back to name + designation. Classify each
-    // matched name as exact (normalized equality) or strong (all tokens present).
-    const rows = handle
-      .prepare<NameJoinRow>(
-        `SELECT n.designation_id, n.name, n.normalized, n.phonetic, n.name_type,
-                d.source, d.source_entry_id, d.entity_type, d.primary_name,
-                d.program, d.designation_date, d.reference_number
-         FROM ${NAME_FTS_TABLE} f
-         JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
-         JOIN designation d ON d.id = n.designation_id
-         WHERE ${NAME_FTS_TABLE} MATCH ?${args.sourceFilter}${args.typeFilter}`,
-      )
-      .all(match);
+    // FTS over the name index; join back to name + designation.
+    const namesMatching = handle.prepare<NameJoinRow>(
+      `SELECT n.designation_id, n.name, n.normalized, n.name_type,
+              d.source, d.source_entry_id, d.entity_type, d.primary_name,
+              d.program, d.designation_date, d.reference_number, d.un_reference_number
+       FROM ${NAME_FTS_TABLE} f
+       JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
+       JOIN designation d ON d.id = n.designation_id
+       WHERE ${NAME_FTS_TABLE} MATCH ?${args.sourceFilter}${args.typeFilter}`,
+    );
 
+    // Classify each name the query's own tokens reach as exact (normalized
+    // equality) or strong (all tokens present).
     const byDesignation = new Map<string, ScreeningHit>();
-    for (const row of rows) {
+    for (const row of namesMatching.all(match)) {
       const isExact = row.normalized === args.normalizedQuery;
       const hit = this.rowToHit(row, isExact ? 'exact' : 'strong');
       const existing = byDesignation.get(row.designation_id);
       // Prefer the higher-confidence match type per designation.
       if (!existing || (isExact && existing.matchType !== 'exact')) {
         byDesignation.set(row.designation_id, hit);
+      }
+    }
+
+    // Then the names a legal-form spelling alone keeps out. The widened
+    // expression reaches every spelling of each form in the query, a multi-word
+    // one only as adjacent words; a name it reaches is kept only when its own
+    // fold holds every token of the query's, so a word inside a longer form
+    // (`company` in `joint stock company`) never stands in for the form.
+    // Designations the query's own tokens already reached keep that hit as is.
+    const queryForms = foldLegalForms(args.normalizedQuery);
+    const widened = buildLegalFormFtsMatch(queryForms);
+    if (widened) {
+      for (const row of namesMatching.all(widened)) {
+        if (byDesignation.has(row.designation_id)) continue;
+        const nameForms = new Set(foldLegalForms(row.normalized));
+        if (queryForms.every((token) => nameForms.has(token))) {
+          byDesignation.set(row.designation_id, this.rowToHit(row, 'strong'));
+        }
       }
     }
     // Exact hits first, then strong; designation identity breaks same-band ties.
@@ -1295,8 +1453,8 @@ export class ScreeningService {
    * share the budget and push a block that fits on its own list out of the
    * pool. A stoplisted word (`FUZZY_STOPLIST`) keys no block of its own; its
    * prefix only pairs with a block that did not fit. With `fullCoverage`, a
-   * candidate must also cover every distinctive query word, every word when all
-   * are stoplisted.
+   * candidate must also cover every distinctive query word, by spelling or by
+   * sound, and every word by spelling when all are stoplisted.
    */
   private runFuzzy(
     handle: SqliteHandle,
@@ -1393,8 +1551,9 @@ export class ScreeningService {
     const rows = handle
       .prepare<NameJoinRow & { rowid: number }>(
         `SELECT n.rowid AS rowid, n.designation_id, n.name, n.normalized,
-                n.phonetic, n.name_type, d.source, d.source_entry_id, d.entity_type,
-                d.primary_name, d.program, d.designation_date, d.reference_number
+                n.name_type, d.source, d.source_entry_id, d.entity_type,
+                d.primary_name, d.program, d.designation_date, d.reference_number,
+                d.un_reference_number
          FROM ${NAME_TABLE} n
          JOIN designation d ON d.id = n.designation_id
          WHERE n.rowid IN (SELECT value FROM json_each(?))`,
@@ -1413,6 +1572,12 @@ export class ScreeningService {
     // variants (their significant tokens each score high) and word-order swaps (all
     // tokens present) stay admitted; a high explicit `minScore` still suppresses
     // uniformly; single-token queries are unchanged (the floor alone governs).
+    //
+    // A word covered by sound alone (`soundKeys`: `gaddafi`/`qadhafi`, Jaro-Winkler
+    // 0.8095) counts toward the surfaced coverage and the completion's every-word
+    // rule, never toward admission, so it only completes a candidate the spelled
+    // words admit. Keys are memoized for the pass: thousands of names share tokens.
+    const soundKey = soundKeys();
     const queries = queryForms.map((normalized) => {
       const tokens = tokenize(normalized);
       const formDistinctive = splitOnStoplist(tokens).distinctive;
@@ -1434,15 +1599,18 @@ export class ScreeningService {
       for (const query of queries) {
         for (const name of names) {
           // Coverage of every query token is the surfaced ranking key; the token arm
-          // counts the distinctive ones only, and they are every token unless the
-          // query carries a stoplisted one.
+          // counts the distinctive ones covered by spelling only, and they are every
+          // token unless the query carries a stoplisted one.
           const {
             best: tokenScore,
             covered,
             distinctiveCovered,
-          } = scoreTokenPairs(query.scoring, name.tokens, args.minScore);
+            phonetic,
+          } = scoreTokenPairs(query.scoring, name.tokens, args.minScore, soundKey);
           const wholeScore = jaroWinkler(query.normalized, name.normalized);
-          if (args.fullCoverage && distinctiveCovered < query.distinctiveCount) continue;
+          if (args.fullCoverage && distinctiveCovered + phonetic < query.distinctiveCount) {
+            continue;
+          }
 
           if (
             this.admitFuzzy(
@@ -1457,7 +1625,11 @@ export class ScreeningService {
           ) {
             const hit = this.rowToHit(row, 'approximate');
             hit.score = Number(Math.max(tokenScore, wholeScore).toFixed(4));
-            hit.queryTokenCoverage = { covered, total: args.queryTokens.length };
+            hit.queryTokenCoverage = {
+              covered,
+              total: args.queryTokens.length,
+              ...(phonetic > 0 ? { phonetic } : {}),
+            };
             if (!best || compareFuzzyRank(hit, best) < 0) best = hit;
           }
         }
@@ -1571,6 +1743,7 @@ export class ScreeningService {
       ...(row.program ? { program: row.program } : {}),
       ...(row.designation_date ? { designationDate: row.designation_date } : {}),
       ...(row.reference_number ? { referenceNumber: row.reference_number } : {}),
+      ...(row.un_reference_number ? { unReferenceNumber: row.un_reference_number } : {}),
       sources: [row.source as SourceCode],
     };
   }
@@ -1592,23 +1765,33 @@ export class ScreeningService {
       ...(row.legal_basis ? { legalBasis: String(row.legal_basis) } : {}),
       ...(row.designation_date ? { designationDate: String(row.designation_date) } : {}),
       ...(row.reference_number ? { referenceNumber: String(row.reference_number) } : {}),
+      ...(row.un_reference_number ? { unReferenceNumber: String(row.un_reference_number) } : {}),
       payload: JSON.parse(String(row.payload)) as DesignationPayload,
     };
   }
 
   /**
    * Resolve a caller's entry ID within one source: trimmed, and case-insensitive
-   * on both sides, against `sourceEntryId` first and then the published
-   * `referenceNumber`. No reference number equals another designation's entry ID
-   * in its source, so the second pass never redirects an ID the first resolves; a
-   * reference number more than one designation publishes (a UK Group ID covering
-   * two regimes' designations of one person) resolves to all of them, and the
-   * caller picks by entry ID.
+   * on both sides, against `sourceEntryId`, then the published `referenceNumber`,
+   * then the `unReferenceNumber` a UK or EU designation implements — each pass
+   * only when every earlier one misses, so adding a pass never redirects a key an
+   * earlier one resolves. Then, for a key shaped like a UN reference number, its
+   * other zero paddings against the UN list's reference number and the
+   * `unReferenceNumber` column (`LYi.028` finds the EU's `LYi.28`), stored
+   * values untouched. A reference more than one designation carries (a UK
+   * Group ID covering two regimes' designations of one person; a UN reference two
+   * records publish) resolves to all of them, and the caller picks by entry ID.
+   * Until a refresh stores `un_reference_number`, a UN reference misses as any
+   * unknown key does.
    */
   async resolveDesignation(source: SourceCode, entryId: string): Promise<DesignationLookup> {
     const wanted = entryId.trim();
     if (!wanted) return { kind: 'not_found' };
     const handle = await this.designationHandle();
+    const found = async (id: string): Promise<DesignationLookup> => {
+      const designation = await this.getDesignation(source, id);
+      return designation ? { kind: 'found', designation } : { kind: 'not_found' };
+    };
 
     // An exact-case match wins over a case-folded one, so an ID that resolves
     // today resolves to the same record.
@@ -1619,24 +1802,42 @@ export class ScreeningService {
          ORDER BY source_entry_id = ? DESC LIMIT 1`,
       )
       .get(source, wanted, wanted);
-    // Sorted here rather than in SQL: an ORDER BY on the entry ID steers the
-    // planner off the case-insensitive reference index onto a scan of the source.
-    const matched = byEntryId
-      ? [byEntryId.source_entry_id]
-      : handle
-          .prepare<{ source_entry_id: string }>(
-            `SELECT source_entry_id FROM designation
-             WHERE source = ? AND reference_number = ? COLLATE NOCASE`,
-          )
-          .all(source, wanted)
-          .map((row) => row.source_entry_id)
-          .sort();
+    if (byEntryId) return found(byEntryId.source_entry_id);
 
-    const [only, ...others] = matched;
-    if (!only) return { kind: 'not_found' };
-    if (others.length > 0) return { kind: 'ambiguous', sourceEntryIds: matched };
-    const designation = await this.getDesignation(source, only);
-    return designation ? { kind: 'found', designation } : { kind: 'not_found' };
+    // Each pass reads its key's case-insensitive (source, key) index. Sorted here
+    // rather than in SQL: an ORDER BY on the entry ID steers the planner off that
+    // index onto a scan of the source, as a COLLATE after the IN list would.
+    const match = (column: string, keys: readonly string[]) =>
+      handle
+        .prepare<{ source_entry_id: string }>(
+          `SELECT source_entry_id FROM designation
+           WHERE source = ? AND ${column} COLLATE NOCASE IN (${keys.map(() => '?').join(', ')})`,
+        )
+        .all(source, ...keys)
+        .map((row) => row.source_entry_id)
+        .sort();
+    // `unReference` marks the columns that hold a UN reference number: the UN
+    // list's own reference number, and the one a UK or EU designation implements.
+    const passes = [
+      { column: 'reference_number', key: 'referenceNumber', unReference: source === 'un' },
+      { column: 'un_reference_number', key: 'unReferenceNumber', unReference: true },
+    ] as const;
+    // A UN reference's other zero paddings are tried only after every pass misses
+    // the key as given, so an exact match always wins.
+    const paddings = unReferencePaddings(wanted);
+    const attempts = [
+      ...passes.map((pass) => ({ ...pass, keys: [wanted] })),
+      ...(paddings.length > 0
+        ? passes.filter((pass) => pass.unReference).map((pass) => ({ ...pass, keys: paddings }))
+        : []),
+    ];
+    for (const { column, key, keys } of attempts) {
+      const matched = match(column, keys);
+      const [only, ...others] = matched;
+      if (!only) continue;
+      return others.length > 0 ? { kind: 'ambiguous', key, sourceEntryIds: matched } : found(only);
+    }
+    return { kind: 'not_found' };
   }
 
   // ─── Identifier lookup ─────────────────────────────────────────────────────
@@ -2199,9 +2400,54 @@ export class ScreeningService {
     return SOURCE_CODES.map((code) => ({ code, recordCount: bySource.get(code) ?? 0 }));
   }
 
-  /** Sanctions mirror readiness + freshness. */
-  async sanctionsReadiness(): Promise<MirrorReadiness> {
-    return this.toReadiness(await this.designationMirror.status());
+  /**
+   * Sanctions mirror readiness and as-of, with each list's recorded harvest and
+   * the last refresh from {@link sanctionsFreshness}, read once per call.
+   */
+  async sanctionsReadiness(): Promise<MirrorReadiness & SanctionsFreshness> {
+    const [status, freshness] = await Promise.all([
+      this.designationMirror.status(),
+      this.sanctionsFreshness(),
+    ]);
+    return { ...this.toReadiness(status), ...freshness };
+  }
+
+  /**
+   * Each sanctions list's last successful harvest and its document's date, and
+   * the last refresh's status: what `sanctions_list_sources` reports beside
+   * {@link sanctionsReadiness}. A list's values are those of the last run that
+   * finished it, also while another run is in progress. Read on every call; the
+   * rows change only as a run's index rebuild commits, and the run reads
+   * `in_progress` until then (see {@link lastRefreshOf}).
+   *
+   * The state is read first, then the name-index stamp and the rows in one
+   * snapshot: that rebuild commits both together, so a reader never pairs a
+   * rebuilt stamp with the rows it replaced.
+   */
+  async sanctionsFreshness(): Promise<SanctionsFreshness> {
+    const handle = await this.designationHandle();
+    const state = await this.designationMirror.store.readState();
+    const { built, rows } = handle.transaction(() => ({
+      built: nameIndexStamp(handle),
+      rows: handle
+        .prepare<HarvestRow>(
+          `SELECT source, harvested_at, published_at, attempt_started_at, attempt_status FROM ${SOURCE_HARVEST_TABLE}`,
+        )
+        .all(),
+    }));
+    const bySource = new Map(rows.map((row) => [row.source, row]));
+    return {
+      lastRefresh: lastRefreshOf(state, built, bySource),
+      sources: SOURCE_CODES.map((code) => {
+        const row = bySource.get(code);
+        if (!row?.harvested_at) return { code };
+        return {
+          code,
+          lastHarvestedAt: row.harvested_at,
+          ...(row.published_at ? { publishedAt: row.published_at } : {}),
+        };
+      }),
+    };
   }
 
   /**
@@ -2469,10 +2715,18 @@ function writeLeiNames(
   }
 }
 
-/** A stored entity payload in the current shape, whichever release wrote it. */
+/**
+ * A stored entity payload in the current shape, whichever release wrote it.
+ * GLEIF publishes `EntityStatus` on every record, so a payload without it was
+ * stored before it and `successors` were read.
+ */
 function readLeiPayload(payload: string): LeiEntityRecord {
   const entity = JSON.parse(payload) as NormalizedLeiEntity;
-  return { ...entity, alternateNames: alternateNamesOf(entity) };
+  return {
+    ...entity,
+    alternateNames: alternateNamesOf(entity),
+    entityStatusLoaded: entity.entityStatus !== undefined,
+  };
 }
 
 /** What the name-index stamp is compared against: the GLEIF sync state's `completedAt`. */
@@ -2493,6 +2747,19 @@ function writeLeiNameStamp(handle: SqliteHandle, stamp: string): void {
     .run(stamp);
 }
 
+/** The state entity status and successors were last recorded loaded under, or undefined when never. */
+function leiEntityStatusStamp(handle: SqliteHandle): string | undefined {
+  return handle
+    .prepare<{ stamp: string }>(`SELECT stamp FROM ${LEI_ENTITY_STATUS_STAMP_TABLE} WHERE id = 1`)
+    .get()?.stamp;
+}
+
+function writeLeiEntityStatusStamp(handle: SqliteHandle, stamp: string): void {
+  handle
+    .prepare(`INSERT OR REPLACE INTO ${LEI_ENTITY_STATUS_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
+    .run(stamp);
+}
+
 /** Derived GLEIF data serves requests only after a complete build for the typed-name stamp. */
 function leiSignaturesIndexed(handle: SqliteHandle): boolean {
   const stamp = handle
@@ -2506,6 +2773,32 @@ function writeLeiSignatureStamp(handle: SqliteHandle, stamp: string): void {
   handle
     .prepare(`INSERT OR REPLACE INTO ${LEI_SIGNATURE_STAMP_TABLE}(id, stamp) VALUES (1, ?)`)
     .run(`v1:${stamp}`);
+}
+
+/**
+ * A UN reference number as the UN list and the lists implementing it publish
+ * one: a two-letter regime code, `e` (entity) or `i` (individual), a dot, and
+ * the listing's number, which the UN pads to three digits and some EU records
+ * do not (`LYi.028`, `LYi.28`). Keys longer than
+ * {@link UN_REFERENCE_MAX_LENGTH} are never tested, so the pattern only reads a
+ * key of a reference's size.
+ */
+const UN_REFERENCE = /^([a-z]{2}[ei]\.)([0-9]{1,8})$/i;
+const UN_REFERENCE_MAX_LENGTH = 12;
+
+/**
+ * The key's other zero paddings when it is shaped like a UN reference number,
+ * up to the UN's three digits (`LYi.0028` → `LYi.28`, `LYi.028`); none for any
+ * other key, so an OFAC, EU, or UK reference number is never reinterpreted.
+ */
+function unReferencePaddings(key: string): string[] {
+  const parts = key.length <= UN_REFERENCE_MAX_LENGTH ? UN_REFERENCE.exec(key) : null;
+  if (!parts) return [];
+  const [, prefix = '', digits = ''] = parts;
+  const number = String(Number(digits));
+  const forms = [number];
+  for (let width = number.length + 1; width <= 3; width++) forms.push(number.padStart(width, '0'));
+  return forms.filter((form) => form !== digits).map((form) => `${prefix}${form}`);
 }
 
 /** A designation row as the index rebuilds read it. */
@@ -2622,6 +2915,9 @@ function rebuildNameIndex(handle: SqliteHandle, stamp: string): void {
   writeNameIndexStamp(handle, stamp);
 }
 
+/** Stamp prefix for the current name-index build rules. */
+const NAME_STAMP_VERSION = 'v2:';
+
 /** The stamp the name index was last built under by this release or a later one, or undefined. */
 function nameIndexStamp(handle: SqliteHandle): string | undefined {
   return handle
@@ -2632,7 +2928,7 @@ function nameIndexStamp(handle: SqliteHandle): string | undefined {
 function writeNameIndexStamp(handle: SqliteHandle, stamp: string): void {
   handle
     .prepare(`INSERT OR REPLACE INTO ${NAME_INDEX_STAMP_TABLE} (id, stamp) VALUES (1, ?)`)
-    .run(`v2:${stamp}`);
+    .run(`${NAME_STAMP_VERSION}${stamp}`);
 }
 
 /** Index a designation's identifiers under their categories' keys; one that normalizes to nothing is skipped. */
@@ -2681,6 +2977,99 @@ function writeIdentifierStamp(handle: SqliteHandle, stamp: string): void {
     .run(`${IDENTIFIER_STAMP_VERSION}${stamp}`);
 }
 
+/**
+ * Record each list's result in a run under that run's `startedAt`. A harvested
+ * list replaces its harvest time and publisher date; a failed one records only
+ * the attempt, so both keep what its last success wrote. The caller owns the
+ * transaction.
+ */
+function writeHarvestOutcomes(
+  handle: SqliteHandle,
+  outcomes: readonly HarvestOutcome[],
+  startedAt: string | undefined,
+): void {
+  if (outcomes.length === 0) return;
+  const harvested = handle.prepare(
+    `INSERT INTO ${SOURCE_HARVEST_TABLE} (source, harvested_at, published_at, attempt_started_at, attempt_status) VALUES (?, ?, ?, ?, 'harvested') ON CONFLICT(source) DO UPDATE SET harvested_at = excluded.harvested_at, published_at = excluded.published_at, attempt_started_at = excluded.attempt_started_at, attempt_status = excluded.attempt_status`,
+  );
+  const failed = handle.prepare(
+    `INSERT INTO ${SOURCE_HARVEST_TABLE} (source, attempt_started_at, attempt_status) VALUES (?, ?, 'failed') ON CONFLICT(source) DO UPDATE SET attempt_started_at = excluded.attempt_started_at, attempt_status = excluded.attempt_status`,
+  );
+  for (const outcome of outcomes) {
+    if (outcome.status === 'harvested') {
+      harvested.run(
+        outcome.source,
+        outcome.harvestedAt,
+        outcome.publishedAt ?? null,
+        startedAt ?? null,
+      );
+    } else {
+      failed.run(outcome.source, startedAt ?? null);
+    }
+  }
+}
+
+/** A `source_harvest` row as stored. */
+interface HarvestRow {
+  attempt_started_at: string | null;
+  attempt_status: 'failed' | 'harvested';
+  harvested_at: string | null;
+  published_at: string | null;
+  source: string;
+}
+
+/**
+ * The last refresh from the sync state, with the lists that failed in it when
+ * any list's outcome was recorded under its `startedAt`.
+ *
+ * A sync run writes `complete` or `error` before its index rebuild records the
+ * run's outcomes and stamps the name index with that state, in one transaction
+ * (see {@link ScreeningService.syncSanctions}). Until that commits, the name
+ * index carries another state's stamp and the run reads `in_progress`. A mirror
+ * an earlier release wrote reads its own state: the first open rebuilds a name
+ * index whose stamp differs, before anything reads it. A state with no
+ * `startedAt` was written by no run ({@link ScreeningService.markSanctionsReady}
+ * after a direct ingest, which indexes as it writes) and has no rebuild to wait for.
+ */
+function lastRefreshOf(
+  state: SyncState,
+  nameStamp: string | undefined,
+  rows: ReadonlyMap<string, HarvestRow>,
+): SanctionsLastRefresh {
+  const { startedAt, status } = state;
+  const started = startedAt ? { startedAt } : {};
+  if (
+    (status === 'complete' || status === 'error') &&
+    startedAt !== undefined &&
+    nameStamp !== `${NAME_STAMP_VERSION}${syncStamp(state)}`
+  ) {
+    return { status: 'in_progress', startedAt };
+  }
+  switch (status) {
+    case 'pending':
+      return { status };
+    case 'complete':
+    case 'in_progress':
+      return { status, ...started };
+    case 'error': {
+      const ofRun = (code: string) => {
+        const row = rows.get(code);
+        return startedAt !== undefined && row?.attempt_started_at === startedAt ? row : undefined;
+      };
+      if (![...rows.keys()].some(ofRun)) return { status, ...started };
+      return {
+        status,
+        ...started,
+        failedSources: SOURCE_CODES.filter((code) => ofRun(code)?.attempt_status === 'failed'),
+      };
+    }
+    default: {
+      const unreachable: never = status;
+      throw new Error(`Unknown sanctions sync status ${String(unreachable)}`);
+    }
+  }
+}
+
 /** Rebuild the identifier index alone from the stored payloads. The caller owns the transaction. */
 function rebuildIdentifierIndex(handle: SqliteHandle, stamp: string): void {
   handle.exec(`DELETE FROM ${IDENTIFIER_TABLE}`);
@@ -2712,8 +3101,11 @@ function matchRank(type: ScreeningHit['matchType']): number {
 
 /**
  * Rank two admitted fuzzy candidates: raw score descending, then query-token
- * coverage descending. Shared by {@link ScreeningService.runFuzzy} and
- * {@link ScreeningService.rankFuzzy} so both surfaces order by the same rule.
+ * coverage descending, then fewer words covered by sound alone — of two equal
+ * counts, spelling outranks sound. Shared by {@link ScreeningService.runFuzzy}
+ * and {@link ScreeningService.rankFuzzy} so both surfaces order by the same
+ * rule; only sanctions hits carry a sound count, so LEI matches order by score
+ * and coverage alone.
  *
  * The score stays the primary key AND keeps its raw Jaro-Winkler value — coverage
  * is a separate real measurement that orders candidates, never a term blended into
@@ -2733,7 +3125,9 @@ function compareFuzzyRank(
 ): number {
   return (
     (b.score ?? 0) - (a.score ?? 0) ||
-    (b.queryTokenCoverage?.covered ?? 0) - (a.queryTokenCoverage?.covered ?? 0)
+    (b.queryTokenCoverage?.covered ?? 0) - (a.queryTokenCoverage?.covered ?? 0) ||
+    // `phonetic` is absent when zero.
+    (a.queryTokenCoverage?.phonetic ?? 0) - (b.queryTokenCoverage?.phonetic ?? 0)
   );
 }
 
@@ -2818,7 +3212,7 @@ function otherOfacList(source: SourceCode): SourceCode | undefined {
  * stores the hit's entry, so `sources` names every selected list the party is
  * on. {@link groupOfacCopies} folds only the records a pass reached, and a pass
  * can reach one record of a party and not the other: the strict completion
- * fuzzy-searches only the lists strict found nothing on, a list's pool budget
+ * skips an OFAC list strict found a hit on, a list's pool budget
  * can keep one record and leave the other, and the two files can publish
  * different names or identifiers for the party. One query covers every hit;
  * `source` and every other field stay the reached record's.

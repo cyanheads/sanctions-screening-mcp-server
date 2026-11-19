@@ -486,6 +486,97 @@ describe('CSL preparation and normalization', () => {
     }
   });
 
+  it("reports each list's source_last_updated verbatim, and none for a list whose entry has no readable one (#88)", async () => {
+    const lastUpdated: Partial<Record<(typeof CSL_SOURCE_CODES)[number], string | null>> = {
+      bis_el: '2026-08-21T20:19:33+00:00',
+      bis_dpl: '2026-04-28T12:39:28+00:00',
+      bis_uvl: null,
+      bis_meu: '20/02/2026',
+      state_dtc: '2026-07-24T00:00:00+00:00',
+    };
+    serve(
+      JSON.stringify({
+        results: CSL_RECORDS,
+        offset: 0,
+        total: CSL_RECORDS.length,
+        sources_used: [
+          // A Treasury list the CSL also carries, which no adapter reads.
+          {
+            source: 'Capta List (CAP) - Treasury Department',
+            source_last_updated: '2026-11-18T17:35:53+00:00',
+          },
+          ...CSL_SOURCE_CODES.map((source) => ({
+            source: SOURCE_LABELS[source],
+            ...(source in lastUpdated ? { source_last_updated: lastUpdated[source] } : {}),
+          })),
+        ],
+      }),
+    );
+    const run = createCslPreparation();
+    try {
+      const reports = [];
+      for (const ingester of run.ingesters) {
+        expect(await collect(ingester.harvest(new AbortController().signal))).toHaveLength(1);
+        reports.push(ingester.report());
+      }
+      expect(reports.map((report) => [report.source, report.publishedAt])).toEqual([
+        ['bis_el', '2026-08-21T20:19:33+00:00'],
+        ['bis_dpl', '2026-04-28T12:39:28+00:00'],
+        ['bis_uvl', undefined],
+        ['bis_meu', undefined],
+        ['state_dtc', '2026-07-24T00:00:00+00:00'],
+        ['state_acn', undefined],
+      ]);
+      expect(reports.every((report) => report.accepted === 1)).toBe(true);
+    } finally {
+      run.dispose();
+    }
+  });
+
+  it('rejects an envelope whose sources_used names one list twice, for all six lists, before yielding any row', async () => {
+    const entry = (source: (typeof CSL_SOURCE_CODES)[number], sourceLastUpdated: string) => ({
+      last_imported: '2026-11-19T12:15:00.026125+00:00',
+      source_last_updated: sourceLastUpdated,
+      source: SOURCE_LABELS[source],
+      import_rate: 'Hourly',
+    });
+    const fetch = serve(
+      JSON.stringify({
+        results: CSL_RECORDS,
+        offset: 0,
+        total: CSL_RECORDS.length,
+        sources_used: [
+          ...CSL_SOURCE_CODES.map((source) => entry(source, '2026-02-10T23:02:53+00:00')),
+          // The Unverified List again, under another date.
+          entry('bis_uvl', '2026-11-18T17:35:53+00:00'),
+        ],
+      }),
+    );
+    const run = createCslPreparation();
+    try {
+      for (const ingester of run.ingesters) {
+        const rows: NormalizedDesignation[] = [];
+        const failure = await (async () => {
+          for await (const row of ingester.harvest(new AbortController().signal)) rows.push(row);
+        })().then(
+          () => undefined,
+          (err: Error) => err,
+        );
+        expect(failure?.message, ingester.source).toBe(
+          'CSL download could not be completely validated; no CSL lists were replayed.',
+        );
+        expect((failure?.cause as Error | undefined)?.message, ingester.source).toBe(
+          'CSL repeats source metadata.',
+        );
+        expect(rows, ingester.source).toEqual([]);
+        expect(ingester.report().accepted, ingester.source).toBe(0);
+      }
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      run.dispose();
+    }
+  });
+
   it('replays bounded pages and retains per-source removal-share guards', async () => {
     serve(
       cslDocument([

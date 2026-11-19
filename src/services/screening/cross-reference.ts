@@ -2,7 +2,9 @@
  * @fileoverview The GLEIF → sanctions cross-reference behind `sanctions_get_entity`
  * and, per node, `sanctions_trace_ownership` (`screenNodes: true`). It screens
  * the entity's legal name and every other and transliterated name strict —
- * exact, then all tokens present, never fuzzy — and looks up its LEI and its
+ * exact, then all tokens present with a legal form matching any spelling of
+ * the same form (`Ltd` and `Limited`, `LLC` and `OOO`), never fuzzy — and looks
+ * up its LEI and its
  * registration-authority ID as non-document identifiers, the registration ID
  * matching only an identifier published for the country of the entity's legal
  * jurisdiction. An ownership node with no Level 1 record has only its LEI, which

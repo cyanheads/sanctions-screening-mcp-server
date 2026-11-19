@@ -4,7 +4,8 @@
  * dataset's delta window from the stored checkpoint, streams it in bounded
  * batches, applies records in document order (upsert, or delete on the marker),
  * and advances `leiAsOf` and the checkpoint once, after every dataset applied. An
- * uncovered gap applies nothing. The load records each golden copy's `ContentDate`.
+ * uncovered gap applies nothing. The load records each golden copy's `ContentDate`,
+ * and entity status as loaded only when it completes (#94).
  * @module tests/services/gleif-sync.test
  */
 
@@ -16,6 +17,7 @@ import {
   loadGleifGoldenCopies,
   refreshGleif,
 } from '@/services/screening/gleif-sync.js';
+import { LEI_ENTITY_STATUS_STAMP_TABLE } from '@/services/screening/schema.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
 import {
   type Change,
@@ -546,5 +548,196 @@ describe('loadGleifGoldenCopies — mirror:init', () => {
 
     const outcome = await refreshGleif(svc, signal(), { loadMissingExceptions: true });
     expect(outcome.needsInit).toEqual(['lei2', 'rr']);
+  });
+});
+
+describe('entity status and successors — the mirror-wide flag follows the load that wrote them (#94)', () => {
+  /**
+   * `Date` is pinned and moved a second between commits: two commits in one
+   * millisecond share a `completedAt`, which would make a dropped stamp read as
+   * current.
+   */
+  const at = (seconds: number) => new Date(Date.UTC(2026, 10, 19, 12, 0, seconds)).toISOString();
+
+  const golden = () =>
+    publication({
+      lei2: [
+        { lei: A, legalName: 'A GOLDEN', entityStatus: 'INACTIVE', successors: [{ lei: X }] },
+        {
+          lei: B,
+          legalName: 'B GOLDEN',
+          entityStatus: 'INACTIVE',
+          successors: [{ name: 'B SUCCESSOR KK' }, { lei: Y, name: 'Y HOLDINGS' }],
+        },
+        { lei: X, legalName: 'X GOLDEN' },
+      ],
+    });
+
+  /** A Level 2 golden copy cut mid-document: the transfer ends cleanly before the root closes. */
+  const rrCut = () => {
+    const rrFull = rrFile({ contentDate: GOLDEN.rr }, [
+      { childLei: X, parentLei: A, relationshipType: DIRECT },
+    ]);
+    return rrFull.slice(0, rrFull.indexOf('</rr:RelationshipRecord>') + 10);
+  };
+
+  /** The stamp rows as stored: each the `completedAt` it was written under. */
+  const stamps = async () =>
+    (await svc.leiEntities.raw())
+      .prepare<{ stamp: string }>(`SELECT stamp FROM ${LEI_ENTITY_STATUS_STAMP_TABLE}`)
+      .all()
+      .map((row) => row.stamp);
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('a completed golden-copy load stamps the table, and every record it wrote carries the fields', async () => {
+    standIn.serve(golden());
+    expect(await svc.leiEntityStatusLoaded()).toBe(false);
+    vi.setSystemTime(at(1));
+
+    await loadGleifGoldenCopies(svc, signal());
+
+    expect((await svc.leiReadiness()).completedAt).toBe(at(1));
+    expect(await stamps()).toEqual([at(1)]);
+    expect(await svc.leiEntityStatusLoaded()).toBe(true);
+    const retired = await svc.getLeiEntity(A);
+    expect(retired).toMatchObject({ entityStatus: 'INACTIVE', entityStatusLoaded: true });
+    expect(retired?.successors).toEqual([{ lei: X }]);
+    expect((await svc.getLeiEntity(B))?.successors).toEqual([
+      { name: 'B SUCCESSOR KK' },
+      { lei: Y, name: 'Y HOLDINGS' },
+    ]);
+    const active = await svc.getLeiEntity(X);
+    expect(active).toMatchObject({ entityStatus: 'ACTIVE', entityStatusLoaded: true });
+    expect(active).not.toHaveProperty('successors');
+  });
+
+  // Level 1 loads whole before Level 2 fails or is aborted: its records carry the fields.
+  it.each(['fails', 'is aborted'] as const)('a load that %s stamps nothing', async (kind) => {
+    await seed(svc, { lei2: STARTS.LastDay, rr: STARTS.LastDay, repex: STARTS.LastDay });
+    const controller = new AbortController();
+    standIn.serve(golden(), {
+      '/files/rr-full.xml':
+        kind === 'fails'
+          ? rrCut()
+          : (res: ServerResponse) => {
+              res.writeHead(200, { 'content-type': 'application/xml' });
+              res.write(rrCut());
+              controller.abort();
+            },
+    });
+    vi.setSystemTime(at(1));
+
+    await expect(loadGleifGoldenCopies(svc, controller.signal)).rejects.toThrow();
+
+    expect(await stamps()).toEqual([]);
+    expect(await svc.leiEntityStatusLoaded()).toBe(false);
+    expect((await svc.leiReadiness()).completedAt).toBe(SEEDED_AS_OF);
+    expect(await svc.getLeiEntity(A)).toMatchObject({
+      legalName: 'A GOLDEN',
+      entityStatus: 'INACTIVE',
+      entityStatusLoaded: true,
+    });
+    // Absent from the golden copy, so still as the earlier release stored it.
+    const stale = await svc.getLeiEntity(C);
+    expect(stale).toMatchObject({ legalName: 'C OLD', entityStatusLoaded: false });
+    expect(stale).not.toHaveProperty('entityStatus');
+  });
+
+  it('a failed load leaves a recorded stamp as it was', async () => {
+    standIn.serve(golden());
+    vi.setSystemTime(at(1));
+    await loadGleifGoldenCopies(svc, signal());
+    standIn.serve(golden(), { '/files/rr-full.xml': rrCut() });
+    vi.setSystemTime(at(2));
+
+    await expect(loadGleifGoldenCopies(svc, signal())).rejects.toThrow();
+
+    expect(await stamps()).toEqual([at(1)]);
+    expect(await svc.leiEntityStatusLoaded()).toBe(true);
+  });
+
+  it('a delta over records an earlier release stored fills the fields only on the records it carries, and leaves the flag false', async () => {
+    const deltas = deltaFiles(
+      [
+        {
+          at: '2026-09-25T05:00:00Z',
+          dataset: 'lei2',
+          record: {
+            lei: A,
+            legalName: 'A RENAMED',
+            entityStatus: 'INACTIVE',
+            successors: [{ lei: X }],
+          },
+        },
+      ],
+      CONTENT_DATE,
+      STARTS,
+    );
+    standIn.serve({
+      ...publication(),
+      lei2: { full: leiFile({ contentDate: GOLDEN.lei2 }, []), deltas: deltas.lei2 },
+    });
+    await seed(svc, { lei2: STARTS.LastDay, rr: STARTS.LastDay, repex: STARTS.LastDay });
+    vi.setSystemTime(at(1));
+
+    const outcome = await refreshGleif(svc, signal(), { loadMissingExceptions: true });
+
+    expect(outcome.applied.lei2).toMatchObject({ source: 'LastDay', records: 1 });
+    expect((await svc.leiReadiness()).completedAt).toBe(at(1));
+    const carried = await svc.getLeiEntity(A);
+    expect(carried).toMatchObject({
+      legalName: 'A RENAMED',
+      entityStatus: 'INACTIVE',
+      entityStatusLoaded: true,
+    });
+    expect(carried?.successors).toEqual([{ lei: X }]);
+    const untouched = await svc.getLeiEntity(B);
+    expect(untouched).toMatchObject({ legalName: 'B OLD', entityStatusLoaded: false });
+    expect(untouched).not.toHaveProperty('entityStatus');
+    expect(untouched).not.toHaveProperty('successors');
+    expect(await stamps()).toEqual([]);
+    expect(await svc.leiEntityStatusLoaded()).toBe(false);
+  });
+
+  it('a refresh carries a recorded stamp to the state it commits', async () => {
+    standIn.serve(golden());
+    vi.setSystemTime(at(1));
+    await loadGleifGoldenCopies(svc, signal());
+    vi.setSystemTime(at(2));
+
+    await refreshGleif(svc, signal(), { loadMissingExceptions: true });
+
+    expect((await svc.leiReadiness()).completedAt).toBe(at(2));
+    expect(await stamps()).toEqual([at(2)]);
+    expect(await svc.leiEntityStatusLoaded()).toBe(true);
+  });
+
+  it("an earlier release's state write clears it, and the next refresh does not restore it", async () => {
+    standIn.serve(golden());
+    vi.setSystemTime(at(1));
+    await loadGleifGoldenCopies(svc, signal());
+    // What a release before #94 commits after its own refresh: the sync state alone.
+    vi.setSystemTime(at(2));
+    await svc.leiEntities.store.writeState({
+      status: 'complete',
+      completedAt: new Date().toISOString(),
+      total: 3,
+      checkpoint: JSON.stringify(GOLDEN),
+    });
+    expect(await svc.leiEntityStatusLoaded()).toBe(false);
+    vi.setSystemTime(at(3));
+
+    await refreshGleif(svc, signal(), { loadMissingExceptions: true });
+
+    expect((await svc.leiReadiness()).completedAt).toBe(at(3));
+    expect(await stamps()).toEqual([at(1)]);
+    expect(await svc.leiEntityStatusLoaded()).toBe(false);
   });
 });

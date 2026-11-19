@@ -78,6 +78,9 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
     program: 'EU-TEST-REGIME',
     designationDate: '2023-02-20',
     referenceNumber: 'EU.3003.30',
+    // Shared with eu:FX-9009, as the EU publishes KPi.045 on two designations: a
+    // lookup by it is ambiguous.
+    unReferenceNumber: 'QDi.939',
     payload: {
       aliases: [{ name: 'Katarina Example', nameType: 'aka' }],
       identifiers: [],
@@ -215,6 +218,7 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
     primaryName: 'Aurelio Ferdinand Castellanos',
     program: 'EU-TEST-REGIME',
     designationDate: '2023-07-19',
+    unReferenceNumber: 'QDi.939',
     payload: {
       aliases: [{ name: 'Ferdinand', nameType: 'low-quality-aka' }],
       identifiers: [],
@@ -240,6 +244,8 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
     primaryName: 'Van Der Berg Shipping',
     program: 'UK-TEST-SHIPPING',
     designationDate: '2024-04-02',
+    // The UN listing this UK designation implements, carried by it alone.
+    unReferenceNumber: 'QDe.110',
     payload: {
       aliases: [],
       identifiers: [],
@@ -254,8 +260,9 @@ export const FIXTURE_DESIGNATIONS: NormalizedDesignation[] = [
 /**
  * Invented GLEIF entities for resolution + tracing: a parent and a subsidiary; a
  * nominee company that reports no parent relationship, only exceptions, and a
- * retired sibling of it; and an entity whose Cyrillic legal name no Latin query
- * reaches, found only through its previous legal name and transliteration.
+ * retired, inactive sibling of it that names it as its successor; and an entity
+ * whose Cyrillic legal name no Latin query reaches, found only through its
+ * previous legal name and transliteration. Each carries its entity status.
  */
 export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
   {
@@ -265,6 +272,7 @@ export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
     alternateNames: [{ name: 'Fictional Trading Co', type: 'PREVIOUS_LEGAL_NAME' }],
     jurisdiction: 'US',
     status: 'ISSUED',
+    entityStatus: 'ACTIVE',
     legalAddress: '99 Commerce Way, Testopolis, US',
     headquartersAddress: '99 Commerce Way, Testopolis, US',
     registrationAuthorityId: 'RA000665',
@@ -278,6 +286,7 @@ export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
     alternateNames: [{ name: 'Testland Holdings', type: 'TRADING_OR_OPERATING_NAME' }],
     jurisdiction: 'GB',
     status: 'ISSUED',
+    entityStatus: 'ACTIVE',
     legalAddress: '1 Holding Square, London, GB',
     headquartersAddress: '1 Holding Square, London, GB',
     registrationAuthorityId: 'RA000585',
@@ -290,6 +299,7 @@ export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
     otherNames: [],
     jurisdiction: 'NG',
     status: 'LAPSED',
+    entityStatus: 'ACTIVE',
     lastUpdate: '2026-02-01T10:00:00Z',
   },
   {
@@ -298,6 +308,8 @@ export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
     otherNames: [],
     jurisdiction: 'NG',
     status: 'RETIRED',
+    entityStatus: 'INACTIVE',
+    successors: [{ lei: '254900SPRNGTRUST0028' }],
     lastUpdate: '2026-02-01T10:00:00Z',
   },
   {
@@ -310,6 +322,7 @@ export const FIXTURE_LEI_ENTITIES: NormalizedLeiEntity[] = [
     ],
     jurisdiction: 'RU',
     status: 'ISSUED',
+    entityStatus: 'ACTIVE',
     lastUpdate: '2026-02-01T10:00:00Z',
   },
 ];

@@ -23,7 +23,18 @@ export interface TypedName {
   type: string;
 }
 
+/** A `SuccessorEntity`: its `SuccessorLEI`, its `SuccessorEntityName`, or both. */
+export interface SuccessorRecord {
+  lei?: string;
+  name?: string;
+}
+
 export interface EntityRecord {
+  /**
+   * `EntityStatus`; `ACTIVE` when omitted, since GLEIF publishes one on every
+   * record. `null` writes no element.
+   */
+  entityStatus?: string | null;
   /** `LegalJurisdiction`; `GB` when omitted. */
   jurisdiction?: string;
   legalName: string;
@@ -32,6 +43,8 @@ export interface EntityRecord {
   otherNames?: readonly TypedName[];
   /** `RegistrationStatus`; `ISSUED` when omitted. */
   status?: string;
+  /** Each `SuccessorEntity`, in document order. */
+  successors?: readonly SuccessorRecord[];
   /** `TransliteratedOtherEntityNames`, in document order. */
   transliteratedNames?: readonly TypedName[];
 }
@@ -42,6 +55,18 @@ const nameList = (container: string, element: string, names?: readonly TypedName
         .map((n) => `<lei:${element} xml:lang="en" type="${n.type}">${n.name}</lei:${element}>`)
         .join('')}</lei:${container}>`
     : '';
+
+/** `EntityStatus` then each `SuccessorEntity`, where LEI-CDF places them after `LegalJurisdiction`. */
+const entityState = (r: EntityRecord) =>
+  (r.entityStatus === null
+    ? ''
+    : `<lei:EntityStatus>${r.entityStatus ?? 'ACTIVE'}</lei:EntityStatus>`) +
+  (r.successors ?? [])
+    .map(
+      (s) =>
+        `<lei:SuccessorEntity>${s.lei ? `<lei:SuccessorLEI>${s.lei}</lei:SuccessorLEI>` : ''}${s.name ? `<lei:SuccessorEntityName xml:lang="en">${s.name}</lei:SuccessorEntityName>` : ''}</lei:SuccessorEntity>`,
+    )
+    .join('');
 
 export interface RelationshipRecord {
   childLei: string;
@@ -79,7 +104,7 @@ export function leiFile(header: FileHeader, records: readonly EntityRecord[]): s
       (r) =>
         `<lei:LEIRecord xmlns:lei="http://www.gleif.org/data/schema/leidata/2016" xmlns:gleif="http://www.gleif.org/data/schema/golden-copy/extensions/1.0">
    <lei:LEI>${r.lei}</lei:LEI>
-   <lei:Entity><lei:LegalName xml:lang="en">${r.legalName}</lei:LegalName>${nameList('OtherEntityNames', 'OtherEntityName', r.otherNames)}${nameList('TransliteratedOtherEntityNames', 'TransliteratedOtherEntityName', r.transliteratedNames)}<lei:LegalJurisdiction>${r.jurisdiction ?? 'GB'}</lei:LegalJurisdiction></lei:Entity>
+   <lei:Entity><lei:LegalName xml:lang="en">${r.legalName}</lei:LegalName>${nameList('OtherEntityNames', 'OtherEntityName', r.otherNames)}${nameList('TransliteratedOtherEntityNames', 'TransliteratedOtherEntityName', r.transliteratedNames)}<lei:LegalJurisdiction>${r.jurisdiction ?? 'GB'}</lei:LegalJurisdiction>${entityState(r)}</lei:Entity>
    <lei:Registration><lei:RegistrationStatus>${r.status ?? 'ISSUED'}</lei:RegistrationStatus></lei:Registration>
    <lei:Extension><gleif:conformity><gleif:conformityflag>CONFORMING</gleif:conformityflag></gleif:conformity></lei:Extension>
 </lei:LEIRecord>`,

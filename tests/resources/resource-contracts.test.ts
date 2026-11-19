@@ -11,13 +11,14 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import type { ErrorContract } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SOURCE_URLS, resetServerConfig } from '@/config/server-config.js';
 import { designationResource } from '@/mcp-server/resources/definitions/designation.resource.js';
 import { entityResource } from '@/mcp-server/resources/definitions/entity.resource.js';
 import { sourcesResource } from '@/mcp-server/resources/definitions/sources.resource.js';
 import { SOURCE_LICENSES, sourceUrls } from '@/mcp-server/tools/definitions/_shared.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
+import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
 import {
   FIXTURE_DESIGNATIONS,
@@ -29,9 +30,12 @@ import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 import {
   emptyGlobalService,
+  holdRebuild,
+  restartGlobalService,
   type SeededService,
   seededGlobalService,
 } from '../services/_helpers.js';
+import { serveLookupCorpus } from '../services/_lookup-corpus.js';
 
 const ctxFor = <const E extends readonly ErrorContract[] | undefined>(errors: E) =>
   createMockContext({ errors });
@@ -49,6 +53,7 @@ const SourcesPayload = z.object({
   leiAsOf: z.string().optional(),
   reportingExceptionsLoaded: z.boolean(),
   alternateNamesIndexed: z.boolean(),
+  entityStatusLoaded: z.boolean(),
   sources: z.array(z.looseObject({ code: z.string() })),
 });
 
@@ -100,6 +105,83 @@ async function namesUnindexedService(): Promise<SeededService> {
     ...(checkpoint ? { checkpoint } : {}),
   });
   return state;
+}
+
+/**
+ * A sanctions mirror the lookup corpus initialized, then — with `fail` —
+ * refreshed with one list's URL answering 404, or the run aborted when that URL
+ * is requested (#88).
+ */
+async function refreshedService(fail?: { url: string; abort?: boolean }): Promise<SeededService> {
+  const state = await emptyGlobalService();
+  const sync = async (mode: 'init' | 'refresh') => {
+    serveLookupCorpus();
+    const served = globalThis.fetch;
+    const controller = new AbortController();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (mode === 'init' || url !== fail?.url) return served(input, init);
+        if (fail.abort) {
+          controller.abort();
+          init?.signal?.throwIfAborted();
+        }
+        return new Response('not found', { status: 404 });
+      }),
+    );
+    try {
+      return await state.service.syncSanctions(mode, controller.signal).then(
+        () => undefined,
+        (err: Error) => err,
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  };
+  expect(await sync('init')).toBeUndefined();
+  if (fail) expect(await sync('refresh')).toBeDefined();
+  return state;
+}
+
+/**
+ * A refreshed mirror whose sync state reads as `status`, for a run no outcome was
+ * recorded under, as this release's server opens it on a restart.
+ */
+async function rewrittenRefreshService(status: 'in_progress' | 'error'): Promise<SeededService> {
+  const state = await refreshedService();
+  const current = await state.service.designations.store.readState();
+  await state.service.designations.store.writeState({
+    ...current,
+    status,
+    mode: 'refresh',
+    startedAt: '2099-01-01T00:00:00.000Z',
+    ...(status === 'error' ? { error: 'Sanctions harvest failed for uk (1 of 11 sources)' } : {}),
+  });
+  return restartGlobalService(state);
+}
+
+/**
+ * A refreshed mirror whose next refresh, in which every list harvests, has written
+ * its final sync state and is held before its index rebuild. Cleanup lets it finish.
+ */
+async function finishingRefreshService(): Promise<SeededService> {
+  const state = await refreshedService();
+  serveLookupCorpus();
+  const { held, release } = holdRebuild(state.service);
+  const run = state.service.syncSanctions('refresh', new AbortController().signal);
+  await held;
+  expect((await state.service.designations.store.readState()).status).toBe('complete');
+  return {
+    service: state.service,
+    cleanup: async () => {
+      release();
+      await run;
+      vi.unstubAllGlobals();
+      await state.cleanup();
+    },
+  };
 }
 
 /** Every text block of a full tool result. */
@@ -242,6 +324,47 @@ describe('sanctions://designation/{source}/{entryId} readiness gate', () => {
   });
 });
 
+describe('sanctions://designation/{source}/{entryId} UN reference numbers (issue #89)', () => {
+  const read = async (source: string, entryId: string) =>
+    JSON.parse(
+      JSON.stringify(
+        await designationResource.handler(
+          parseParams(designationResource, { source, entryId }),
+          ctxFor(designationResource.errors),
+        ),
+      ),
+    ) as Record<string, unknown>;
+
+  it('carries the UN reference sanctions_get_designation returns, and resolves by it', async () => {
+    global = await seededGlobalService();
+    const payload = await read('uk', ' QDE.110 ');
+    const tool = await getDesignationTool.handler(
+      getDesignationTool.input.parse({ source: 'uk', entryId: 'FX-1010' }),
+      ctxFor(getDesignationTool.errors),
+    );
+    expect(payload).toMatchObject({ sourceEntryId: 'FX-1010', unReferenceNumber: 'QDe.110' });
+    expect(tool.unReferenceNumber).toBe(payload.unReferenceNumber);
+  });
+
+  it('omits it on the wire for a designation that carries none', async () => {
+    global = await seededGlobalService();
+    const payload = await read('uk', 'FX-4004');
+    expect(payload).toMatchObject({ sourceEntryId: 'FX-4004' });
+    expect(payload).not.toHaveProperty('unReferenceNumber');
+  });
+
+  it('fails reference_ambiguous on a UN reference two designations carry, naming both', async () => {
+    global = await seededGlobalService();
+    const error = await read('eu', 'qdi.939').catch((e: unknown) => e);
+    expect(error).toMatchObject({
+      data: { reason: 'reference_ambiguous', sourceEntryIds: ['FX-3003', 'FX-9009'] },
+    });
+    expect((error as Error).message).toBe(
+      'UN reference number "qdi.939" is carried by 2 eu designations: FX-3003, FX-9009.',
+    );
+  });
+});
+
 describe('sanctions://designation/{source}/{entryId} percent-encoded entry IDs (#44)', () => {
   it.each(['%46X-1001', 'FX%2D1001', '%46%58%2D%31%30%30%31'])(
     'decodes %j once before the lookup',
@@ -344,7 +467,33 @@ describe('sanctions://entity/{lei} readiness gate', () => {
       parseParams(entityResource, { lei: '5493001KJTIIGC8Y1R12' }),
       ctxFor(entityResource.errors),
     );
-    expect(payload).toEqual(FIXTURE_LEI_ENTITIES[0]);
+    expect(payload).toEqual({ ...FIXTURE_LEI_ENTITIES[0], entityStatusLoaded: true });
+  });
+
+  it("serves sanctions_get_entity's entity payload, entity status and successors included (#94)", async () => {
+    global = await seededGlobalService();
+    const lei = '254900SPRNGRETIRD042';
+    const payload = await entityResource.handler(
+      parseParams(entityResource, { lei }),
+      ctxFor(entityResource.errors),
+    );
+    expect(payload).toMatchObject({
+      lei,
+      status: 'RETIRED',
+      entityStatus: 'INACTIVE',
+      successors: [{ lei: '254900SPRNGTRUST0028' }],
+      entityStatusLoaded: true,
+    });
+    const tool = await runToolContract(getEntityTool, { lei });
+    // The tool adds the cross-reference; the rest is the resource's record.
+    const {
+      sanctionsHits: _hits,
+      sanctionsScreen: _screen,
+      screeningStatus: _status,
+      caveat: _caveat,
+      ...entity
+    } = tool.structuredContent as Record<string, unknown>;
+    expect(entity).toStrictEqual(payload);
   });
 
   it('declares the readiness, not-found, and checksum reasons in its error contract', () => {
@@ -374,6 +523,56 @@ describe('sanctions://sources provenance parity', () => {
         createMockContext(),
       );
       // The whole payload, not a field list: a key one surface adds or drops fails here.
+      expect(payload).toStrictEqual(tool.structuredContent);
+    },
+  );
+
+  it.each([
+    ['refreshed by this release', () => refreshedService(), undefined, undefined],
+    ['running a refresh', () => rewrittenRefreshService('in_progress'), 'in_progress', undefined],
+    [
+      'finishing a refresh whose index rebuild has not committed',
+      finishingRefreshService,
+      'in_progress',
+      undefined,
+    ],
+    [
+      'after a refresh in which one list failed',
+      () => refreshedService({ url: DEFAULT_SOURCE_URLS.ukSanctions }),
+      'error',
+      ['uk'],
+    ],
+    [
+      'after a refresh stopped with no list failed',
+      () => refreshedService({ url: DEFAULT_SOURCE_URLS.euFsf, abort: true }),
+      'error',
+      [],
+    ],
+    [
+      'after a failed refresh no outcome was recorded under',
+      () => rewrittenRefreshService('error'),
+      'error',
+      undefined,
+    ],
+  ] as const)(
+    'serves the sanctions_list_sources structuredContent unchanged on a mirror %s (#88)',
+    async (_state, build, status, failedSources) => {
+      global = await build();
+      const tool = await runToolContract(listSourcesTool, {});
+      expect(tool.isError).toBeFalsy();
+      const structured = tool.structuredContent as {
+        lastRefresh?: { failedSources?: string[]; status: string };
+        sources: { lastHarvestedAt?: string }[];
+      };
+      // The state under test is the one the payload reports.
+      expect(structured.lastRefresh?.status).toBe(status);
+      expect(structured.lastRefresh?.failedSources).toStrictEqual(failedSources);
+      expect(structured.sources.some((source) => source.lastHarvestedAt)).toBe(true);
+
+      const payload = await sourcesResource.handler(
+        parseParams(sourcesResource, {}),
+        createMockContext(),
+      );
       expect(payload).toStrictEqual(tool.structuredContent);
     },
   );
@@ -462,6 +661,54 @@ describe('sanctions://sources provenance parity', () => {
       '**GLEIF alternate-name index:** none yet — the GLEIF mirror has never completed a load. mirror:init loads the golden copy and builds the index with it.',
     );
     expect(text).not.toContain('**GLEIF alternate-name index:** built');
+  });
+
+  it.each([
+    ['seeded', seededGlobalService, true],
+    ['GLEIF-only (loaded without a recorded golden copy)', gleifOnlyService, false],
+    ['earlier-release-rewritten', namesUnindexedService, false],
+    ['unsynced', emptyGlobalService, false],
+  ] as const)(
+    'reports entity status as loaded only after a recorded full load, on a %s mirror (#94)',
+    async (_state, build, loaded) => {
+      global = await build();
+      const result = await runToolContract(listSourcesTool, {});
+      expect(result.structuredContent).toMatchObject({ entityStatusLoaded: loaded });
+    },
+  );
+
+  it('carries the recorded entity-status load across a later commit, and an earlier release clears it (#94)', async () => {
+    global = await seededGlobalService();
+    // Each commit stamps its own completedAt, so each gets a distinct clock reading.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      // A refresh commit: no option, so the stamp is carried because it matched.
+      vi.setSystemTime(new Date('2027-01-01T00:00:00.000Z'));
+      await global.service.markLeiReady(FIXTURE_LEI_ENTITIES.length);
+      expect(await global.service.leiEntityStatusLoaded()).toBe(true);
+      expect(contentText(await runToolContract(listSourcesTool, {}))).toContain(
+        '**GLEIF entity status and successors:** loaded for every entity in the last full GLEIF load\n',
+      );
+
+      // An earlier release's commit moves completedAt without re-stamping.
+      const { checkpoint } = await global.service.leiEntities.store.readState();
+      await global.service.leiEntities.store.writeState({
+        status: 'complete',
+        completedAt: '2027-01-02T00:00:00.000Z',
+        total: FIXTURE_LEI_ENTITIES.length,
+        ...(checkpoint ? { checkpoint } : {}),
+      });
+      expect(await global.service.leiEntityStatusLoaded()).toBe(false);
+      // Once dropped, a later commit without a full load does not bring it back.
+      vi.setSystemTime(new Date('2027-01-03T00:00:00.000Z'));
+      await global.service.markLeiReady(FIXTURE_LEI_ENTITIES.length);
+      expect(await global.service.leiEntityStatusLoaded()).toBe(false);
+      expect(contentText(await runToolContract(listSourcesTool, {}))).toContain(
+        '**GLEIF entity status and successors:** not loaded for every entity',
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([

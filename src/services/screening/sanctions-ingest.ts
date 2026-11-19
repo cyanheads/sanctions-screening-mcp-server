@@ -46,10 +46,11 @@ import {
   componentText,
   createRejections,
   type IngestRejections,
+  isoDocumentDate,
   isUsableName,
 } from '@/services/screening/ingest-validation.js';
 import { fetchSourceDownload } from '@/services/screening/source-fetch.js';
-import { fold } from '@/services/screening/text-matching.js';
+import { fold, hasOtherScriptLetter } from '@/services/screening/text-matching.js';
 import type {
   AddressRecord,
   DobRecord,
@@ -65,6 +66,7 @@ import {
   decodeUtf8Stream,
   requireCompleteDocument,
   scanRecordFragments,
+  startTagAttribute,
 } from '@/services/screening/xml-stream.js';
 
 /**
@@ -82,10 +84,16 @@ export interface DeferredColumns {
   program?: string;
 }
 
-/** What one source's harvest accepted and dropped. */
+/** What one source's harvest accepted and dropped, and the date its document carried. */
 export interface SourceHarvestReport {
   /** Normalized designations the harvest emitted. */
   accepted: number;
+  /**
+   * The publisher's date on the document the harvest read, as {@link
+   * isoDocumentDate} keeps it; absent when the document carried none that reads
+   * as ISO 8601.
+   */
+  publishedAt?: string;
   /** Records dropped during the harvest, by reason. */
   rejected: IngestRejections;
   source: SourceCode;
@@ -283,6 +291,7 @@ function openSourceTextStream(
   url: string,
   signal: AbortSignal,
   source: string,
+  onRootStartTag?: (startTag: string) => void,
 ): Promise<AsyncIterable<string>> {
   const reqCtx = requestContextService.createRequestContext({ operation: `harvest:${source}` });
   return withRetry(
@@ -315,7 +324,11 @@ function openSourceTextStream(
       if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(head)) {
         throw serviceUnavailable(`${source} returned HTML instead of XML — likely rate-limited.`);
       }
-      return requireCompleteDocument(replayTextStream(head, iterator, drained), source);
+      return requireCompleteDocument(
+        replayTextStream(head, iterator, drained),
+        source,
+        onRootStartTag,
+      );
     },
     { operation: `harvest:${source}`, baseDelayMs: 2000, signal },
   );
@@ -338,15 +351,22 @@ async function* replayTextStream(
 // ─── Streaming spine ───────────────────────────────────────────────────────────
 
 /**
- * Accounting a streaming harvest fills in as it runs — the two things a record
- * stream cannot express as yielded records: what it dropped, and the columns the
- * source published after the records they belong to.
+ * Accounting a streaming harvest fills in as it runs — what a record stream
+ * cannot express as yielded records: what it dropped, the columns the source
+ * published after the records they belong to, and the document's own date.
  */
 export interface HarvestState {
   /** Columns to apply once the source's rows have landed. Only OFAC fills this. */
   deferredFields: Map<string, DeferredColumns>;
   /** A record has been yielded whose {@link deferredFields} arrive after it. */
   defersFields: boolean;
+  /**
+   * The publisher's date on the document, read from its header element (OFAC
+   * `DateOfIssue`, UK `DateGenerated`) or root attribute (EU `generationDate`, UN
+   * `dateGenerated`) as {@link isoDocumentDate} keeps it; unset when the document
+   * carries none that reads.
+   */
+  publishedAt?: string;
   rejections: IngestRejections;
 }
 
@@ -358,9 +378,10 @@ export function createHarvestState(): HarvestState {
 /**
  * Scan a text stream for the named record elements and normalize each in turn —
  * the spine of every source whose payload is a flat repeating sequence (EU
- * `<sanctionEntity>`, UK `<Designation>`, UN `<INDIVIDUAL>`/`<ENTITY>`). OFAC
- * needs {@link streamOfacFromText} instead, for its reference-set head and its
- * deferred programme tail.
+ * `<sanctionEntity>`, UN `<INDIVIDUAL>`/`<ENTITY>`). OFAC needs {@link
+ * streamOfacFromText} instead, for its reference-set head and its deferred
+ * programme tail, and the UK {@link streamUkFromText}, for its text-only date
+ * header.
  */
 async function* streamFlatRecords(
   textChunks: AsyncIterable<string>,
@@ -376,6 +397,12 @@ async function* streamFlatRecords(
 
 /** How to reach one source and normalize its stream. */
 interface StreamingSourceSpec {
+  /**
+   * The root attribute that carries the document's own date (EU `generationDate`,
+   * UN `dateGenerated`). A source that dates its document in a header element
+   * reads it in its {@link stream} instead.
+   */
+  rootDateAttribute?: string;
   source: SourceCode;
   stream(
     textChunks: AsyncIterable<string>,
@@ -393,17 +420,30 @@ interface StreamingSourceSpec {
 function buildStreamingIngester(spec: StreamingSourceSpec): SanctionsIngester {
   let state = createHarvestState();
   let accepted = 0;
+  const { rootDateAttribute } = spec;
 
   return {
     source: spec.source,
     url: spec.url,
     deferredFields: () => state.deferredFields,
     defersFields: () => state.defersFields,
-    report: () => ({ source: spec.source, accepted, rejected: state.rejections }),
+    report: () => ({
+      source: spec.source,
+      accepted,
+      rejected: state.rejections,
+      ...opt('publishedAt', state.publishedAt),
+    }),
     async *harvest(signal) {
-      state = createHarvestState();
+      const run = createHarvestState();
+      state = run;
       accepted = 0;
-      const text = await openSourceTextStream(spec.url(), signal, spec.source);
+      const readRootDate = rootDateAttribute
+        ? (startTag: string) => {
+            const publishedAt = isoDocumentDate(startTagAttribute(startTag, rootDateAttribute));
+            if (publishedAt) run.publishedAt = publishedAt;
+          }
+        : undefined;
+      const text = await openSourceTextStream(spec.url(), signal, spec.source, readRootDate);
       for await (const designation of spec.stream(text, state)) {
         accepted += 1;
         yield designation;
@@ -416,6 +456,7 @@ function buildStreamingIngester(spec: StreamingSourceSpec): SanctionsIngester {
 
 /**
  * Record elements the OFAC scanner lifts out, covering both published schemas.
+ * `<DateOfIssue>` (the advanced document's first element, once) dates the file;
  * `<ReferenceValueSets>` (the head of an advanced document) resolves the numeric
  * type ids every party carries; `<Location>` and `<IDRegDocument>` (the two
  * blocks between the head and the parties) are what a party's addresses,
@@ -423,6 +464,7 @@ function buildStreamingIngester(spec: StreamingSourceSpec): SanctionsIngester {
  * supplies the deferred programme fields.
  */
 const OFAC_RECORD_TAGS = [
+  'DateOfIssue',
   'ReferenceValueSets',
   'Location',
   'IDRegDocument',
@@ -462,6 +504,11 @@ export async function* streamOfacFromText(
   for await (const fragment of scanRecordFragments(textChunks, OFAC_RECORD_TAGS)) {
     const body = recordBody(parseXml<Record<string, unknown>>(fragment.xml), fragment.name);
     switch (fragment.name) {
+      case 'DateOfIssue': {
+        const publishedAt = ofacDateOfIssue(body);
+        if (publishedAt) state.publishedAt = publishedAt;
+        continue;
+      }
       case 'ReferenceValueSets':
         refs = buildOfacReferenceSets(body);
         continue;
@@ -492,6 +539,19 @@ export async function* streamOfacFromText(
     state.defersFields = true;
     yield record;
   }
+}
+
+/**
+ * An advanced document's `<DateOfIssue>` — `Year`, `Month`, and `Day` children,
+ * unpadded (`<Day>4</Day>`) — as an ISO 8601 date at the precision it carries.
+ */
+function ofacDateOfIssue(body: Record<string, unknown>): string | undefined {
+  const year = asText(body.Year);
+  const month = asText(body.Month);
+  const day = month && asText(body.Day);
+  return isoDocumentDate(
+    [year, month?.padStart(2, '0'), day?.padStart(2, '0')].filter(Boolean).join('-'),
+  );
 }
 
 function buildOfacIngester(
@@ -1521,6 +1581,7 @@ function buildEuIngester(): SanctionsIngester {
     source: 'eu',
     url: () => getServerConfig().euFsfUrl,
     stream: streamEuFromText,
+    rootDateAttribute: 'generationDate',
   });
 }
 
@@ -1535,8 +1596,9 @@ export function parseEu(
 }
 
 /**
- * Normalize one EU `<sanctionEntity>`. Null when the entity carries neither a
- * `logicalId` nor an `euReferenceNumber`, or no usable name.
+ * Normalize one EU `<sanctionEntity>`: the {@link euPrimaryAlias} names it, and
+ * every other alias follows in document order. Null when the entity carries
+ * neither a `logicalId` nor an `euReferenceNumber`, or no usable name.
  */
 function parseEuEntity(
   e: Record<string, unknown>,
@@ -1549,22 +1611,24 @@ function parseEuEntity(
   }
   const subjectType = (e.subjectType as Record<string, unknown> | undefined)?.['@_code'];
   const nameAliases = asArray(e.nameAlias as unknown)
-    .map((n) => {
+    .map((n): EuNameAlias => {
       const na = n as Record<string, unknown>;
       const whole = asText(na['@_wholeName']);
-      const strong = asText(na['@_strong']);
       return {
         name:
           whole ?? [asText(na['@_firstName']), asText(na['@_lastName'])].filter(Boolean).join(' '),
-        strong: strong !== 'false',
+        strong: asText(na['@_strong']) !== 'false',
+        language: asText(na['@_nameLanguage']),
+        hasFunction: asText(na['@_function']) !== undefined,
       };
     })
     .filter((n) => isUsableName(n.name));
-  const primary = nameAliases[0]?.name;
-  if (!primary) {
+  const [first] = nameAliases;
+  if (!first) {
     rejections.unusableName += 1;
     return null;
   }
+  const primary = euPrimaryAlias(first, nameAliases);
   const citizenships = asArray(e.citizenship as unknown).flatMap((c) => {
     const country = euText(c, 'countryDescription');
     return country ? [country] : [];
@@ -1575,7 +1639,7 @@ function parseEuEntity(
     source: 'eu',
     sourceEntryId: id,
     entityType: mapEuType(asText(subjectType)),
-    primaryName: primary,
+    primaryName: primary.name,
     ...opt(
       'program',
       asText((e.regulation as Record<string, unknown> | undefined)?.['@_programme']),
@@ -1593,11 +1657,15 @@ function parseEuEntity(
     // date is not when the entry was designated.
     ...opt('designationDate', asText(e['@_designationDate'])),
     ...opt('referenceNumber', asText(e['@_euReferenceNumber'])),
+    // Published on every entity, empty on most (`unitedNationId=""`).
+    ...opt('unReferenceNumber', componentText(e['@_unitedNationId'])),
     payload: {
-      aliases: nameAliases.slice(1).map((n) => ({
-        name: n.name,
-        nameType: (n.strong ? 'aka' : 'low-quality-aka') as NameRecord['nameType'],
-      })),
+      aliases: nameAliases
+        .filter((n) => n !== primary)
+        .map((n) => ({
+          name: n.name,
+          nameType: (n.strong ? 'aka' : 'low-quality-aka') as NameRecord['nameType'],
+        })),
       identifiers: dedupe(asArray(e.identification as unknown).flatMap(euIdentifier)),
       addresses: dedupe(asArray(e.address as unknown).flatMap(euAddress)),
       datesOfBirth: dedupe(asArray(e.birthdate as unknown).flatMap(euBirth)),
@@ -1605,6 +1673,48 @@ function parseEuEntity(
       features: [],
     },
   };
+}
+
+/** One usable EU `<nameAlias>`, with what {@link euPrimaryAlias} reads from it. */
+interface EuNameAlias {
+  /** The alias carries a `function`, which the list writes on the designee's main entry. */
+  hasFunction: boolean;
+  /** The `nameLanguage` tag. A tag, not a script: `EN` also marks Cyrillic text. */
+  language: string | undefined;
+  name: string;
+  strong: boolean;
+}
+
+/** A letter of the Latin script. */
+const LATIN_LETTER = /[^\P{L}\P{Script=Latin}]/u;
+
+/** A name written in the Latin script: some Latin letter, and no letter of another script. */
+function isLatinScript(name: string): boolean {
+  return LATIN_LETTER.test(name) && !hasOtherScriptLetter(name);
+}
+
+/**
+ * The alias that names an EU entity. The file publishes no primary name, only
+ * aliases in whichever languages it translates them into, so the first is
+ * often Greek, Cyrillic, or a Swedish spelling. The main entry is the first
+ * Latin-script alias carrying a `function`. With none, an entity whose first
+ * alias is written in another script is named by its first Latin-script `EN`
+ * alias, else its first untagged one, else its first Latin-script alias; an
+ * `EN` alias never outranks a Latin first alias, since the list also tags
+ * nicknames and acronyms `EN` (`Pharaoh`, `IG`). Otherwise the first alias
+ * stands, as it does when no alias is in Latin script.
+ */
+function euPrimaryAlias(first: EuNameAlias, aliases: readonly EuNameAlias[]): EuNameAlias {
+  const latin = aliases.filter((a) => isLatinScript(a.name));
+  const withFunction = latin.find((a) => a.hasFunction);
+  if (withFunction) return withFunction;
+  if (!hasOtherScriptLetter(first.name)) return first;
+  return (
+    latin.find((a) => a.language === 'EN') ??
+    latin.find((a) => a.language === undefined) ??
+    latin[0] ??
+    first
+  );
 }
 
 /**
@@ -1660,16 +1770,48 @@ function mapEuType(code: string | undefined): EntityType {
   return 'unknown';
 }
 
+/**
+ * The names a record publishes in their native script at `path` below `node` (UK
+ * `NonLatinNames/NonLatinName/NameNonLatinScript`, UN `NAME_ORIGINAL_SCRIPT`), as
+ * published but trimmed, each typed `nameType`. An empty element, or one a lossy
+ * decode left U+FFFD in, adds none. They follow the record's other names, so a
+ * name both blocks spell alike stays matched on the earlier one.
+ */
+function nativeScriptNames(
+  node: unknown,
+  nameType: NameRecord['nameType'],
+  ...path: string[]
+): NameRecord[] {
+  return elementsAt(node, ...path)
+    .map(asText)
+    .filter(isUsableName)
+    .map((name) => ({ name, nameType }));
+}
+
 // ─── UK Sanctions List (UKSL, FCDO) ─────────────────────────────────────────────
 
-/** Normalize a decoded UK text stream. Shares {@link parseUkDesignation} with {@link parseUk}. */
-export function streamUkFromText(
+/**
+ * Normalize a decoded UK text stream. Shares {@link parseUkDesignation} with
+ * {@link parseUk}. The list dates itself in `<DateGenerated>` (`DD/MM/YYYY`, once,
+ * before the first designation), a text-only element that has no record body,
+ * so it is read from its parsed fragment directly.
+ */
+export async function* streamUkFromText(
   textChunks: AsyncIterable<string>,
   state: HarvestState,
 ): AsyncGenerator<NormalizedDesignation> {
-  return streamFlatRecords(textChunks, ['Designation', 'designation'], (record) =>
-    parseUkDesignation(record, state.rejections),
-  );
+  const tags = ['DateGenerated', 'Designation', 'designation'];
+  for await (const fragment of scanRecordFragments(textChunks, tags)) {
+    const doc = parseXml<Record<string, unknown>>(fragment.xml);
+    if (fragment.name === 'DateGenerated') {
+      const generated = asText(doc.DateGenerated);
+      const publishedAt = generated && isoDocumentDate(ukDate(generated));
+      if (publishedAt) state.publishedAt = publishedAt;
+      continue;
+    }
+    const record = parseUkDesignation(recordBody(doc, fragment.name), state.rejections);
+    if (record) yield record;
+  }
 }
 
 function buildUkIngester(): SanctionsIngester {
@@ -1763,11 +1905,16 @@ function parseUkDesignation(
     // The legacy OFSI Group ID. The UK list issues none for a designation made
     // after 28 Jan 2026, and one Group ID can cover two designations.
     ...opt('referenceNumber', asText(d.OFSIGroupID)),
+    ...opt('unReferenceNumber', componentText(d.UNReferenceNumber)),
     payload: {
-      aliases: allNames.slice(1).map((n) => ({
-        name: n.name,
-        nameType: 'aka' as NameRecord['nameType'],
-      })),
+      aliases: [
+        ...allNames.slice(1).map((n) => ({
+          name: n.name,
+          nameType: 'aka' as NameRecord['nameType'],
+        })),
+        // The list does not say which name each one renders, so none is typed primary.
+        ...nativeScriptNames(d, 'aka', 'NonLatinNames', 'NonLatinName', 'NameNonLatinScript'),
+      ],
       identifiers: dedupe([
         ...ukIdentifiers('Passport', individuals, 'PassportDetails', 'Passport', 'PassportNumber'),
         ...ukIdentifiers(
@@ -1818,10 +1965,29 @@ function parseUkDesignation(
         }),
       ),
       nationalities: dedupe(textsAt(individuals, 'Nationalities', 'Nationality')),
-      features: dedupe(ukShipFeatures(d)),
+      // Document order: the list publishes both elements ahead of `ShipDetails`.
+      features: dedupe([
+        ...ukListFeatures(d, 'DesignationSource'),
+        ...ukListFeatures(d, 'SanctionsImposed'),
+        ...ukShipFeatures(d),
+      ]),
       ...opt('remarks', asText(d.OtherInformation)),
     },
   };
+}
+
+/**
+ * One feature per part of a UK element the list publishes as one `|`-separated
+ * list (`Asset freeze|Travel Ban`, `UK|UN`), typed by the element name, trimmed,
+ * in published order. For `SanctionsImposed` the string is the source, never
+ * `SanctionsImposedIndicators`: every indicator is false on a shipping or trade
+ * sanction, and no indicator names several of the published measures.
+ */
+function ukListFeatures(d: Record<string, unknown>, element: string): FeatureRecord[] {
+  return textsAt(d, element)
+    .flatMap((list) => list.split('|').map(componentText))
+    .filter((value): value is string => Boolean(value))
+    .map((value) => ({ type: element, value }));
 }
 
 /**
@@ -1901,6 +2067,7 @@ function buildUnIngester(): SanctionsIngester {
     source: 'un',
     url: () => getServerConfig().unScUrl,
     stream: streamUnFromText,
+    rootDateAttribute: 'dateGenerated',
   });
 }
 
@@ -1947,16 +2114,21 @@ function parseUnEntry(
     return null;
   }
 
-  const aliases: NameRecord[] = asArray(e.INDIVIDUAL_ALIAS ?? e.ENTITY_ALIAS)
-    .map((a) => {
-      const al = a as Record<string, unknown>;
-      const quality = asText(al.QUALITY)?.toLowerCase();
-      return {
-        name: asText(al.ALIAS_NAME) ?? '',
-        nameType: (quality === 'low' ? 'low-quality-aka' : 'aka') as NameRecord['nameType'],
-      };
-    })
-    .filter((a) => isUsableName(a.name));
+  const aliases: NameRecord[] = [
+    ...asArray(e.INDIVIDUAL_ALIAS ?? e.ENTITY_ALIAS)
+      .map((a) => {
+        const al = a as Record<string, unknown>;
+        const quality = asText(al.QUALITY)?.toLowerCase();
+        return {
+          name: asText(al.ALIAS_NAME) ?? '',
+          nameType: (quality === 'low' ? 'low-quality-aka' : 'aka') as NameRecord['nameType'],
+        };
+      })
+      .filter((a) => isUsableName(a.name)),
+    // The primary name in the script it was published in: typed as OFAC types its
+    // native-script rendering of a primary name.
+    ...nativeScriptNames(e, 'primary', 'NAME_ORIGINAL_SCRIPT'),
+  ];
 
   // A BETWEEN date publishes only its year range; it renders as an ISO 8601
   // interval (`1973/1974`). TYPE_OF_DATE APPROXIMATELY flags the date circa.
@@ -2273,6 +2445,7 @@ export function toDesignationRow(d: NormalizedDesignation): Record<string, strin
     legal_basis: d.legalBasis ?? null,
     designation_date: d.designationDate ?? null,
     reference_number: d.referenceNumber ?? null,
+    un_reference_number: d.unReferenceNumber ?? null,
     payload: JSON.stringify(d.payload),
   };
 }

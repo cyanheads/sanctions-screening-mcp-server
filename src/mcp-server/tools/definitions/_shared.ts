@@ -100,15 +100,19 @@ export type SourcesPayload = z.infer<typeof SourcesPayloadSchema>;
 /**
  * Build the whole sources payload: one row per sanctions list, then the GLEIF
  * row, plus each mirror's readiness and freshness, whether GLEIF reporting
- * exceptions are loaded, and whether the GLEIF alternate-name index is built.
- * Every URL is the configured one, reported as is.
+ * exceptions are loaded, whether the GLEIF alternate-name index is built, and
+ * whether the last full GLEIF load wrote entity status and successors. A
+ * sanctions row carries its list's last recorded harvest and document date
+ * only once one is recorded, and `lastRefresh` appears only while a refresh is
+ * running or after one failed. Every URL is the configured one, reported as is.
  */
 export async function buildSourcesPayload(svc: ScreeningService): Promise<SourcesPayload> {
-  const [counts, sanctions, lei, alternateNamesIndexed] = await Promise.all([
+  const [counts, sanctions, lei, alternateNamesIndexed, entityStatusLoaded] = await Promise.all([
     svc.sourceCounts(),
     svc.sanctionsReadiness(),
     svc.leiReadiness(),
     svc.leiNamesIndexed(),
+    svc.leiEntityStatusLoaded(),
   ]);
   const urlFor = sourceUrls();
   const missingCsl = counts
@@ -116,6 +120,17 @@ export async function buildSourcesPayload(svc: ScreeningService): Promise<Source
       (source) => source.recordCount === 0 && CSL_SOURCE_CODES.some((code) => code === source.code),
     )
     .map((source) => source.code);
+  const refresh = sanctions.lastRefresh;
+  const lastRefresh =
+    refresh.status === 'error'
+      ? refresh
+      : refresh.status === 'in_progress'
+        ? {
+            status: 'in_progress' as const,
+            ...(refresh.startedAt ? { startedAt: refresh.startedAt } : {}),
+          }
+        : undefined;
+  const harvests = new Map(sanctions.sources.map((source) => [source.code, source]));
   return {
     sanctionsReady: sanctions.ready,
     ...(missingCsl.length
@@ -124,18 +139,25 @@ export async function buildSourcesPayload(svc: ScreeningService): Promise<Source
         }
       : {}),
     ...(sanctions.completedAt ? { sanctionsAsOf: sanctions.completedAt } : {}),
+    ...(lastRefresh ? { lastRefresh } : {}),
     leiReady: lei.ready,
     ...(lei.completedAt ? { leiAsOf: lei.completedAt } : {}),
     reportingExceptionsLoaded: lei.exceptionsLoaded,
     alternateNamesIndexed,
+    entityStatusLoaded,
     sources: [
-      ...counts.map((s) => ({
-        code: s.code,
-        label: SOURCE_LABELS[s.code],
-        recordCount: s.recordCount,
-        url: urlFor[s.code],
-        license: SOURCE_LICENSES[s.code],
-      })),
+      ...counts.map((s) => {
+        const { lastHarvestedAt, publishedAt } = harvests.get(s.code) ?? {};
+        return {
+          code: s.code,
+          label: SOURCE_LABELS[s.code],
+          recordCount: s.recordCount,
+          ...(lastHarvestedAt ? { lastHarvestedAt } : {}),
+          ...(publishedAt ? { publishedAt } : {}),
+          url: urlFor[s.code],
+          license: SOURCE_LICENSES[s.code],
+        };
+      }),
       {
         code: 'gleif',
         label: GLEIF_SOURCE_LABEL,

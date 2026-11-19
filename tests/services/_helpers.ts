@@ -8,6 +8,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { vi } from 'vitest';
 import { resetServerConfig } from '@/config/server-config.js';
 import {
   FIXTURE_DESIGNATIONS,
@@ -136,4 +137,49 @@ export async function emptyGlobalService(): Promise<SeededService> {
       resetScreeningService();
     },
   };
+}
+
+/**
+ * Restart the GLOBAL service on its mirror, as a server process starting on a
+ * mirror another process left: the new service opens the file afresh. The
+ * returned cleanup closes it, then runs `previous`'s.
+ */
+export async function restartGlobalService(previous: SeededService): Promise<SeededService> {
+  await previous.service.close();
+  resetScreeningService();
+  initScreeningService();
+  const service = getScreeningService();
+  return {
+    service,
+    cleanup: async () => {
+      await service.close();
+      await previous.cleanup();
+    },
+  };
+}
+
+/**
+ * Hold `service`'s post-sync index rebuild until `release()`. `held` resolves once
+ * a run has written its final sync state and reached the rebuild, which then runs
+ * unchanged.
+ */
+export function holdRebuild(service: ScreeningService): {
+  held: Promise<void>;
+  release: () => void;
+} {
+  const rebuild = service.rebuildSearchIndexes.bind(service);
+  let reached: () => void = () => {};
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  vi.spyOn(service, 'rebuildSearchIndexes').mockImplementation(async (outcomes) => {
+    reached();
+    await gate;
+    return rebuild(outcomes);
+  });
+  return { held, release };
 }

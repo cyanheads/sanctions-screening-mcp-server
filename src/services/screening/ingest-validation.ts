@@ -11,6 +11,10 @@
  * A silent drop is its own failure mode: a source that started publishing
  * malformed records would be absorbed without a trace. Every normalizer counts
  * what it dropped and why, and each harvest reports the tally for its source.
+ *
+ * Also the field readers the XML and JSON ingesters share: `componentText` for a
+ * published detail component, and `isoDocumentDate` for each source's own
+ * publication date.
  * @module services/screening/ingest-validation
  */
 
@@ -60,4 +64,44 @@ export function componentText(value: unknown): string | undefined {
         : undefined;
   if (!text || ['na', 'unknown'].includes(text.toLowerCase().replace(/[./]/gu, ''))) return;
   return /[\p{L}\p{N}]/u.test(text) ? text : undefined;
+}
+
+/**
+ * An ISO 8601 calendar date at any precision (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`), or
+ * a date and time to minutes, seconds, or a fraction, with an optional `Z` or
+ * `±HH:MM` offset. Captures year, month, day, hour, minute, second, and the
+ * offset's hours and minutes.
+ */
+const ISO_DOCUMENT_DATE =
+  /^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:Z|[+-](\d{2}):(\d{2}))?)?)?)?$/;
+
+/** Longer than any value {@link ISO_DOCUMENT_DATE} accepts, which tops out at 35 characters. */
+const MAX_ISO_DOCUMENT_DATE = 40;
+
+/**
+ * A publisher's date for its document — OFAC `DateOfIssue`, EU `generationDate`,
+ * UK `DateGenerated`, UN `dateGenerated`, CSL `source_last_updated` — kept only
+ * when it reads as ISO 8601, and then verbatim: at the precision it was
+ * published, its fraction and offset as written, a local time never given a
+ * zone. A value that is not an ISO 8601 date, or names a day, hour, or offset
+ * that does not exist, is undefined.
+ */
+export function isoDocumentDate(text: string | undefined): string | undefined {
+  const value = text?.trim();
+  if (!value || value.length > MAX_ISO_DOCUMENT_DATE) return;
+  const match = ISO_DOCUMENT_DATE.exec(value);
+  if (!match) return;
+  const [year, month, day, hour, minute, second, offsetHour, offsetMinute] = match
+    .slice(1)
+    .map((part) => (part === undefined ? undefined : Number(part)));
+  if (month !== undefined && (month < 1 || month > 12)) return;
+  if (
+    day !== undefined &&
+    (day < 1 || day > new Date(Date.UTC(year as number, month as number, 0)).getUTCDate())
+  ) {
+    return;
+  }
+  if ((hour ?? 0) > 23 || (minute ?? 0) > 59 || (second ?? 0) > 59) return;
+  if ((offsetHour ?? 0) > 23 || (offsetMinute ?? 0) > 59) return;
+  return value;
 }

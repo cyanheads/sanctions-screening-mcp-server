@@ -12,10 +12,11 @@
  * schema, not a one-time transformation of older data, and the mirror lifecycle
  * scripts reach the raw handle on paths the store's sync never runs. Owning the
  * DDL here gives both paths one definition — every statement is `CREATE … IF NOT
- * EXISTS`, so `ensureAuxSchema` is safe to run on every open. A new column on a
+ * EXISTS`, so `ensureDesignationAuxSchema` and `ensureLeiAuxSchema` are safe to
+ * run on every open. A new column on a
  * primary table is different: the store's generic upsert writes every declared
  * column, so a mirror written before the column existed must gain it before its
- * first write — that is what the designation spec's migration does. So is an
+ * first write — that is what the designation spec's migrations do. So is an
  * index a spec stops declaring: the declarative DDL only creates, so a mirror
  * that has the index keeps it until a migration drops it — the GLEIF spec's.
  * @module services/screening/schema
@@ -27,6 +28,8 @@ import type { SqliteHandle, SqliteMirrorStoreSpec } from '@cyanheads/mcp-ts-core
 export const DESIGNATION_TABLE = 'designation';
 /** Case-insensitive `(source, reference_number)` lookup index, created by the designation spec's v2 migration. */
 export const REFERENCE_NUMBER_INDEX = 'designation_source_reference_number_idx';
+/** Case-insensitive `(source, un_reference_number)` lookup index, created by the designation spec's v3 migration. */
+export const UN_REFERENCE_NUMBER_INDEX = 'designation_source_un_reference_number_idx';
 /** Per-name/alias matching index, projected from `designation.payload`. */
 export const NAME_TABLE = 'name';
 /** FTS5 external-content index over `name.normalized` — the shape every release's strict match reads. */
@@ -41,6 +44,8 @@ export const NAME_INDEX_STAMP_TABLE = 'name_index_stamp';
 export const IDENTIFIER_TABLE = 'designation_identifier';
 /** One row: the sync-state stamp of the designation data the identifier index was built from. */
 export const IDENTIFIER_STAMP_TABLE = 'designation_identifier_stamp';
+/** One row per sanctions list: its last successful harvest, that document's date, and its last attempt. */
+export const SOURCE_HARVEST_TABLE = 'source_harvest';
 /** Primary table name for the GLEIF Level 1 mirror. */
 export const LEI_ENTITY_TABLE = 'lei_entity';
 /** The `lei_entity.status` index releases through 0.4.0 declared; the GLEIF spec's v2 migration drops it. */
@@ -55,6 +60,8 @@ export const LEI_NAME_TABLE = 'lei_name';
 export const LEI_NAME_FTS_TABLE = 'lei_name_fts';
 /** One row: the GLEIF sync-state `completedAt` the name index was last known complete under. */
 export const LEI_NAME_STAMP_TABLE = 'lei_name_stamp';
+/** One row: the GLEIF sync-state `completedAt` of the golden-copy load that wrote entity status and successors for every entity in that copy. */
+export const LEI_ENTITY_STATUS_STAMP_TABLE = 'lei_entity_status_stamp';
 /** B-tree on `lei_name(normalized)` that strict resolution reads exact names through; built by the mirror scripts. */
 export const LEI_NAME_NORMALIZED_INDEX = 'lei_name_normalized_idx';
 /** Out-of-band-built GLEIF deletion-signature projection and its completion stamp. */
@@ -82,14 +89,16 @@ export const designationStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
     legal_basis: 'TEXT',
     designation_date: 'TEXT',
     reference_number: 'TEXT',
+    un_reference_number: 'TEXT',
     payload: 'TEXT',
   },
   fts: ['normalized_name'],
-  // `reference_number` is indexed by its migration, never here: the store runs
-  // this list before its migrations, and a mirror written before the column
-  // existed would fail to open on an index over a column it does not have yet.
+  // `reference_number` and `un_reference_number` are indexed by their migrations,
+  // never here: the store runs this list before its migrations, and a mirror
+  // written before a column existed would fail to open on an index over a column
+  // it does not have yet.
   indexes: [{ columns: ['source'] }, { columns: ['source', 'source_entry_id'] }],
-  version: 2,
+  version: 3,
   migrations: [
     {
       // v2 adds `reference_number`. A mirror created at v2 already has it from the
@@ -109,6 +118,31 @@ export const designationStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
         handle.exec(
           `CREATE INDEX IF NOT EXISTS ${REFERENCE_NUMBER_INDEX}
              ON ${DESIGNATION_TABLE}(source, reference_number COLLATE NOCASE)`,
+        );
+      },
+    },
+    {
+      /**
+       * v3 adds `un_reference_number`, the UN reference a UK or EU designation
+       * implements, the same way: only where the declarative DDL has not, then its
+       * case-insensitive index. Existing rows stay NULL until their list's next
+       * successful harvest rewrites them. A release at v2 still opens the file: the
+       * store skips migrations at or below a stored version, and that release's
+       * upserts leave the column as they found it.
+       */
+      version: 3,
+      up(handle) {
+        const hasColumn = handle
+          .prepare<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM pragma_table_info('${DESIGNATION_TABLE}') WHERE name = 'un_reference_number'`,
+          )
+          .get()?.n;
+        if (!hasColumn) {
+          handle.exec(`ALTER TABLE ${DESIGNATION_TABLE} ADD COLUMN un_reference_number TEXT`);
+        }
+        handle.exec(
+          `CREATE INDEX IF NOT EXISTS ${UN_REFERENCE_NUMBER_INDEX}
+             ON ${DESIGNATION_TABLE}(source, un_reference_number COLLATE NOCASE)`,
         );
       },
     },
@@ -165,7 +199,13 @@ export const leiStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
  * lockstep by triggers, and the one-row stamp of the sync run it was built
  * from; and the per-identifier `designation_identifier` index (one row per
  * published identifier, keyed by its category's normalized form, with the label
- * and value as published) with its own stamp. Idempotent.
+ * and value as published) with its own stamp; and `source_harvest`, one row per
+ * sanctions list, written by the post-sync index rebuild: when its last
+ * successful harvest completed (`harvested_at`, UTC) and the publisher's date on
+ * that document (`published_at`), plus how its last attempt ended
+ * (`attempt_status`, `harvested` or `failed`) and the sync-state `startedAt` of
+ * the run that made it (`attempt_started_at`). A failed attempt leaves the two
+ * harvest columns as the last success wrote them. Idempotent.
  *
  * `name_fts` indexes `normalized` (the name's fold tokens) alone, in the shape
  * and under the trigger names every earlier release created: an earlier
@@ -253,6 +293,14 @@ export function ensureDesignationAuxSchema(handle: SqliteHandle): void {
       id    INTEGER PRIMARY KEY CHECK (id = 1),
       stamp TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS ${SOURCE_HARVEST_TABLE} (
+      source             TEXT PRIMARY KEY,
+      harvested_at       TEXT,
+      published_at       TEXT,
+      attempt_started_at TEXT,
+      attempt_status     TEXT NOT NULL CHECK (attempt_status IN ('harvested', 'failed'))
+    );
   `);
 }
 
@@ -289,6 +337,10 @@ export function dropNameIndex(handle: SqliteHandle): void {
  *   the index existed gains these tables empty on open, and an empty index read
  *   as "no alternate names" would hide the legal names too — so whether the
  *   index serves resolution is read from the stamp, never from the table.
+ * - `lei_entity_status_stamp`, the record of a completed golden-copy load that
+ *   stored the status and successors of every entity in that copy. Never
+ *   written on first open: an empty mirror's first load writes it, and a mirror
+ *   an earlier release wrote stays unstamped until `mirror:init`.
  */
 export function ensureLeiAuxSchema(handle: SqliteHandle): void {
   handle.exec(`
@@ -335,6 +387,11 @@ export function ensureLeiAuxSchema(handle: SqliteHandle): void {
     END;
 
     CREATE TABLE IF NOT EXISTS ${LEI_NAME_STAMP_TABLE} (
+      id    INTEGER PRIMARY KEY CHECK (id = 1),
+      stamp TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ${LEI_ENTITY_STATUS_STAMP_TABLE} (
       id    INTEGER PRIMARY KEY CHECK (id = 1),
       stamp TEXT NOT NULL
     );

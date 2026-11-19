@@ -23,6 +23,7 @@ import type { ErrorContract } from '@cyanheads/mcp-ts-core/errors';
 import {
   type SchemaSpec,
   type SqliteHandle,
+  type SqliteMirrorStoreSpec,
   sqliteMirrorStore,
 } from '@cyanheads/mcp-ts-core/mirror';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
@@ -30,6 +31,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetServerConfig } from '@/config/server-config.js';
 import { designationResource } from '@/mcp-server/resources/definitions/designation.resource.js';
 import { entityResource } from '@/mcp-server/resources/definitions/entity.resource.js';
+import type { SourcesPayload } from '@/mcp-server/tools/definitions/_shared.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
@@ -43,6 +45,8 @@ import {
   IDENTIFIER_TABLE,
   LEI_STATUS_INDEX,
   REFERENCE_NUMBER_INDEX,
+  SOURCE_HARVEST_TABLE,
+  UN_REFERENCE_NUMBER_INDEX,
 } from '@/services/screening/schema.js';
 import {
   buildScreeningService,
@@ -275,22 +279,34 @@ describe('a 0.2.0 mirror opened by the current service', () => {
 
 /** The v2 schema facts a migration must leave behind, read off a raw handle. */
 function schemaFacts(handle: SqliteHandle) {
+  const columns = (name: string) =>
+    handle
+      .prepare<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM pragma_table_info('designation') WHERE name = ?",
+      )
+      .get(name)?.n ?? 0;
   return {
     version: handle.prepare<{ v: number }>('SELECT MAX(version) AS v FROM schema_version').get()?.v,
-    referenceColumns:
-      handle
-        .prepare<{ n: number }>(
-          "SELECT COUNT(*) AS n FROM pragma_table_info('designation') WHERE name = 'reference_number'",
-        )
-        .get()?.n ?? 0,
+    referenceColumns: columns('reference_number'),
+    unReferenceColumns: columns('un_reference_number'),
+    // Both lookup indexes: the pattern matches `un_reference_number` too.
     referenceIndexes: handle
       .prepare<{ name: string }>(
         "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'designation' AND sql LIKE '%reference_number%'",
       )
       .all()
-      .map((row) => row.name),
+      .map((row) => row.name)
+      .sort(),
   };
 }
+
+/** What every current open of a designation store reports, however it was created. */
+const CURRENT_SCHEMA = {
+  version: 3,
+  referenceColumns: 1,
+  unReferenceColumns: 1,
+  referenceIndexes: [REFERENCE_NUMBER_INDEX, UN_REFERENCE_NUMBER_INDEX],
+};
 
 async function screenIdentifier(value: string, type = 'any') {
   const result = await runToolContract(screenIdentifierTool, { value, type } as never);
@@ -330,21 +346,17 @@ async function switchToV1Mirror(
 }
 
 describe('the upgrade itself', () => {
-  it('migrates the file to schema version 2 with the reference column and its one index', async () => {
+  it('migrates the file to schema version 3 with both reference columns and their indexes', async () => {
     const handle = await getScreeningService().designations.raw();
-    expect(schemaFacts(handle)).toEqual({
-      version: 2,
-      referenceColumns: 1,
-      referenceIndexes: [REFERENCE_NUMBER_INDEX],
-    });
+    expect(schemaFacts(handle)).toEqual(CURRENT_SCHEMA);
     // Every row the release wrote is still there, with no reference yet.
     expect(
       handle
-        .prepare<{ n: number; refs: number }>(
-          'SELECT COUNT(*) AS n, COUNT(reference_number) AS refs FROM designation',
+        .prepare<{ n: number; refs: number; unRefs: number }>(
+          'SELECT COUNT(*) AS n, COUNT(reference_number) AS refs, COUNT(un_reference_number) AS unRefs FROM designation',
         )
         .get(),
-    ).toEqual({ n: 27, refs: 0 });
+    ).toEqual({ n: 27, refs: 0, unRefs: 0 });
   });
 
   it('serves sanctions_screen_identifier from the stored payloads on first open', async () => {
@@ -494,7 +506,7 @@ describe('the upgrade itself', () => {
       before,
     );
     expect(before['k0rn ptrf']).toEqual([]);
-    expect(before['巴贺航空发动机股份有限公司']).toEqual([]);
+    expect(before.巴贺航空发动机股份有限公司).toEqual([]);
     expect(before['Catherine Pyotrov']).toContain('un:FX-7007 · Catherine Pyotrov');
   });
 
@@ -590,7 +602,7 @@ describe('the upgrade itself', () => {
 });
 
 describe('a mirror created by the current service', () => {
-  it('gets the reference column and its index exactly once, however often it is reopened', async () => {
+  it('gets both reference columns and their indexes exactly once, however often it is reopened', async () => {
     const freshPath = join(dir, 'fresh.db');
     process.env.SANCTIONS_MIRROR_PATH = freshPath;
     resetServerConfig();
@@ -598,14 +610,190 @@ describe('a mirror created by the current service', () => {
       const service = buildScreeningService();
       try {
         await service.sourceCounts();
-        expect(schemaFacts(await service.designations.raw())).toEqual({
-          version: 2,
-          referenceColumns: 1,
-          referenceIndexes: [REFERENCE_NUMBER_INDEX],
-        });
+        expect(schemaFacts(await service.designations.raw())).toEqual(CURRENT_SCHEMA);
       } finally {
         await service.close();
       }
+    }
+  });
+});
+
+/** The designation store spec as 0.6.1 declared it: v2 adds `reference_number` and its index. */
+const V2_SPEC: Omit<SqliteMirrorStoreSpec, 'path'> = {
+  ...V1_SPEC,
+  columns: { ...V1_SPEC.columns, reference_number: 'TEXT' },
+  version: 2,
+  migrations: [
+    {
+      version: 2,
+      up(handle) {
+        const hasColumn = handle
+          .prepare<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM pragma_table_info('designation') WHERE name = 'reference_number'",
+          )
+          .get()?.n;
+        if (!hasColumn) handle.exec('ALTER TABLE designation ADD COLUMN reference_number TEXT');
+        handle.exec(
+          `CREATE INDEX IF NOT EXISTS ${REFERENCE_NUMBER_INDEX} ON designation(source, reference_number COLLATE NOCASE)`,
+        );
+      },
+    },
+  ],
+};
+
+/**
+ * Bring the 0.2.0 file `beforeEach` wrote to what 0.6.1 leaves after a refresh:
+ * opened under 0.6.1's spec (schema version 2) and its reference numbers stored.
+ * Returns the stored rows, for the current open to keep.
+ */
+async function upgradeToV2(designations: NormalizedDesignation[]) {
+  await getScreeningService().close();
+  resetScreeningService();
+  const store = sqliteMirrorStore({ path, ...V2_SPEC });
+  const handle = await store.raw();
+  const setReference = handle.prepare('UPDATE designation SET reference_number = ? WHERE id = ?');
+  handle.transaction(() => {
+    for (const d of designations) {
+      if (d.referenceNumber) setReference.run(d.referenceNumber, d.id);
+    }
+  });
+  const facts = schemaFacts(handle);
+  const rows = storedReferences(handle);
+  await store.close();
+  initScreeningService();
+  return { facts, rows };
+}
+
+function storedReferences(handle: SqliteHandle) {
+  return handle
+    .prepare<{ id: string; reference_number: string | null }>(
+      'SELECT id, reference_number FROM designation ORDER BY id',
+    )
+    .all();
+}
+
+/** The UK and EU records the UN references and UK measures are read from, as published. */
+const UN_LINK_DOCUMENTS = {
+  uk: `<?xml version="1.0" encoding="utf-8"?>
+<Designations>
+  <Designation><UniqueID>AFG0001</UniqueID><OFSIGroupID>12703</OFSIGroupID><UNReferenceNumber>TAe.010</UNReferenceNumber><IndividualEntityShip>Entity</IndividualEntityShip>
+    <Names><Name><Name6>HAJI KHAIRULLAH HAJI SATTAR MONEY EXCHANGE</Name6><NameType>Primary Name</NameType></Name></Names>
+    <DesignationSource>UN</DesignationSource><SanctionsImposed>Asset freeze</SanctionsImposed></Designation>
+  <Designation><UniqueID>SYR0200</UniqueID><OFSIGroupID>13410</OFSIGroupID><UNReferenceNumber>N/A</UNReferenceNumber><IndividualEntityShip>Individual</IndividualEntityShip>
+    <Names><Name><Name6>Sa'ad</Name6><NameType>Primary name</NameType></Name></Names>
+    <DesignationSource>UK</DesignationSource><SanctionsImposed>Asset freeze|Travel Ban|Director Disqualification Sanction</SanctionsImposed></Designation>
+</Designations>`,
+  eu: `<?xml version="1.0" encoding="UTF-8"?>
+<export>
+  <sanctionEntity designationDetails="" unitedNationId="LYi.28" euReferenceNumber="EU.4801.12" logicalId="118593"><subjectType code="person"/><nameAlias wholeName="Salah Badi" strong="true"/></sanctionEntity>
+  <sanctionEntity designationDetails="" unitedNationId="" euReferenceNumber="EU.27.28" logicalId="13"><subjectType code="person"/><nameAlias wholeName="Saddam Hussein Al-Tikriti" strong="true"/></sanctionEntity>
+</export>`,
+};
+
+describe('a 0.6.1 mirror (schema version 2) opened by the current service', () => {
+  const designations = () => [...FIXTURE_DESIGNATIONS, ...lookupDesignations()];
+
+  it('migrates to schema version 3, keeping every designation and its reference number, with no UN reference', async () => {
+    const before = await upgradeToV2(designations());
+    expect(before.facts).toEqual({
+      version: 2,
+      referenceColumns: 1,
+      unReferenceColumns: 0,
+      referenceIndexes: [REFERENCE_NUMBER_INDEX],
+    });
+    expect(before.rows).toHaveLength(27);
+    expect(before.rows.filter((row) => row.reference_number).length).toBeGreaterThan(0);
+
+    const handle = await getScreeningService().designations.raw();
+    expect(schemaFacts(handle)).toEqual(CURRENT_SCHEMA);
+    expect(storedReferences(handle)).toEqual(before.rows);
+    expect(
+      handle
+        .prepare<{ n: number }>('SELECT COUNT(un_reference_number) AS n FROM designation')
+        .get(),
+    ).toEqual({ n: 0 });
+  });
+
+  it('looks a UN reference up case-insensitively through its index', async () => {
+    await upgradeToV2(designations());
+    const handle = await getScreeningService().designations.raw();
+    const plan = handle
+      .prepare<{ detail: string }>(
+        'EXPLAIN QUERY PLAN SELECT id FROM designation WHERE source = ? AND un_reference_number = ? COLLATE NOCASE',
+      )
+      .all('uk', 'tae.010')
+      .map((row) => row.detail)
+      .join('\n');
+    expect(plan).toContain(`USING INDEX ${UN_REFERENCE_NUMBER_INDEX}`);
+  });
+
+  it('reads NULL until a sanctions refresh, then the UN references and UK features the lists publish, none of them indexed as a name or identifier', async () => {
+    await upgradeToV2(designations());
+    const service = getScreeningService();
+    const handle = await service.designations.raw();
+    const stored = (id: string) => {
+      const row = handle
+        .prepare<{ un: string | null; payload: string }>(
+          'SELECT un_reference_number AS un, payload FROM designation WHERE id = ?',
+        )
+        .get(id);
+      return row && { un: row.un, features: JSON.parse(row.payload).features };
+    };
+    expect(stored('uk:RUS0251')).toEqual({ un: null, features: [] });
+
+    serveLookupCorpus(UN_LINK_DOCUMENTS);
+    await service.syncSanctions('refresh', new AbortController().signal);
+
+    expect(stored('uk:AFG0001')).toEqual({
+      un: 'TAe.010',
+      features: [
+        { type: 'DesignationSource', value: 'UN' },
+        { type: 'SanctionsImposed', value: 'Asset freeze' },
+      ],
+    });
+    expect(stored('uk:SYR0200')?.un).toBeNull();
+    expect(stored('eu:118593')).toEqual({ un: 'LYi.28', features: [] });
+    expect(stored('eu:13')?.un).toBeNull();
+
+    const published = ['TAe.010', 'LYi.28', 'UN', 'UK', 'Asset freeze', 'Travel Ban'];
+    const indexed = [
+      ...handle.prepare<{ v: string }>('SELECT name AS v FROM name').all(),
+      ...handle.prepare<{ v: string }>(`SELECT value AS v FROM ${IDENTIFIER_TABLE}`).all(),
+    ].map((row) => row.v);
+    expect(indexed.length).toBeGreaterThan(0);
+    for (const value of published) expect(indexed, value).not.toContain(value);
+  });
+
+  it('reports neither date for any list and a valid sources output until a refresh records each harvest (#88)', async () => {
+    await upgradeToV2(designations());
+    const service = getScreeningService();
+    const before = await runToolContract(listSourcesTool, {});
+    expect(before.isError).toBeFalsy();
+    const handle = await service.designations.raw();
+    const recorded = () =>
+      handle.prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${SOURCE_HARVEST_TABLE}`).get()?.n;
+    expect(recorded()).toBe(0);
+
+    const stored = before.structuredContent as SourcesPayload;
+    expect(stored).not.toHaveProperty('lastRefresh');
+    expect(stored.sanctionsAsOf).toBe('2026-09-24T04:00:00.000Z');
+    for (const row of stored.sources) {
+      expect(row, row.code).not.toHaveProperty('lastHarvestedAt');
+      expect(row, row.code).not.toHaveProperty('publishedAt');
+    }
+    const text = (before.content ?? []).map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(text).toContain('**Per-list harvest:** not recorded yet for any list — ');
+
+    serveLookupCorpus();
+    await service.syncSanctions('refresh', new AbortController().signal);
+    const { startedAt } = await service.designations.store.readState();
+    const after = await runToolContract(listSourcesTool, {});
+    expect(after.isError).toBeFalsy();
+    const refreshed = after.structuredContent as SourcesPayload;
+    expect(recorded()).toBe(11);
+    expect(refreshed).not.toHaveProperty('lastRefresh');
+    for (const row of refreshed.sources.filter((source) => source.code !== 'gleif')) {
+      expect(row.lastHarvestedAt! >= startedAt!, row.code).toBe(true);
     }
   });
 });
@@ -936,6 +1124,36 @@ describe('a 0.3.0 GLEIF mirror opened by the current service', () => {
     });
   });
 
+  it('serves a record 0.3.0 wrote as not carrying entity status, with no new field and a valid output (#94)', async () => {
+    // Every field 0.3.0 stored, as it stored it, and neither entityStatus nor successors.
+    expect(await getScreeningService().getLeiEntity(LONE)).toEqual({
+      lei: LONE,
+      legalName: 'Spring Trust Nominees Ltd',
+      otherNames: [],
+      status: 'RETIRED',
+      alternateNames: [],
+      entityStatusLoaded: false,
+    });
+
+    const wire = await runToolContract(getEntityTool, { lei: LONE });
+    expect(wire.isError).toBeFalsy();
+    const structured = wire.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      lei: LONE,
+      legalName: 'Spring Trust Nominees Ltd',
+      status: 'RETIRED',
+      entityStatusLoaded: false,
+    });
+    expect(structured).not.toHaveProperty('entityStatus');
+    expect(structured).not.toHaveProperty('successors');
+    const text = wire.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+    expect(text).toContain('**Entity status and successors:** not loaded for this record');
+
+    const sources = await runToolContract(listSourcesTool, {});
+    expect(sources.isError).toBeFalsy();
+    expect(sources.structuredContent).toMatchObject({ leiReady: true, entityStatusLoaded: false });
+  });
+
   describe('once mirror:init loads the golden copies', () => {
     let standIn: GleifStandIn;
     const golden = (contentDate: string) => ({
@@ -948,7 +1166,13 @@ describe('a 0.3.0 GLEIF mirror opened by the current service', () => {
             otherNames: [{ name: 'Qorlane Brands', type: 'TRADING_OR_OPERATING_NAME' }],
           },
           { lei: PARENT, legalName: 'Testland Holdings PLC' },
-          { lei: LONE, legalName: 'Spring Trust Nominees Ltd', status: 'RETIRED' },
+          {
+            lei: LONE,
+            legalName: 'Spring Trust Nominees Ltd',
+            status: 'RETIRED',
+            entityStatus: 'INACTIVE',
+            successors: [{ lei: PARENT }],
+          },
         ]),
         deltas: {},
       },
@@ -1000,6 +1224,51 @@ describe('a 0.3.0 GLEIF mirror opened by the current service', () => {
       resetScreeningService();
       initScreeningService();
       expect((await resolveWith({ name: 'Qorlane Brands' })).notice).toBeUndefined();
+    });
+
+    /** sanctions_get_entity for one LEI and sanctions_list_sources, both through output validation. */
+    const entityStatusSurfaces = async (lei: string) => {
+      const entity = await runToolContract(getEntityTool, { lei });
+      const sources = await runToolContract(listSourcesTool, {});
+      expect(entity.isError).toBeFalsy();
+      expect(sources.isError).toBeFalsy();
+      return {
+        entity: entity.structuredContent as Record<string, unknown>,
+        mirrorWide: (sources.structuredContent as { entityStatusLoaded: boolean })
+          .entityStatusLoaded,
+      };
+    };
+
+    it('loads entity status and successors on every record, and turns the mirror-wide flag true (#94)', async () => {
+      standIn.serve(golden('2026-09-25T08:08:49Z'));
+      await loadGleifGoldenCopies(getScreeningService(), new AbortController().signal);
+
+      const retired = await entityStatusSurfaces(LONE);
+      expect(retired.mirrorWide).toBe(true);
+      expect(retired.entity).toMatchObject({
+        status: 'RETIRED',
+        entityStatus: 'INACTIVE',
+        successors: [{ lei: PARENT }],
+        entityStatusLoaded: true,
+      });
+      const active = (await entityStatusSurfaces(CHILD)).entity;
+      expect(active).toMatchObject({ entityStatus: 'ACTIVE', entityStatusLoaded: true });
+      expect(active).not.toHaveProperty('successors');
+    });
+
+    it('leaves both flags false while a load is only part-way through (#94)', async () => {
+      const full = golden('2026-09-25T08:08:49Z').lei2.full;
+      standIn.serve(golden('2026-09-25T08:08:49Z'), {
+        '/files/lei2-full.xml': full.slice(0, full.indexOf('</lei:LEIRecord>') + 16),
+      });
+      await expect(
+        loadGleifGoldenCopies(getScreeningService(), new AbortController().signal),
+      ).rejects.toThrow();
+
+      const { entity, mirrorWide } = await entityStatusSurfaces(LONE);
+      expect(mirrorWide).toBe(false);
+      expect(entity).toMatchObject({ status: 'RETIRED', entityStatusLoaded: false });
+      expect(entity).not.toHaveProperty('entityStatus');
     });
   });
 });

@@ -67,6 +67,14 @@ describe('vetCounterpartyPrompt', () => {
     expect(text).not.toMatch(/retry with matchMode/i);
   });
 
+  it('vets a successor of a retired LEI and reads an unloaded entity status as unknown (#94)', async () => {
+    const messages = await vetCounterpartyPrompt.generate({ name: 'Acme Corp' });
+    const text = messages[0]!.content.type === 'text' ? messages[0]!.content.text : '';
+    expect(text).toContain('A retired, merged, or duplicate LEI may name successors');
+    expect(text).toContain('a successor is the entity to vet');
+    expect(text).toContain('entityStatusLoaded false says nothing about whether it has one');
+  });
+
   it('weaves the jurisdiction into the workflow when provided', async () => {
     const args = vetCounterpartyPrompt.args!.parse({ name: 'Acme Corp', jurisdiction: 'US' });
     const messages = await vetCounterpartyPrompt.generate(args);
@@ -82,11 +90,13 @@ describe('vetCounterpartyPrompt', () => {
     expect(text).toContain('Deduplicate queued (lei, direction) roots and edge identities');
     expect(text).toContain('invalid_cursor or stale_cursor');
     expect(text).toContain('not an immutable snapshot');
+    // sanctions_trace_ownership no longer returns this field.
+    expect(text).not.toContain('byteTargetExceeded');
     expect(text).toContain('sanctionsScreen.hasMore');
     expect(text).toContain('not necessarily omitted strict cross-reference hits');
     expect(text).toContain('all eleven loaded sanctions and export-control lists');
     expect(text).toContain('official agency lists and Federal Register publications');
-    expect(text).toContain('not purported upstream publication freshness');
+    expect(text).toContain('not proof of when the list last changed');
     expect(text).toContain('not endorsed or certified by the International Trade Administration');
   });
 

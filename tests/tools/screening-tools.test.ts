@@ -195,6 +195,129 @@ describe('screening tools (seeded)', () => {
   });
 });
 
+describe('GLEIF entity status and successor entities (issue #94)', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  it('leaves trace cursors and nodes and resolve rows as they were before the new payload keys', async () => {
+    const paged = await traceOwnershipTool.handler(
+      traceOwnershipTool.input.parse({ lei: '5493001KJTIIGC8Y1R12', limit: 1 }),
+      ctxFor(traceOwnershipTool.errors),
+    );
+    expect(paged.nextCursor).toBe(
+      'eyJ2ZXJzaW9uIjoxLCJxdWVyeSI6eyJsZWkiOiI1NDkzMDAxS0pUSUlHQzhZMVIxMiIsImRpcmVjdGlvbiI6ImJvdGgiLCJkZXB0aCI6Mywic2NyZWVuTm9kZXMiOmZhbHNlLCJsaW1pdCI6MX0sInRvcG9sb2d5IjoiZDljYzhjMjMxNTZhN2ZiYmFkNWVkNjNmZTYyY2VjZjNhMDA3MTRhYmRiMWNjNTg2NDM4Nzc3ODA2OTdiNjBlYyIsIm9mZnNldCI6MX0',
+    );
+    const retired = await traceOwnershipTool.handler(
+      traceOwnershipTool.input.parse({ lei: '254900SPRNGRETIRD042' }),
+      ctxFor(traceOwnershipTool.errors),
+    );
+    expect(retired.nodes).toEqual([
+      {
+        lei: '254900SPRNGRETIRD042',
+        legalName: 'Qorvath Nominee Services Holdings Ltd',
+        jurisdiction: 'NG',
+        status: 'RETIRED',
+        depth: 0,
+        role: 'root',
+        parentStatus: { direct: { status: 'none' }, ultimate: { status: 'none' } },
+      },
+    ]);
+    const resolved = await resolveEntityTool.handler(
+      resolveEntityTool.input.parse({ name: 'Qorvath Nominee Services', status: 'any' }),
+      ctxFor(resolveEntityTool.errors),
+    );
+    expect(resolved.matches).toEqual([
+      {
+        lei: '254900SPRNGRETIRD042',
+        legalName: 'Qorvath Nominee Services Holdings Ltd',
+        matchedName: 'Qorvath Nominee Services Holdings Ltd',
+        matchedNameType: 'LEGAL_NAME',
+        matchType: 'strong',
+        jurisdiction: 'NG',
+        status: 'RETIRED',
+      },
+      {
+        lei: '254900SPRNGTRUST0028',
+        legalName: 'Qorvath Nominee Services Ltd',
+        matchedName: 'Qorvath Nominee Services Ltd',
+        matchedNameType: 'LEGAL_NAME',
+        matchType: 'strong',
+        jurisdiction: 'NG',
+        status: 'LAPSED',
+      },
+    ]);
+  });
+
+  it('get_entity returns an inactive entity and its successor on both surfaces', async () => {
+    const result = await runToolContract(getEntityTool, { lei: '254900SPRNGRETIRD042' });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      status: 'RETIRED',
+      entityStatus: 'INACTIVE',
+      successors: [{ lei: '254900SPRNGTRUST0028' }],
+      entityStatusLoaded: true,
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('**Registration status:** RETIRED\n**Entity status:** INACTIVE\n');
+    expect(text).toContain('**Successor entities:** `254900SPRNGTRUST0028` — pass a successor LEI');
+  });
+
+  it('get_entity returns an active entity with no successors key on both surfaces', async () => {
+    const result = await runToolContract(getEntityTool, { lei: '529900T8BM49AURSDO55' });
+    expect(result.structuredContent).toMatchObject({
+      entityStatus: 'ACTIVE',
+      entityStatusLoaded: true,
+    });
+    expect(result.structuredContent).not.toHaveProperty('successors');
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('**Entity status:** ACTIVE');
+    expect(text).toContain('**Successor entities:** none published');
+  });
+
+  it('get_entity reads a record stored before entity status was read as not loaded, every other field unchanged', async () => {
+    const lei = '254900SPRNGOLDREC042';
+    // The payload an earlier release stored: no entityStatus, no successors.
+    await seeded.service.ingestLeiEntities([
+      {
+        lei,
+        legalName: 'Qorvath Legacy Holdings Ltd',
+        otherNames: ['Qorvath Legacy'],
+        jurisdiction: 'NG',
+        status: 'RETIRED',
+        lastUpdate: '2025-03-01T10:00:00Z',
+      },
+    ]);
+    const result = await runToolContract(getEntityTool, { lei });
+    expect(result.isError).toBeFalsy();
+    const {
+      sanctionsHits: _hits,
+      sanctionsScreen: _screen,
+      screeningStatus: _status,
+      caveat: _caveat,
+      ...entity
+    } = result.structuredContent as Record<string, unknown>;
+    expect(entity).toStrictEqual({
+      lei,
+      legalName: 'Qorvath Legacy Holdings Ltd',
+      otherNames: ['Qorvath Legacy'],
+      alternateNames: [{ name: 'Qorvath Legacy', type: 'UNKNOWN' }],
+      jurisdiction: 'NG',
+      status: 'RETIRED',
+      entityStatusLoaded: false,
+      lastUpdate: '2025-03-01T10:00:00Z',
+    });
+    const text = result.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(text).toContain('**Entity status and successors:** not loaded for this record');
+    expect(text).not.toContain('none published');
+    expect(text).not.toContain('**Entity status:**');
+  });
+});
+
 describe('query-token coverage on both client surfaces (issue #15)', () => {
   let seeded: SeededService;
   beforeEach(async () => {
@@ -1381,6 +1504,74 @@ describe('descriptive features on both surfaces (issue #64)', () => {
         name,
       ).toEqual([]);
     }
+  });
+});
+
+describe('UN reference numbers on both surfaces (issue #89)', () => {
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  const textOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+    result.content.map((c) => ('text' in c ? c.text : '')).join('\n');
+  const hitsOf = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+    (result.structuredContent as { hits: Record<string, unknown>[] }).hits;
+
+  it('get_designation resolves a UK designation by the UN reference it carries alone', async () => {
+    const result = await runToolContract(getDesignationTool, { source: 'uk', entryId: 'qde.110' });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      sourceEntryId: 'FX-1010',
+      unReferenceNumber: 'QDe.110',
+    });
+    expect(result.structuredContent).not.toHaveProperty('referenceNumber');
+    expect(textOf(result)).toContain('**Entry ID:** FX-1010 | **UN reference:** QDe.110');
+  });
+
+  it('get_designation fails reference_ambiguous on the UN reference two EU designations carry', async () => {
+    const result = await runToolContract(getDesignationTool, { source: 'eu', entryId: 'QDi.939' });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.InvalidParams,
+        data: { reason: 'reference_ambiguous', sourceEntryIds: ['FX-3003', 'FX-9009'] },
+      },
+    });
+    expect(textOf(result)).toContain(
+      'UN reference number "QDi.939" is carried by 2 eu designations: FX-3003, FX-9009.',
+    );
+    // Each still answers by its entry ID, carrying the shared value.
+    const own = await runToolContract(getDesignationTool, { source: 'eu', entryId: 'FX-9009' });
+    expect(own.structuredContent).toMatchObject({ unReferenceNumber: 'QDi.939' });
+    expect(textOf(own)).toContain('**Entry ID:** FX-9009 | **UN reference:** QDi.939');
+  });
+
+  it('screen_name carries a hit’s UN reference on both surfaces, strict and fuzzy, and omits it otherwise', async () => {
+    const strict = await runToolContract(screenNameTool, { name: 'Van Der Berg Shipping' });
+    const hit = hitsOf(strict).find((h) => h.sourceEntryId === 'FX-1010');
+    expect(hit).toMatchObject({ matchType: 'exact', unReferenceNumber: 'QDe.110' });
+    expect(textOf(strict)).toContain(
+      '**Entry ID:** FX-1010 | **UN reference:** QDe.110 | **Type:** organization',
+    );
+
+    const fuzzy = await runToolContract(screenNameTool, {
+      name: 'vanderbergshipping',
+      matchMode: 'fuzzy',
+    });
+    expect(hitsOf(fuzzy).find((h) => h.sourceEntryId === 'FX-1010')).toMatchObject({
+      matchType: 'approximate',
+      unReferenceNumber: 'QDe.110',
+    });
+    expect(textOf(fuzzy)).toContain('| **UN reference:** QDe.110 |');
+
+    const none = await runToolContract(screenNameTool, { name: 'Ivan Testovich Volkov' });
+    expect(hitsOf(none)[0]).toMatchObject({ sourceEntryId: 'FX-1001' });
+    expect(hitsOf(none)[0]).not.toHaveProperty('unReferenceNumber');
+    expect(textOf(none)).not.toContain('UN reference');
   });
 });
 

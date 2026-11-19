@@ -24,7 +24,8 @@
  * A record scan cannot tell a complete document from a truncated one: it drops a
  * record whose closing tag never arrives and ends normally. {@link
  * requireCompleteDocument} is the check that can — it confirms the document's
- * root element closed.
+ * root element closed, and hands over the root start tag it read on the way, so
+ * a date published as a root attribute is read without a second pass.
  * @module services/screening/xml-stream
  */
 
@@ -79,12 +80,12 @@ const MISC = String.raw`\s|<!--(?:(?!-->)[\s\S])*-->|<\?(?:(?!\?>)[\s\S])*\?>`;
 /**
  * The document's root start tag: the first element after the prolog (XML
  * declaration, processing instructions, comments, a DOCTYPE with or without an
- * internal subset). Captures the qualified name and a `/` when self-closing. A
- * byte-order mark is already gone — {@link decodeUtf8Stream} strips it — and
- * would match `\s` if it were not.
+ * internal subset). Captures the whole start tag, its qualified name, and a `/`
+ * when self-closing. A byte-order mark is already gone — {@link
+ * decodeUtf8Stream} strips it — and would match `\s` if it were not.
  */
 const ROOT_START_TAG = new RegExp(
-  String.raw`^(?:${MISC}|<!DOCTYPE[^[>]*(?:\[(?:(?!\]\s*>)[\s\S])*\])?\s*>)*<([A-Za-z_][\w.:-]*)(?:\s[^>]*?)?(\/?)>`,
+  String.raw`^(?:${MISC}|<!DOCTYPE[^[>]*(?:\[(?:(?!\]\s*>)[\s\S])*\])?\s*>)*(<([A-Za-z_][\w.:-]*)(?:\s[^>]*?)?(\/?)>)`,
 );
 
 /**
@@ -309,12 +310,17 @@ class RootCloseScan {
  *
  * @param textChunks Decoded document text, in arrival order.
  * @param label Names the document in the error (the source code).
+ * @param onRootStartTag Handed the root start tag (`<name attr="…">`, prolog
+ *   excluded) once, as soon as it is read and before the chunk that completes it
+ *   is passed on — the one place a root attribute is visible without a second
+ *   pass over the document.
  * @throws ServiceUnavailable when the stream ends before the root element opens
  *   or closes.
  */
 export async function* requireCompleteDocument(
   textChunks: AsyncIterable<string>,
   label: string,
+  onRootStartTag?: (startTag: string) => void,
 ): AsyncGenerator<string> {
   let head = '';
   let root: { name: string; scan: RootCloseScan } | undefined;
@@ -325,8 +331,9 @@ export async function* requireCompleteDocument(
       head += chunk;
       const match = ROOT_START_TAG.exec(head);
       if (match) {
-        const name = match[1] as string;
-        root = { name, scan: new RootCloseScan(name, match[2] === '/') };
+        const name = match[2] as string;
+        onRootStartTag?.(match[1] as string);
+        root = { name, scan: new RootCloseScan(name, match[3] === '/') };
         root.scan.push(head.slice(match[0].length));
         head = '';
       } else if (head.length > MAX_ROOT_SEARCH) {
@@ -348,6 +355,16 @@ export async function* requireCompleteDocument(
 }
 
 /**
+ * The value of attribute `name` on an element start tag, as published (no entity
+ * decoding: the attributes read through this are dates), or undefined when the
+ * tag carries no such attribute. `name` is a literal attribute name.
+ */
+export function startTagAttribute(startTag: string, name: string): string | undefined {
+  const match = new RegExp(String.raw`\s${name}\s*=\s*(?:"([^"]*)"|'([^']*)')`).exec(startTag);
+  return match ? (match[1] ?? match[2]) : undefined;
+}
+
+/**
  * Scan a decoded-text stream for complete `<recordName>…</recordName>`
  * fragments, buffering across chunk boundaries and yielding each with the local
  * element name that matched.
@@ -359,7 +376,15 @@ export async function* requireCompleteDocument(
  * `<DistinctParties>` vs `<DistinctParty>`).
  *
  * A record whose closing tag never arrives — a truncated document — is dropped
- * rather than emitted partially.
+ * rather than emitted partially. A self-closing record (`<DateOfIssue/>`) is a
+ * complete, empty fragment: waiting for a closing tag it never has would
+ * buffer, and drop, every record after it.
+ *
+ * Linear in the stream however many chunks a record spans: while a record waits
+ * for the end of its open tag or for its closing tag, each arriving chunk is
+ * searched only with the few characters before it, and set aside rather than
+ * appended, so the buffered record is neither searched nor copied again until
+ * that terminator arrives.
  *
  * @param textChunks Decoded source text, in arrival order.
  * @param recordNames Local element names to lift out, longest-first internally
@@ -374,8 +399,26 @@ export async function* scanRecordFragments(
   const alternation = [...recordNames].sort((a, b) => b.length - a.length).join('|');
   const openRe = new RegExp(`<((?:[A-Za-z][\\w.-]*:)?(?:${alternation}))(?=[\\s/>])`);
   let buf = '';
+  /**
+   * Set while `buf` holds a record whose open tag (`until` is `>`) or closing tag
+   * has not arrived: the chunks received since, and the last `until.length - 1`
+   * characters already searched, so a terminator split across chunks is found.
+   */
+  let waiting: { until: string; chunks: string[]; tail: string } | undefined;
   for await (const chunk of textChunks) {
-    buf += chunk;
+    if (waiting) {
+      const searched = waiting.tail + chunk;
+      if (!searched.includes(waiting.until)) {
+        waiting.chunks.push(chunk);
+        waiting.tail = searched.slice(searched.length - (waiting.until.length - 1));
+        continue;
+      }
+      // The terminator may have arrived: rejoin, and rescan the record once.
+      buf += waiting.chunks.join('') + chunk;
+      waiting = undefined;
+    } else {
+      buf += chunk;
+    }
     for (;;) {
       const open = openRe.exec(buf);
       if (!open) {
@@ -385,18 +428,25 @@ export async function* scanRecordFragments(
         break;
       }
       const qualifiedName = open[1] as string;
+      const name = qualifiedName.slice(qualifiedName.indexOf(':') + 1);
+      const tagEnd = buf.indexOf('>', open.index + open[0].length);
+      if (tagEnd !== -1 && buf[tagEnd - 1] === '/') {
+        yield { name, xml: buf.slice(open.index, tagEnd + 1) };
+        buf = buf.slice(tagEnd + 1);
+        continue;
+      }
       const closeTag = `</${qualifiedName}>`;
-      const closeIdx = buf.indexOf(closeTag, open.index + open[0].length);
+      const closeIdx = tagEnd === -1 ? -1 : buf.indexOf(closeTag, tagEnd + 1);
       if (closeIdx === -1) {
         // Record not fully buffered — drop the pre-record prefix and read more.
         buf = buf.slice(open.index);
+        const until = tagEnd === -1 ? '>' : closeTag;
+        // Waiting on `</Name>`, `buf` holds at least `<Name>`: never shorter than the tail.
+        waiting = { until, chunks: [], tail: buf.slice(buf.length - (until.length - 1)) };
         break;
       }
       const end = closeIdx + closeTag.length;
-      yield {
-        name: qualifiedName.slice(qualifiedName.indexOf(':') + 1),
-        xml: buf.slice(open.index, end),
-      };
+      yield { name, xml: buf.slice(open.index, end) };
       buf = buf.slice(end);
     }
   }

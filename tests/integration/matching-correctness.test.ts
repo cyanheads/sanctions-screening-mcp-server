@@ -8,11 +8,14 @@
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
+import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
+import { parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
 import { tokenize } from '@/services/screening/text-matching.js';
 import type { NormalizedDesignation, SourceCode } from '@/services/screening/types.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
+import { parseXml } from '@/services/screening/xml.js';
 import {
   freshService,
   type SeededService,
@@ -268,7 +271,7 @@ describe('screenName name-shape correctness', () => {
     expect(weaker?.queryTokenCoverage).toEqual({ covered: 2, total: 3 });
   });
 
-  it('orders every approximate hit by score, then by coverage, then by list and entry ID', async () => {
+  it('orders every approximate hit by score, then by coverage, then by words matched by sound, then by list and entry ID', async () => {
     const result = await service.screenName(
       { ...defaults, query: 'Nikolas Maduro Moros', matchMode: 'fuzzy' },
       createMockContext(),
@@ -278,6 +281,7 @@ describe('screenName name-shape correctness', () => {
       .map((hit) => [
         -(hit.score ?? 0),
         -(hit.queryTokenCoverage?.covered ?? 0),
+        hit.queryTokenCoverage?.phonetic ?? 0,
         hit.source,
         hit.sourceEntryId,
       ]);
@@ -285,22 +289,26 @@ describe('screenName name-shape correctness', () => {
   });
 });
 
-/** One hit's ranking key, ascending: negated score, negated coverage, list, entry ID. */
-type RankKey = [number, number, SourceCode, string];
+/**
+ * One hit's ranking key, ascending: negated score, negated coverage, words
+ * covered by sound alone, list, entry ID.
+ */
+type RankKey = [number, number, number, SourceCode, string];
 
 const entryIdCollator = new Intl.Collator('en', { numeric: true });
 
 /**
- * Score and coverage, then identity: the list in `SOURCE_CODES` order, the entry
+ * Score, coverage, and sound count, then identity: the list in `SOURCE_CODES` order, the entry
  * ID by numeric collation, then the entry ID by code units, which orders the
  * zero-padded variants numeric collation calls equal.
  */
 const compareRankKeys = (a: RankKey, b: RankKey): number =>
   a[0] - b[0] ||
   a[1] - b[1] ||
-  SOURCE_CODES.indexOf(a[2]) - SOURCE_CODES.indexOf(b[2]) ||
-  entryIdCollator.compare(a[3], b[3]) ||
-  (a[3] < b[3] ? -1 : a[3] > b[3] ? 1 : 0);
+  a[2] - b[2] ||
+  SOURCE_CODES.indexOf(a[3]) - SOURCE_CODES.indexOf(b[3]) ||
+  entryIdCollator.compare(a[4], b[4]) ||
+  (a[4] < b[4] ? -1 : a[4] > b[4] ? 1 : 0);
 
 /**
  * Nine designations under one name, spread over every list, with entry IDs whose
@@ -540,6 +548,144 @@ describe('cross-script comparison on both tool surfaces', () => {
   });
 });
 
+describe('legal-form spellings on both tool surfaces (issue #90)', () => {
+  let harness: SeededService;
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  const organization = (id: string, primaryName: string): NormalizedDesignation => {
+    const [source, sourceEntryId] = id.split(':') as [SourceCode, string];
+    return {
+      id,
+      source,
+      sourceEntryId,
+      entityType: 'organization',
+      primaryName,
+      payload: { aliases: [], identifiers: [], addresses: [], datesOfBirth: [], nationalities: [] },
+    };
+  };
+  const textOf = (result: Awaited<ReturnType<typeof runToolContract>>): string =>
+    result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+
+  it('reports a name equal up to legal-form spelling as strong in structuredContent and content', async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations([
+      organization('ofac_sdn:16830', 'STG HOLDINGS LIMITED'),
+      organization('eu:SPEC-1', 'Limited Liability Company Spectrum'),
+    ]);
+    const result = await runToolContract(screenNameTool, {
+      name: 'STG Holdings Ltd.',
+      sources: ['ofac_sdn', 'eu'],
+    });
+    expect(result.isError).toBeFalsy();
+    const data = result.structuredContent as {
+      hits: { sourceEntryId: string; matchedName: string; matchType: string; score?: number }[];
+    };
+    expect(data.hits).toHaveLength(1);
+    expect(data.hits[0]).toMatchObject({
+      sourceEntryId: '16830',
+      matchedName: 'STG HOLDINGS LIMITED',
+      matchType: 'strong',
+    });
+    expect(data.hits[0]?.score).toBeUndefined();
+    const text = textOf(result);
+    expect(text).toContain('### STG HOLDINGS LIMITED — strong\n');
+    expect(text).toContain('**Matched on:** "STG HOLDINGS LIMITED" (primary)');
+    expect(text).toContain(SCREENING_CAVEAT);
+
+    // The same words under another form match nothing strict.
+    const crossForm = await runToolContract(screenNameTool, {
+      name: 'Spectrum Ltd',
+      sources: ['eu'],
+    });
+    const crossHits = (crossForm.structuredContent as typeof data).hits;
+    expect(crossHits.filter((hit) => hit.matchType !== 'approximate')).toEqual([]);
+  });
+
+  it('cross-references a GLEIF entity whose legal name differs only in legal-form spelling', async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations([
+      organization('ofac_sdn:44269', 'BUOYANT HOLDINGS LIMITED'),
+    ]);
+    const lei = '2549009T6MXOLIE32077';
+    await harness.service.ingestLeiEntities([
+      {
+        lei,
+        legalName: 'BUOYANT HOLDINGS LTD.',
+        otherNames: [],
+        jurisdiction: 'KY',
+        status: 'ISSUED',
+      },
+    ]);
+    const result = await runToolContract(getEntityTool, { lei });
+    expect(result.isError).toBeFalsy();
+    const { sanctionsHits } = result.structuredContent as {
+      sanctionsHits: { sourceEntryId: string; matchedName?: string; matchType?: string }[];
+    };
+    expect(sanctionsHits).toEqual([
+      expect.objectContaining({
+        sourceEntryId: '44269',
+        matchedName: 'BUOYANT HOLDINGS LIMITED',
+        matchType: 'strong',
+      }),
+    ]);
+    expect(textOf(result)).toContain('matched "BUOYANT HOLDINGS LIMITED"');
+  });
+});
+
+describe('sound-alike surnames on both tool surfaces (issue #92)', () => {
+  let harness: SeededService;
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  const person = (id: string, primaryName: string): NormalizedDesignation => {
+    const [source, sourceEntryId] = id.split(':') as [SourceCode, string];
+    return {
+      id,
+      source,
+      sourceEntryId,
+      entityType: 'person',
+      primaryName,
+      payload: { aliases: [], identifiers: [], addresses: [], datesOfBirth: [], nationalities: [] },
+    };
+  };
+
+  it('completes a strict hit with a sound-alike record and reports its sound count in structuredContent and content', async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations([
+      person('ofac_sdn:12627', 'Hannibal Muammar GADDAFI'),
+      person('un:690771', 'Hannibal Muammar Qadhafi'),
+    ]);
+    const result = await runToolContract(screenNameTool, {
+      name: 'Hannibal Gaddafi',
+      sources: ['ofac_sdn', 'un'],
+    });
+    expect(result.isError).toBeFalsy();
+    const { hits } = result.structuredContent as {
+      hits: {
+        source: SourceCode;
+        sourceEntryId: string;
+        matchType: string;
+        score?: number;
+        queryTokenCoverage?: { covered: number; phonetic?: number; total: number };
+      }[];
+    };
+    expect(
+      hits.map((hit) => [hit.source, hit.sourceEntryId, hit.matchType, hit.queryTokenCoverage]),
+    ).toEqual([
+      ['ofac_sdn', '12627', 'strong', undefined],
+      ['un', '690771', 'approximate', { covered: 2, total: 2, phonetic: 1 }],
+    ]);
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain(
+      '### Hannibal Muammar Qadhafi — approximate · score 1 · covers 2/2 query tokens (1 by sound)\n',
+    );
+    expect(text).toContain('### Hannibal Muammar GADDAFI — strong\n');
+  });
+});
+
 describe('designation merge and deduplication', () => {
   let standalone: SeededService;
 
@@ -709,5 +855,151 @@ describe('native-script names (issue #20)', () => {
     expect(result.modeUsed).toBe('fuzzy');
     expect(result.normalizedQuery).toBe('αφγανικη επιτροπη στηριξησ');
     expect(result.hits.some((hit) => hit.designationId === 'eu:327')).toBe(true);
+  });
+});
+
+// ─── UK and UN native-script names (issue #87) ──────────────────────────────────
+//
+// Parsed from published UK and UN record shapes, so the names under test are the
+// ones the ingest reads. OFAC 47800 publishes the same Han name, typed primary.
+
+const NATIVE_UK_SOURCE = `<Designations>
+  <Designation><UniqueID>GAC0076</UniqueID><IndividualEntityShip>Individual</IndividualEntityShip>
+    <Names><Name><Name1>Levan</Name1><Name6>Murusidze</Name6><NameType>Primary Name</NameType></Name></Names>
+    <NonLatinNames><NonLatinName><NameNonLatinScript>ლევან მურუსიძე</NameNonLatinScript><NonLatinScriptType>Georgian</NonLatinScriptType></NonLatinName></NonLatinNames>
+  </Designation>
+  <Designation><UniqueID>GHR0179</UniqueID><IndividualEntityShip>Individual</IndividualEntityShip>
+    <Names>
+      <Name><Name1>Zhi</Name1><Name6>Chen</Name6><NameType>Primary Name</NameType></Name>
+      <Name><Name6>Vincent</Name6><NameType>Alias</NameType></Name>
+    </Names>
+    <NonLatinNames>
+      <NonLatinName><NameNonLatinScript>ចេន ហ្ស៊ី</NameNonLatinScript><NonLatinScriptType>Khmer</NonLatinScriptType></NonLatinName>
+      <NonLatinName><NameNonLatinScript>陈志</NameNonLatinScript><NonLatinScriptType>Chinese</NonLatinScriptType></NonLatinName>
+    </NonLatinNames>
+  </Designation>
+  <Designation><UniqueID>CYB0044</UniqueID><IndividualEntityShip>Entity</IndividualEntityShip>
+    <Names><Name><Name6>WUHAN XIAORUIZHI SCIENCE AND TECHNOLOGY COMPANY LIMITED </Name6><NameType>Primary Name</NameType></Name></Names>
+    <NonLatinNames><NonLatinName><NameNonLatinScript>武汉晓睿智科技有限责任公司</NameNonLatinScript></NonLatinName></NonLatinNames>
+  </Designation>
+  <Designation><UniqueID>AQD0007</UniqueID><IndividualEntityShip>Entity</IndividualEntityShip>
+    <Names>
+      <Name><Name6>AL MOULATHAMOUN</Name6><NameType>Primary name</NameType></Name>
+      <Name><Name6>Les Enturbannes</Name6><NameType>Alias</NameType></Name>
+    </Names>
+    <NonLatinNames>
+      <NonLatinName><NameNonLatinScript>الملثمون</NameNonLatinScript></NonLatinName>
+      <NonLatinName><NameNonLatinScript>Les Enturbannés</NameNonLatinScript></NonLatinName>
+    </NonLatinNames>
+  </Designation>
+</Designations>`;
+
+const NATIVE_UN_SOURCE = `<CONSOLIDATED_LIST><INDIVIDUALS><INDIVIDUAL>
+  <DATAID>6908048</DATAID><FIRST_NAME>SADDAM</FIRST_NAME><SECOND_NAME>HUSSEIN</SECOND_NAME><THIRD_NAME>AL-TIKRITI</THIRD_NAME>
+  <REFERENCE_NUMBER>IQi.001</REFERENCE_NUMBER><NAME_ORIGINAL_SCRIPT>صدام حسين التكريتي</NAME_ORIGINAL_SCRIPT>
+  <INDIVIDUAL_ALIAS><QUALITY>Low</QUALITY><ALIAS_NAME>Abu Ali</ALIAS_NAME></INDIVIDUAL_ALIAS>
+</INDIVIDUAL></INDIVIDUALS></CONSOLIDATED_LIST>`;
+
+const ofacWuhan: NormalizedDesignation = {
+  id: 'ofac_sdn:47800',
+  source: 'ofac_sdn',
+  sourceEntryId: '47800',
+  entityType: 'organization',
+  primaryName: 'WUHAN XIAORUIZHI SCIENCE AND TECHNOLOGY COMPANY LIMITED',
+  payload: {
+    aliases: [{ name: '武汉晓睿智科技有限责任公司', nameType: 'primary' }],
+    identifiers: [],
+    addresses: [],
+    datesOfBirth: [],
+    nationalities: [],
+  },
+};
+
+describe('UK and UN native-script names (issue #87)', () => {
+  let harness: SeededService;
+  const parsed = () => [
+    ...parseUk(parseXml(NATIVE_UK_SOURCE)),
+    ...parseUn(parseXml(NATIVE_UN_SOURCE)),
+  ];
+
+  beforeEach(async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations([...parsed(), ofacWuhan]);
+  });
+
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  const screen = (query: string, matchMode: 'strict' | 'fuzzy' = 'strict') =>
+    harness.service.screenName({ ...defaults, query, matchMode }, createMockContext());
+
+  it.each([
+    ['ლევან მურუსიძე', ['uk:GAC0076'], 'aka'],
+    ['ចេន ហ្ស៊ី', ['uk:GHR0179'], 'aka'],
+    ['صدام حسين التكريتي', ['un:6908048'], 'primary'],
+    ['武汉晓睿智科技有限责任公司', ['ofac_sdn:47800', 'uk:CYB0044'], undefined],
+  ])('screens %j exactly onto the record that publishes it', async (query, ids, nameType) => {
+    const result = await screen(query);
+    expect(result.modeUsed).toBe('strict');
+    expect(result.hits.map((hit) => hit.designationId).sort()).toEqual(ids);
+    for (const hit of result.hits) {
+      expect(hit).toMatchObject({ matchType: 'exact', matchedName: query });
+      if (nameType) expect(hit.matchedNameType).toBe(nameType);
+    }
+  });
+
+  it('indexes a name row for every published native-script name', async () => {
+    const handle = await harness.service.designations.raw();
+    const rows = handle
+      .prepare<{ designation_id: string; name: string; name_type: string }>(
+        `SELECT designation_id, name, name_type FROM name WHERE designation_id IN ('uk:GAC0076', 'uk:GHR0179', 'uk:CYB0044', 'uk:AQD0007', 'un:6908048') ORDER BY rowid`,
+      )
+      .all();
+    expect(rows.filter((row) => row.designation_id === 'uk:GHR0179')).toEqual([
+      { designation_id: 'uk:GHR0179', name: 'Zhi Chen', name_type: 'primary' },
+      { designation_id: 'uk:GHR0179', name: 'Vincent', name_type: 'aka' },
+      { designation_id: 'uk:GHR0179', name: 'ចេន ហ្ស៊ី', name_type: 'aka' },
+      { designation_id: 'uk:GHR0179', name: '陈志', name_type: 'aka' },
+    ]);
+    expect(rows).toHaveLength(parsed().reduce((n, d) => n + 1 + d.payload.aliases.length, 0));
+  });
+
+  it('keeps the primary name and the Latin match of each record', async () => {
+    expect((await harness.service.getDesignation('uk', 'GAC0076'))?.primaryName).toBe(
+      'Levan Murusidze',
+    );
+    expect((await harness.service.getDesignation('un', '6908048'))?.primaryName).toBe(
+      'SADDAM HUSSEIN AL-TIKRITI',
+    );
+    // The Names block's `Les Enturbannes` and the published `Les Enturbannés` fold
+    // alike; the earlier row stays the match.
+    for (const [query, matchedName] of [
+      ['Les Enturbannés', 'Les Enturbannes'],
+      ['Levan Murusidze', 'Levan Murusidze'],
+      ['Saddam Hussein Al-Tikriti', 'SADDAM HUSSEIN AL-TIKRITI'],
+    ] as const) {
+      const [hit] = (await screen(query)).hits;
+      expect(hit, query).toMatchObject({ matchType: 'exact', matchedName });
+    }
+    const fuzzy = await screen('Levan Murusidse', 'fuzzy');
+    expect(fuzzy.hits.find((hit) => hit.designationId === 'uk:GAC0076')).toMatchObject({
+      matchType: 'approximate',
+      matchedName: 'Levan Murusidze',
+    });
+  });
+
+  it('carries the native-script match on both tool surfaces', async () => {
+    const result = await runToolContract(screenNameTool, { name: 'ლევან მურუსიძე' });
+    expect(result.isError).toBeFalsy();
+    const { hits } = result.structuredContent as {
+      hits: { matchedName: string; matchedNameType: string; sourceEntryId: string }[];
+    };
+    expect(hits).toMatchObject([
+      { sourceEntryId: 'GAC0076', matchedName: 'ლევან მურუსიძე', matchedNameType: 'aka' },
+    ]);
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('"ლევან მურუსიძე" (aka)');
+    expect(text).toContain('**Entry ID:** GAC0076');
   });
 });

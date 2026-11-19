@@ -44,7 +44,7 @@ describe('sanctions_screen_name format()', () => {
           matchedNameType: 'aka',
           matchType: 'approximate',
           score: 0.912_345,
-          queryTokenCoverage: { covered: 2, total: 3 },
+          queryTokenCoverage: { covered: 2, total: 3, phonetic: 1 },
           program: 'UKRAINE-EO13662',
           designationDate: '2019-03-15',
           birthDates: [{ date: '1968–1972', circa: true }, { date: '1970-07' }],
@@ -58,7 +58,7 @@ describe('sanctions_screen_name format()', () => {
     expect(text).toContain('1 potential match(es)');
     expect(text).toContain('Ivan Testovich Volkov — approximate');
     expect(text).toContain('score 0.912345'); // the same raw value as structuredContent
-    expect(text).toContain('covers 2/3 query tokens'); // the secondary ranking key
+    expect(text).toContain('covers 2/3 query tokens (1 by sound)'); // the secondary ranking key
     expect(text).toContain('OFAC Specially Designated Nationals');
     expect(text).toContain('Entry ID:** FX-1001');
     expect(text).toContain('Matched on:** "Ivan Wolkow" (aka)');
@@ -97,6 +97,40 @@ describe('sanctions_screen_name format()', () => {
     expect(text).not.toContain('Nationalities:');
     expect(text).not.toContain('Address countries:');
     expect(text).not.toContain('Also listed on');
+  });
+
+  it('shows a sound-matched count exactly where the coverage carries one (issue #92)', () => {
+    const hit = (sourceEntryId: string, queryTokenCoverage: Record<string, number>) => ({
+      source: 'un',
+      sourceLabel: 'UN Security Council Consolidated List',
+      sourceEntryId,
+      sources: ['un'],
+      entityType: 'person',
+      primaryName: `Hannibal Muammar Qadhafi ${sourceEntryId}`,
+      matchedName: 'Hannibal Muammar Qadhafi',
+      matchedNameType: 'primary',
+      matchType: 'approximate',
+      score: 1,
+      queryTokenCoverage,
+    });
+    const payload = {
+      hits: [
+        hit('SOUND', { covered: 2, total: 2, phonetic: 1 }),
+        hit('SPELL', { covered: 2, total: 2 }),
+      ],
+      caveat: SCREENING_CAVEAT,
+    };
+    const parsed = screenNameTool.output.parse(payload);
+    expect(parsed.hits.map((h) => h.queryTokenCoverage)).toStrictEqual([
+      { covered: 2, total: 2, phonetic: 1 },
+      { covered: 2, total: 2 },
+    ]);
+    const text = render(screenNameTool, payload);
+    expect(text).toContain(
+      'Qadhafi SOUND — approximate · score 1 · covers 2/2 query tokens (1 by sound)\n',
+    );
+    expect(text).toContain('Qadhafi SPELL — approximate · score 1 · covers 2/2 query tokens\n');
+    expect(text.match(/by sound/g)).toHaveLength(1);
   });
 
   it('names every list of a grouped OFAC hit, and whose record the date is (issue #61)', () => {
@@ -389,6 +423,8 @@ describe('sanctions_get_entity format()', () => {
     legalName: 'Fictional Trading Company LLC',
     otherNames: [],
     alternateNames: [],
+    entityStatus: 'ACTIVE',
+    entityStatusLoaded: true,
     sanctionsHits: [],
     screeningStatus: 'screened',
     caveat: SCREENING_CAVEAT,
@@ -621,6 +657,72 @@ describe('sanctions_get_entity format()', () => {
     expect(text).not.toContain('count basis');
     expect(text).not.toContain('Screened:');
   });
+
+  it('renders the entity status beside the registration status and every successor by LEI, name, or both (#94)', () => {
+    const text = render(getEntityTool, {
+      ...base,
+      status: 'RETIRED',
+      entityStatus: 'INACTIVE',
+      successors: [
+        { lei: '549300SZJ9VS8SGXAN81' },
+        { name: 'Ｒ１株式会社' },
+        { lei: '254900SPRNGTRUST0028', name: 'Acme *Star* Holdings' },
+      ],
+    });
+
+    expect(text).toContain('**Registration status:** RETIRED\n**Entity status:** INACTIVE\n');
+    expect(text).toContain(
+      '**Successor entities:** `549300SZJ9VS8SGXAN81`; Ｒ１株式会社 (no LEI); `254900SPRNGTRUST0028` (Acme \\*Star\\* Holdings) — pass a successor LEI to sanctions_get_entity or sanctions_trace_ownership; successors are not screened here.',
+    );
+    expect(text).not.toContain('none published');
+    expect(text).not.toContain('not loaded for this record');
+  });
+
+  it('renders a loaded record with no successor as none published (#94)', () => {
+    const text = render(getEntityTool, base);
+
+    expect(text).toContain('**Entity status:** ACTIVE');
+    expect(text).toContain('**Successor entities:** none published');
+    expect(text).not.toContain('not loaded for this record');
+  });
+
+  it('renders a record stored before entity status was read as not loaded, never as no successor (#94)', () => {
+    const { entityStatus: _omitted, ...stored } = base;
+    const text = render(getEntityTool, { ...stored, status: 'RETIRED', entityStatusLoaded: false });
+
+    expect(text).toContain(
+      '**Entity status and successors:** not loaded for this record — it was stored before they were read, so this does not mean no successor. A GLEIF refresh that updates the record, or mirror:init, loads them.',
+    );
+    expect(text).not.toContain('**Entity status:**');
+    expect(text).not.toContain('Successor entities');
+    expect(text).not.toContain('none published');
+  });
+
+  it('requires entityStatusLoaded and keeps a successor without its optional fields valid (#94)', () => {
+    const { entityStatusLoaded: _omitted, ...withoutFlag } = base;
+    expect(() => getEntityTool.output.parse(withoutFlag)).toThrow();
+    expect(
+      getEntityTool.output.parse({ ...base, successors: [{ name: 'Ｒ１株式会社' }] }).successors,
+    ).toEqual([{ name: 'Ｒ１株式会社' }]);
+  });
+
+  it('escapes Markdown punctuation in every GLEIF name it renders, keeping the payload as written', () => {
+    const payload = {
+      ...base,
+      legalName: 'Acme *Star* [Holdings] Ltd',
+      otherNames: ['Star <Trading> Co'],
+      alternateNames: [{ name: 'Star <Trading> Co', type: 'TRADING_OR_OPERATING_NAME' }],
+    };
+    const text = render(getEntityTool, payload);
+
+    expect(text).toContain('# Acme \\*Star\\* \\[Holdings\\] Ltd\n');
+    expect(text).toContain('**Other names:** Star \\<Trading> Co\n');
+    expect(text).toContain('**Names by type:** Star \\<Trading> Co (TRADING_OR_OPERATING_NAME)\n');
+    expect(text).not.toContain('*Star*');
+    const parsed = getEntityTool.output.parse(payload);
+    expect(parsed.legalName).toBe('Acme *Star* [Holdings] Ltd');
+    expect(parsed.otherNames).toEqual(['Star <Trading> Co']);
+  });
 });
 
 describe('sanctions_trace_ownership format()', () => {
@@ -639,7 +741,6 @@ describe('sanctions_trace_ownership format()', () => {
     hasMore: false,
     truncationReasons: [],
     missingEntityCount: 0,
-    byteTargetExceeded: false,
   };
 
   /** A node's entity line in the Entities section, plus every indented line under it. */
@@ -1148,6 +1249,7 @@ describe('sanctions_list_sources format()', () => {
       leiAsOf: '2026-06-01T13:00:00.000Z',
       reportingExceptionsLoaded: true,
       alternateNamesIndexed: true,
+      entityStatusLoaded: true,
       sources: [
         source,
         {
@@ -1176,6 +1278,9 @@ describe('sanctions_list_sources format()', () => {
     expect(text).not.toMatch(/reporting exceptions:\*\* not loaded/i);
     expect(text).toContain('**GLEIF alternate-name index:** built');
     expect(text).not.toContain('not built');
+    expect(text).toContain(
+      '**GLEIF entity status and successors:** loaded for every entity in the last full GLEIF load\n',
+    );
   });
 
   it('reports an unsynced mirror as NOT ready with no timestamp', () => {
@@ -1184,6 +1289,7 @@ describe('sanctions_list_sources format()', () => {
       leiReady: false,
       reportingExceptionsLoaded: false,
       alternateNamesIndexed: false,
+      entityStatusLoaded: false,
       sources: [{ ...source, recordCount: 0 }],
     });
 
@@ -1201,6 +1307,8 @@ describe('sanctions_list_sources format()', () => {
       '**GLEIF alternate-name index:** none yet — the GLEIF mirror has never completed a load. mirror:init loads the golden copy and builds the index with it.',
     );
     expect(text).not.toContain('not built');
+    // The "NOT ready" line already says no entity is loaded; no status line repeats it.
+    expect(text).not.toContain('entity status and successors');
   });
 
   it('states an unbuilt name index on a ready mirror, with what it costs resolution and what builds it', () => {
@@ -1209,12 +1317,166 @@ describe('sanctions_list_sources format()', () => {
       leiReady: true,
       reportingExceptionsLoaded: true,
       alternateNamesIndexed: false,
+      entityStatusLoaded: true,
       sources: [source],
     });
     expect(text).toContain(
       '**GLEIF alternate-name index:** not built — sanctions_resolve_entity searches legal names only',
     );
     expect(text).toContain('mirror:init');
+  });
+
+  it('states entity status not loaded on a ready mirror, pointing at each record and at mirror:init (#94)', () => {
+    const text = render(listSourcesTool, {
+      sanctionsReady: true,
+      leiReady: true,
+      reportingExceptionsLoaded: true,
+      alternateNamesIndexed: true,
+      entityStatusLoaded: false,
+      sources: [source],
+    });
+    expect(text).toContain(
+      '**GLEIF entity status and successors:** not loaded for every entity — a record stored before they were read says so in its own entityStatusLoaded. mirror:init reloads the GLEIF golden copy and loads them.',
+    );
+    expect(text).not.toContain('loaded for every entity in the last full GLEIF load');
+  });
+
+  it('rejects a sources payload without the entity-status flag (#94)', () => {
+    expect(() =>
+      render(listSourcesTool, {
+        sanctionsReady: true,
+        leiReady: true,
+        reportingExceptionsLoaded: true,
+        alternateNamesIndexed: true,
+        sources: [source],
+      }),
+    ).toThrow();
+  });
+
+  /** A ready mirror's flags, for the per-list harvest and refresh cases (#88). */
+  const ready = {
+    sanctionsReady: true,
+    sanctionsAsOf: '2026-11-18T04:00:00.000Z',
+    leiReady: true,
+    reportingExceptionsLoaded: true,
+    alternateNamesIndexed: true,
+    entityStatusLoaded: true,
+  };
+  const uk = {
+    code: 'uk',
+    label: 'UK Sanctions List (FCDO)',
+    recordCount: 5_900,
+    url: 'https://sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.xml',
+    license: 'Open Government Licence v3.0 (attribution required)',
+  };
+  const gleif = {
+    code: 'gleif',
+    label: 'GLEIF LEI (Level 1 entities + Level 2 ownership)',
+    recordCount: 3,
+    relationshipCount: 2,
+    url: 'https://goldencopy.gleif.org',
+    license: 'CC0 1.0 Universal (public domain)',
+  };
+
+  it("renders each list's last harvest and document date as stored, and no refresh line after a refresh that succeeded (#88)", () => {
+    const text = render(listSourcesTool, {
+      ...ready,
+      sources: [
+        { ...source, lastHarvestedAt: '2026-11-19T04:01:02.345Z' },
+        { ...uk, lastHarvestedAt: '2026-11-19T04:01:03.000Z', publishedAt: '2026-11-17' },
+        {
+          ...source,
+          code: 'eu',
+          label: 'EU Consolidated Financial Sanctions List',
+          lastHarvestedAt: '2026-11-19T04:01:04.000Z',
+          publishedAt: '2026-10-23T17:05:43.888+02:00',
+        },
+        gleif,
+      ],
+    });
+
+    // A date-only value stays a date; an offset and fraction are kept.
+    expect(text).toContain(
+      '**Last harvested:** 2026-11-19T04:01:03.000Z | **Document date:** 2026-11-17\n',
+    );
+    expect(text).toContain(
+      '**Last harvested:** 2026-11-19T04:01:04.000Z | **Document date:** 2026-10-23T17:05:43.888+02:00\n',
+    );
+    // Harvested from a document that carried no date this server reads.
+    expect(text).toContain(
+      '**Last harvested:** 2026-11-19T04:01:02.345Z | **Document date:** none read from the document\n',
+    );
+    expect(text).not.toContain('**Last sanctions refresh:**');
+    expect(text).not.toContain('**Per-list harvest:**');
+    // The GLEIF row is not a harvested list.
+    const gleifSection = text.slice(text.indexOf('(`gleif`)'));
+    expect(gleifSection).not.toContain('Last harvested');
+  });
+
+  it('states how to read a list with no recorded harvest, never borrowing sanctionsAsOf as its date (#88)', () => {
+    const none = render(listSourcesTool, { ...ready, sources: [source, uk, gleif] });
+    expect(none).toContain(
+      "**Per-list harvest:** not recorded yet for any list — this server records a list's harvest time and document date from its next successful harvest on, so an absent date is unknown, not old. sanctionsAsOf dates the whole mirror, not any one list.\n",
+    );
+    expect(none.match(/\*\*Last harvested:\*\* not recorded\n/g)).toHaveLength(2);
+    expect(none).not.toContain(`**Last harvested:** ${ready.sanctionsAsOf}`);
+    expect(none).not.toContain('**Document date:**');
+
+    const some = render(listSourcesTool, {
+      ...ready,
+      sources: [source, { ...uk, lastHarvestedAt: '2026-11-19T04:01:03.000Z' }, gleif],
+    });
+    expect(some).toContain('**Per-list harvest:** not recorded yet for `ofac_sdn` — ');
+  });
+
+  it.each([
+    [
+      'running',
+      { status: 'in_progress', startedAt: '2026-11-19T04:00:00.000Z' },
+      '**Last sanctions refresh:** in_progress, started 2026-11-19T04:00:00.000Z — each list below shows its last finished harvest until this run ends; a run killed before it finished also reads as in_progress.\n',
+    ],
+    [
+      'failed for named lists',
+      {
+        status: 'error',
+        startedAt: '2026-11-19T04:00:00.000Z',
+        failedSources: ['uk', 'bis_el'],
+      },
+      '**Last sanctions refresh:** error, started 2026-11-19T04:00:00.000Z — the harvest failed for `uk`, `bis_el`; each keeps its previous harvest below. sanctionsAsOf stays at the last refresh in which every list harvested.\n',
+    ],
+    [
+      'failed with no list failed',
+      { status: 'error', startedAt: '2026-11-19T04:00:00.000Z', failedSources: [] },
+      "**Last sanctions refresh:** error, started 2026-11-19T04:00:00.000Z — no list's harvest failed: the run stopped before it finished (cancelled or out of time), and a list whose last harvest is earlier than that start was not refreshed by it. sanctionsAsOf stays at the last refresh in which every list harvested.\n",
+    ],
+    [
+      'failed with no outcome recorded',
+      { status: 'error', startedAt: '2026-11-19T04:00:00.000Z' },
+      "**Last sanctions refresh:** error, started 2026-11-19T04:00:00.000Z — no list's outcome is recorded for this run, so which lists failed is unknown. sanctionsAsOf stays at the last refresh in which every list harvested.\n",
+    ],
+    [
+      'failed with no recorded start',
+      { status: 'error', failedSources: ['uk'] },
+      '**Last sanctions refresh:** error — the harvest failed for `uk`; each keeps its previous harvest below. sanctionsAsOf stays at the last refresh in which every list harvested.\n',
+    ],
+  ] as const)('renders a %s refresh in words (#88)', (_state, lastRefresh, line) => {
+    const text = render(listSourcesTool, {
+      ...ready,
+      lastRefresh,
+      sources: [{ ...uk, lastHarvestedAt: '2026-11-18T04:01:03.000Z', publishedAt: '2026-11-17' }],
+    });
+    expect(text).toContain(line);
+    expect(text.match(/\*\*Last sanctions refresh:\*\*/g)).toHaveLength(1);
+  });
+
+  it('rejects a lastRefresh state the payload never carries, and a failed list that is not a sanctions list (#88)', () => {
+    for (const lastRefresh of [
+      { status: 'complete', startedAt: '2026-11-19T04:00:00.000Z' },
+      { status: 'pending' },
+      { status: 'error', failedSources: ['gleif'] },
+    ]) {
+      expect(() => render(listSourcesTool, { ...ready, lastRefresh, sources: [uk] })).toThrow();
+    }
   });
 });
 
@@ -1260,6 +1522,76 @@ describe('published reference numbers in format() (issue #42)', () => {
       '**Entry ID:** 113458 | **Reference:** QDe.004',
     );
     expect(render(getDesignationTool, record)).not.toContain('Reference:');
+  });
+});
+
+describe('UN reference numbers in format() (issue #89)', () => {
+  const hit = {
+    source: 'uk',
+    sourceLabel: 'UK Sanctions List (FCDO)',
+    sourceEntryId: 'AFG0001',
+    sources: ['uk'],
+    entityType: 'organization',
+    primaryName: 'HAJI KHAIRULLAH HAJI SATTAR MONEY EXCHANGE',
+    matchedName: 'HAJI KHAIRULLAH HAJI SATTAR MONEY EXCHANGE',
+    matchedNameType: 'primary',
+    matchType: 'exact',
+  };
+  const record = {
+    source: 'uk',
+    sourceLabel: 'UK Sanctions List (FCDO)',
+    sourceEntryId: 'AFG0001',
+    entityType: 'organization',
+    primaryName: 'HAJI KHAIRULLAH HAJI SATTAR MONEY EXCHANGE',
+    aliases: [],
+    identifiers: [],
+    addresses: [],
+    datesOfBirth: [],
+    nationalities: [],
+    features: [],
+    caveat: SCREENING_CAVEAT,
+  };
+
+  it('renders a screen_name hit UN reference after its reference number, alone, or not at all', () => {
+    const both = { ...hit, referenceNumber: '12703', unReferenceNumber: 'TAe.010' };
+    expect(render(screenNameTool, { hits: [both], caveat: SCREENING_CAVEAT })).toContain(
+      '**Entry ID:** AFG0001 | **Reference:** 12703 | **UN reference:** TAe.010 | **Type:** organization',
+    );
+    const alone = { ...hit, unReferenceNumber: 'TAe.010' };
+    expect(render(screenNameTool, { hits: [alone], caveat: SCREENING_CAVEAT })).toContain(
+      '**Entry ID:** AFG0001 | **UN reference:** TAe.010 | **Type:** organization',
+    );
+    expect(render(screenNameTool, { hits: [hit], caveat: SCREENING_CAVEAT })).not.toContain(
+      'UN reference',
+    );
+  });
+
+  it('renders a designation UN reference after its reference number, alone, or not at all', () => {
+    expect(
+      render(getDesignationTool, {
+        ...record,
+        referenceNumber: '12703',
+        unReferenceNumber: 'TAe.010',
+      }),
+    ).toContain('**Entry ID:** AFG0001 | **Reference:** 12703 | **UN reference:** TAe.010\n');
+    expect(render(getDesignationTool, { ...record, unReferenceNumber: 'TAe.010' })).toContain(
+      '**Entry ID:** AFG0001 | **UN reference:** TAe.010\n',
+    );
+    expect(render(getDesignationTool, record)).not.toContain('UN reference');
+  });
+
+  it('keeps the value on both surfaces exactly as published', () => {
+    // Values the lists publish off the UN's own form: case, padding.
+    for (const value of ['QDE.145', 'LYi.28']) {
+      const parsed = getDesignationTool.output.parse({ ...record, unReferenceNumber: value });
+      expect(parsed.unReferenceNumber).toBe(value);
+      expect(render(getDesignationTool, parsed)).toContain(`**UN reference:** ${value}`);
+      const hits = screenNameTool.output.parse({
+        hits: [{ ...hit, unReferenceNumber: value }],
+        caveat: SCREENING_CAVEAT,
+      }).hits;
+      expect(hits[0]?.unReferenceNumber).toBe(value);
+    }
   });
 });
 

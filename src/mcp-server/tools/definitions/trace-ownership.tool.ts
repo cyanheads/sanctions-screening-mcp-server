@@ -41,7 +41,6 @@ import {
   screenedInputText,
 } from './_shared.js';
 
-const PAGE_BYTE_TARGET = 64 * 1024;
 const PAGE_LIMIT = 100;
 
 const BoundarySchema = z
@@ -61,9 +60,9 @@ const BoundarySchema = z
   .describe('One omitted same-side branch, with executable inputs for a new trace segment.');
 type Boundary = z.infer<typeof BoundarySchema>;
 
-const CursorSchema = z.object({
+const CursorSchema = z.strictObject({
   version: z.literal(1),
-  query: z.object({
+  query: z.strictObject({
     lei: z.string(),
     direction: z.enum(['parents', 'children', 'both']),
     depth: z.number().int(),
@@ -104,25 +103,6 @@ const ParentLevelSchema = z.object({
       'Every reason given in the reporting exception (e.g. NATURAL_PERSONS, NON_CONSOLIDATING, NO_KNOWN_PERSON). Present only when status is exception.',
     ),
 });
-
-/** Measure both public surfaces, including continuation and disclosure overhead. */
-function pageBytes(page: unknown, notice?: string): number {
-  const result = traceOwnershipTool.output.parse(page);
-  const content = traceOwnershipTool.format?.(result) ?? [];
-  if (notice !== undefined)
-    content.push({ type: 'text', text: `\n\n${renderLimitNotice(notice)}` });
-  return Buffer.byteLength(
-    JSON.stringify({
-      structuredContent: notice === undefined ? result : { ...result, notice },
-      content,
-    }),
-  );
-}
-
-/** Shared with the framework enrichment trailer so byte accounting uses the emitted notice. */
-function renderLimitNotice(notice: unknown): string {
-  return `> ${String(notice)}`;
-}
 
 /**
  * Potential matches returned per node by the cross-reference, after its merge. A
@@ -421,7 +401,7 @@ function parentLevelText(
 export const traceOwnershipTool = tool('sanctions_trace_ownership', {
   title: 'sanctions-screening-mcp-server: trace ownership',
   description:
-    'Trace a paged GLEIF Level 2 ownership segment from a 20-character LEI (use sanctions_resolve_entity to obtain one). Direction both walks parents and children separately from the root, never sideways into siblings or co-parents; parents-side placement wins cycles. Ultimate-parent edges are shortcuts, never walked hops; ultimate-only nodes are flagged reachedVia: ultimate. Drain nextCursor with the same query, then re-root each boundary with its LEI, same-side direction and depth, including at depth five; deduplicate branch roots and edges across segments. Pages emit nodes, then edges, then boundaries, up to limit records (50 default, 100 maximum), stopping after an intact record reaches the soft 64-KiB target. Edges reference nodes across assembled pages. Cursors bind query and topology; changed topology requires restarting without a cursor. Entity and screening values read current mirrors, not an immutable snapshot. Set screenNodes to cross-reference only this page of nodes as sanctions_get_entity does: legal, other and transliterated names strict (exact then all tokens present, never fuzzy), LEI and country-matched registration number as exact non-document identifiers, with merged designation hits and matchedOn inputs. A node missing Level 1 is screened by LEI alone. Every hit is a candidate to verify; no hit is a clearance. Each eligible node retains direct and ultimate parentStatus: relationship, reporting exception and its reasons, none, or unknown when exceptions are not loaded. Read hasMore and truncationReasons separately from segment-wide missingEntityCount and page-local missingEntityLeis, screening counts and per-node ten-hit cap disclosures. A screening aid, not a compliance determination; a finished segment never proves full beneficial ownership.',
+    'Trace a paged GLEIF Level 2 ownership segment from a 20-character LEI (use sanctions_resolve_entity to obtain one). Direction both walks parents and children separately from the root, never sideways into siblings or co-parents; parents-side placement wins cycles. Ultimate-parent edges are shortcuts, never walked hops; ultimate-only nodes are flagged reachedVia: ultimate. Drain nextCursor with the same query, then re-root each boundary with its LEI, same-side direction and depth, including at depth five; deduplicate branch roots and edges across segments. Pages emit nodes, then edges, then boundaries: limit records each (50 default, 100 maximum), the last page the remainder. Edges reference nodes across assembled pages. Cursors bind query and topology; changed topology requires restarting without a cursor. Entity and screening values read current mirrors, not an immutable snapshot. Set screenNodes to cross-reference only this page of nodes as sanctions_get_entity does: legal, other and transliterated names strict (exact then all tokens present, a legal form matching any spelling of the same form, never fuzzy), LEI and country-matched registration number as exact non-document identifiers, with merged designation hits and matchedOn inputs. A node missing Level 1 is screened by LEI alone. Every hit is a candidate to verify; no hit is a clearance. Each eligible node retains direct and ultimate parentStatus: relationship, reporting exception and its reasons, none, or unknown when exceptions are not loaded. Read hasMore and truncationReasons separately from segment-wide missingEntityCount and page-local missingEntityLeis, screening counts and per-node ten-hit cap disclosures. A screening aid, not a compliance determination; a finished segment never proves full beneficial ownership.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     lei: LeiInputSchema.describe('The 20-character GLEIF LEI at the root of the ownership graph.'),
@@ -452,7 +432,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       .min(1)
       .default(50)
       .describe(
-        'Maximum records across nodes, edges and boundaries per page (default 50, requests above 100 clamp with notice).',
+        'Records per page across nodes, edges and boundaries; every page but the last holds exactly this many (default 50, requests above 100 clamp with notice). Lower it for smaller pages: a screened node at its ten-hit cap is the largest record.',
       ),
     cursor: z
       .string()
@@ -632,11 +612,6 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       .describe(
         'Number of nodes absent from Level 1 across the entire segment, including earlier and later pages.',
       ),
-    byteTargetExceeded: z
-      .boolean()
-      .describe(
-        'Serialized structuredContent plus content exceeds the soft 64-KiB target; indivisible records are retained intact.',
-      ),
     complete: z
       .boolean()
       .describe(
@@ -675,7 +650,6 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
   enrichment: {
     notice: z.string().optional().describe('Input normalization notice when limit was clamped.'),
   },
-  enrichmentTrailer: { notice: { render: renderLimitNotice } },
   errors: [
     {
       reason: 'invalid_cursor',
@@ -743,11 +717,9 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       (a, b) => a.depth - b.depth || lexical(a.lei, b.lei),
     );
     const limit = Math.min(input.limit, PAGE_LIMIT);
-    const limitNotice =
-      input.limit > PAGE_LIMIT
-        ? `Requested limit ${input.limit} clamped to ${PAGE_LIMIT} records.`
-        : undefined;
-    if (limitNotice !== undefined) ctx.enrich.notice(limitNotice);
+    if (input.limit > PAGE_LIMIT) {
+      ctx.enrich.notice(`Requested limit ${input.limit} clamped to ${PAGE_LIMIT} records.`);
+    }
     const query = {
       lei,
       direction: input.direction,
@@ -775,8 +747,6 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     const existing = await svc.existingLeiEntities(orderedNodes.map((node) => node.lei));
     const missingEntityCount = orderedNodes.length - existing.size;
     const reportingExceptionsLoaded = await svc.reportingExceptionsLoaded();
-    const statusByLei = new Map<string, Record<ParentLevel, ParentLevelStatus>>();
-    const missingEntityLeis: string[] = [];
 
     const sanctionsReady = await svc.sanctionsReady();
     const screened = input.screenNodes && sanctionsReady;
@@ -785,14 +755,66 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       : input.screenNodes
         ? 'not_ready'
         : 'not_requested';
-    let screenedNodeCount = 0;
-    let flaggedNodeCount = 0;
-    const screensByLei = new Map<string, CrossReferenceResult>();
 
-    const pageNodes: GraphNode[] = [];
-    const pageEdges: GraphEdge[] = [];
-    const pageBoundaries: Boundary[] = [];
-    const buildPage = (nextOffset: number, byteTargetExceeded = false) => ({
+    const stream = [
+      ...orderedNodes.map((node) => ({ kind: 'node' as const, node })),
+      ...edges.map((edge) => ({ kind: 'edge' as const, edge })),
+      ...boundaries.map((boundary) => ({ kind: 'boundary' as const, boundary })),
+    ];
+    const page = stream.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    const pageNodes = page.flatMap((record) => (record.kind === 'node' ? [record.node] : []));
+    const pageEdges = page.flatMap((record) => (record.kind === 'edge' ? [record.edge] : []));
+    const pageBoundaries = page.flatMap((record) =>
+      record.kind === 'boundary' ? [record.boundary] : [],
+    );
+
+    // Only this page's nodes are hydrated, given parent statuses, and screened.
+    const entityByLei = new Map(
+      (pageNodes.length > 0
+        ? await svc.getLeiEntitiesBatch(pageNodes.map((node) => node.lei))
+        : []
+      ).map((e) => [e.lei, e]),
+    );
+    const missingEntityLeis: string[] = [];
+    for (const node of pageNodes) {
+      const e = entityByLei.get(node.lei);
+      if (!e) {
+        missingEntityLeis.push(node.lei);
+        continue;
+      }
+      node.legalName = e.legalName;
+      if (e.jurisdiction) node.jurisdiction = e.jurisdiction;
+      if (e.status) node.status = e.status;
+    }
+    const statusByLei = await parentStatuses(
+      svc,
+      new Map(
+        pageNodes.flatMap((node) => {
+          const parentTypes = parentTypesByLei.get(node.lei);
+          return parentTypes ? [[node.lei, parentTypes] as const] : [];
+        }),
+      ),
+      reportingExceptionsLoaded,
+    );
+    const screensByLei = new Map<string, CrossReferenceResult>();
+    if (screened) {
+      for (const node of pageNodes) {
+        ctx.signal.throwIfAborted();
+        screensByLei.set(
+          node.lei,
+          await crossReferenceEntity(
+            svc,
+            entityByLei.get(node.lei) ?? { lei: node.lei },
+            PER_NODE_SCREEN_LIMIT,
+            ctx,
+          ),
+        );
+      }
+    }
+    const flaggedNodeCount = [...screensByLei.values()].filter((s) => s.hits.length > 0).length;
+
+    return {
       rootLei: lei,
       nodes: pageNodes.map((node) => {
         const screen = screensByLei.get(node.lei);
@@ -851,70 +873,23 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
         ),
       ],
       missingEntityCount,
-      byteTargetExceeded,
       complete:
         nextOffset === totalAvailable && boundaries.length === 0 && missingEntityCount === 0,
       truncated: nextOffset < totalAvailable || boundaries.length > 0,
       reportingExceptionsLoaded,
       missingEntityLeis,
       screeningStatus,
-      screenedNodeCount,
+      screenedNodeCount: screensByLei.size,
       flaggedNodeCount,
       caveat: SCREENING_CAVEAT,
-    });
-    const stream = [
-      ...orderedNodes.map((node) => ({ kind: 'node' as const, node })),
-      ...edges.map((edge) => ({ kind: 'edge' as const, edge })),
-      ...boundaries.map((boundary) => ({ kind: 'boundary' as const, boundary })),
-    ];
-    let nextOffset = offset;
-    for (const record of stream.slice(offset, offset + limit)) {
-      ctx.signal.throwIfAborted();
-      if (record.kind === 'node') {
-        const node = record.node;
-        // Hydrate only the record being appended. A screened node is never discarded.
-        const [e] = await svc.getLeiEntitiesBatch([node.lei]);
-        if (e) {
-          node.legalName = e.legalName;
-          if (e.jurisdiction) node.jurisdiction = e.jurisdiction;
-          if (e.status) node.status = e.status;
-        } else missingEntityLeis.push(node.lei);
-        const parentTypes = parentTypesByLei.get(node.lei);
-        if (parentTypes) {
-          const statuses = await parentStatuses(
-            svc,
-            new Map([[node.lei, parentTypes]]),
-            reportingExceptionsLoaded,
-          );
-          for (const [lei, status] of statuses) statusByLei.set(lei, status);
-        }
-        if (screened) {
-          const screen = await crossReferenceEntity(
-            svc,
-            e ?? { lei: node.lei },
-            PER_NODE_SCREEN_LIMIT,
-            ctx,
-          );
-          screensByLei.set(node.lei, screen);
-          screenedNodeCount++;
-          if (screen.hits.length > 0) flaggedNodeCount++;
-        }
-        pageNodes.push(node);
-      } else if (record.kind === 'edge') pageEdges.push(record.edge);
-      else pageBoundaries.push(record.boundary);
-      nextOffset++;
-      if (pageBytes(buildPage(nextOffset), limitNotice) >= PAGE_BYTE_TARGET) break;
-    }
-    const page = buildPage(nextOffset);
-    page.byteTargetExceeded = pageBytes(page, limitNotice) > PAGE_BYTE_TARGET;
-    return page;
+    };
   },
 
   format: (r) => {
     const lines = [`# Ownership graph for \`${r.rootLei}\``, ''];
     lines.push(`**${r.nodes.length} node(s), ${r.edges.length} edge(s).**`);
     lines.push(
-      `**Segment page:** totalAvailable: ${r.totalAvailable} records (nodes + edges + boundaries); totalAvailableBasis: ${r.totalAvailableBasis}; hasMore: ${r.hasMore}; byteTargetExceeded: ${r.byteTargetExceeded}${r.byteTargetExceeded ? ' (soft target exceeded; records retained intact)' : ''}; missingEntityCount: ${r.missingEntityCount}; truncationReasons: ${JSON.stringify(r.truncationReasons)}.`,
+      `**Segment page:** totalAvailable: ${r.totalAvailable} records (nodes + edges + boundaries); totalAvailableBasis: ${r.totalAvailableBasis}; hasMore: ${r.hasMore}; missingEntityCount: ${r.missingEntityCount}; truncationReasons: ${JSON.stringify(r.truncationReasons)}.`,
     );
     lines.push(
       'Pages read current mirrors, not an immutable snapshot. Assemble nodes and edges across pages; a finished segment is not proof of full beneficial ownership.',

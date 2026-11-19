@@ -1,6 +1,7 @@
 /**
  * @fileoverview Unit tests for the pure text-matching primitives: folding,
- * tokenization, FTS match building, Jaro-Winkler, and Double-Metaphone. These
+ * tokenization, FTS match building, the legal-form fold and its widened match,
+ * Jaro-Winkler, and Double-Metaphone. These
  * are the source of the real signal the matching engine surfaces.
  * @module tests/services/text-matching.test
  */
@@ -9,21 +10,59 @@ import { describe, expect, it } from 'vitest';
 import {
   bestTokenScore,
   buildFtsMatch,
+  buildLegalFormFtsMatch,
   comparisonForms,
   deletionSignatures,
   doubleMetaphone,
   FUZZY_STOPLIST,
   fold,
+  foldLegalForms,
+  hasOtherScriptLetter,
   isStoplistToken,
   jaro,
   jaroWinkler,
+  LEGAL_FORM_SPELLINGS,
   lengthRatio,
   scoreTokenPairs,
   scoringQuery,
+  soundKeys,
   splitOnStoplist,
   tokenCoverage,
   tokenize,
 } from '@/services/screening/text-matching.js';
+import { expectLinearTime } from './_linear-time.js';
+
+/**
+ * Asserts `run`'s thread CPU time (µs per call) over `make(size)` stays under
+ * 100 ms and grows under 256-fold against the 5,000-character baseline, doubling
+ * `size` from 10,000 to `largest`. Each size takes the least of five baseline/size
+ * pairs, so a descheduled sample never reads as slow code.
+ */
+function expectBoundedCpuGrowth(
+  run: (input: string) => unknown,
+  make: (size: number) => string,
+  largest: number,
+): void {
+  const baseline = make(5_000);
+  const measure = (input: string, repeats: number): number => {
+    const start = process.threadCpuUsage();
+    for (let i = 0; i < repeats; i++) run(input);
+    const elapsed = process.threadCpuUsage(start);
+    return (elapsed.user + elapsed.system) / repeats;
+  };
+  measure(baseline, 64);
+  for (let size = 10_000; size <= largest; size *= 2) {
+    const input = make(size);
+    const samples = Array.from({ length: 5 }, () => {
+      const small = Math.max(measure(baseline, 32), 1);
+      const large = measure(input, 4);
+      return { large, growth: large / small };
+    });
+    const least = (key: 'growth' | 'large') => Math.min(...samples.map((sample) => sample[key]));
+    expect(least('large'), `µs at ${size}`).toBeLessThan(100_000);
+    expect(least('growth'), `growth at ${size}`).toBeLessThan(256);
+  }
+}
 
 describe('fuzzy comparison forms and deletion signatures', () => {
   it('maps the Russian alphabet before folding and preserves unknown letters', () => {
@@ -177,23 +216,56 @@ describe('fold cost on caller-sized text', () => {
     ['punctuation', (n) => '-'.repeat(n)],
   ];
 
-  it.each(shapes)('grows linearly on %s', (_label, make) => {
-    const time = (n: number): number => {
-      const input = make(n);
-      let best = Number.POSITIVE_INFINITY;
-      for (let run = 0; run < 5; run++) {
-        const start = performance.now();
-        fold(input);
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    time(5_000); // warm the regex and normalizer paths
-    const t5k = Math.max(time(5_000), 0.05);
-    const t80k = time(80_000);
-    expect(t80k / t5k).toBeLessThan(64);
-    expect(t80k).toBeLessThan(250);
+  it.each(shapes)(
+    'grows linearly on %s',
+    async (_label, make) => {
+      await expectLinearTime(fold, make, 80_000, 250);
+    },
+    0,
+  );
+});
+
+describe('hasOtherScriptLetter', () => {
+  it.each([
+    ['Александр Бортников', true],
+    ['武汉晓睿智科技有限责任公司', true],
+    ['عبد المنان آغا', true],
+    // Mixed scripts: one Cyrillic word beside a Latin one.
+    ['АО Almaz', true],
+    // A Latin homoglyph inside a Cyrillic name.
+    ['Валерiївна', true],
+    ['Almaz-2021 (UK) Ltd.', false],
+    ['Société Générale', false],
+    ['2021', false],
+    ['---', false],
+    // Script-neutral letters (Common) count for no script: the micro sign and the modifier apostrophe.
+    ['µ', false],
+    ['Saʼid', false],
+  ])('reads %j as holding a letter of another script: %s', (text, expected) => {
+    expect(hasOtherScriptLetter(text)).toBe(expected);
   });
+
+  it('reads the micro sign as Greek once folded, as strict matching reads it', () => {
+    expect(fold('µ')).toBe('μ');
+    expect(hasOtherScriptLetter(fold('µ'))).toBe(true);
+  });
+
+  const worstCases: [label: string, build: (length: number) => string, max: number][] = [
+    ['a long digit run', (n) => '1'.repeat(n), 320_000],
+    ['a long Latin run', (n) => 'a'.repeat(n), 80_000],
+    ['script-neutral letters', (n) => 'µ'.repeat(n), 80_000],
+    ['a Latin run ending in another script', (n) => `${'a'.repeat(n - 1)}я`, 80_000],
+    ['one long line ending in a break', (n) => `${'x'.repeat(n)}\ny`, 80_000],
+    ['breaks throughout', (n) => '  \r\n'.repeat(n / 4), 80_000],
+  ];
+
+  it.each(worstCases)(
+    'reads %s in time linear in its length',
+    async (_label, build, max) => {
+      await expectLinearTime(hasOtherScriptLetter, build, max, 50);
+    },
+    0,
+  );
 });
 
 describe('tokenize', () => {
@@ -283,14 +355,15 @@ describe('tokenCoverage', () => {
   });
 });
 
+/** mulberry32: a seeded generator, so a failing case reproduces. */
+const seeded = (seed: number) => () => {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+
 describe('scoreTokenPairs — one pass equals the separate helpers', () => {
-  /** mulberry32: a seeded generator, so a failing case reproduces. */
-  const seeded = (seed: number) => () => {
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
   const random = seeded(71);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
   // Name words, near variants, stoplisted words, short and supplementary-plane tokens.
@@ -356,6 +429,137 @@ describe('scoreTokenPairs — one pass equals the separate helpers', () => {
     expect(marks(['limited', 'liability', 'company'])).toEqual([true, true, true]);
     expect(marks([])).toEqual([]);
   });
+});
+
+describe('scoreTokenPairs — words that sound alike (issue #92)', () => {
+  const both = (query: string[], candidate: string[], threshold = 0.85) => ({
+    spelled: scoreTokenPairs(scoringQuery(query), candidate, threshold),
+    sounded: scoreTokenPairs(scoringQuery(query), candidate, threshold, soundKeys()),
+  });
+
+  it('covers a word spelling misses when its primary key, three characters long, matches', () => {
+    // Under the 0.85 floor by spelling, one key by sound.
+    expect(jaroWinkler('gaddafi', 'qadhafi')).toBeCloseTo(0.8095, 4);
+    expect([doubleMetaphone('gaddafi'), doubleMetaphone('qadhafi')]).toEqual(['KTF', 'KTF']);
+    const { spelled, sounded } = both(['hannibal', 'gaddafi'], ['hannibal', 'muammar', 'qadhafi']);
+    expect(spelled).toEqual({ best: 1, covered: 1, distinctiveCovered: 1, phonetic: 0 });
+    expect(sounded).toEqual({ best: 1, covered: 2, distinctiveCovered: 1, phonetic: 1 });
+  });
+
+  it('counts a word by spelling first, never twice', () => {
+    // `hassan` clears the floor against `hasan`, so its shared key with `hussein` adds nothing.
+    const { sounded } = both(['ahmed', 'hassan'], ['hussein', 'hasan', 'ahmed']);
+    expect(sounded).toEqual({ best: 1, covered: 2, distinctiveCovered: 2, phonetic: 0 });
+  });
+
+  it.each([
+    ['a stoplisted candidate word', ['anita', 'rahimi'], ['rahimi', 'and', 'sons']],
+    ['a stoplisted word of an all-stoplisted query', ['und', 'co'], ['anita', 'co']],
+  ])('never counts %s by sound, though the keys match', (_label, query, candidate) => {
+    expect(doubleMetaphone('anita')).toBe('ANT');
+    expect([doubleMetaphone('and'), doubleMetaphone('und')]).toEqual(['ANT', 'ANT']);
+    expect(both(query, candidate).sounded).toMatchObject({ covered: 1, phonetic: 0 });
+  });
+
+  it.each([
+    ['a two-character key', ['wang', 'jun'], ['jin', 'wang'], 'JN'],
+    ['a one-character key', ['zhang', 'wei'], ['yu', 'zhang'], 'A'],
+  ])('never counts %s by sound', (_label, query, candidate, key) => {
+    const [, word] = query as [string, string];
+    expect(doubleMetaphone(word)).toBe(key);
+    expect(doubleMetaphone(candidate[0] as string)).toBe(key);
+    expect(both(query, candidate).sounded).toMatchObject({ covered: 1, phonetic: 0 });
+  });
+
+  it('keys a Latin token off the stoplist with a key of three characters or more, nothing else', () => {
+    // `qadhafi` twice: the second read is the memo's.
+    const key = soundKeys();
+    expect(
+      ['qadhafi', 'qadhafi', 'hussein', 'company', 'al', 'wei', 'jun', 'ромашка', '2021'].map(key),
+    ).toEqual([
+      'KTF',
+      'KTF',
+      'HSN',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it('adds only sound-covered words over 20,000 random token lists, leaving best and the spelled counts alone', () => {
+    const random = seeded(92);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    // Sound-alike families under the floor, stoplisted and short-key words, and a non-Latin one.
+    const VOCABULARY = [
+      ...['gaddafi', 'qadhafi', 'kaddafi', 'hassan', 'hussein', 'husain', 'zhang', 'xiong'],
+      ...['anita', 'and', 'und', 'jun', 'jin', 'wei', 'yu', 'ali', 'el', 'al', 'ltd', 'company'],
+      ...['ivan', 'ivanov', 'mohammed', 'muhammad', 'ромашка', 'x'],
+    ];
+    const tokens = (min: number, max: number): string[] =>
+      Array.from({ length: min + Math.floor(random() * (max - min + 1)) }, () => pick(VOCABULARY));
+    const key = (token: string) => doubleMetaphone(token);
+    const mismatches: unknown[] = [];
+    let soundCovered = 0;
+    for (let i = 0; i < 20_000; i++) {
+      const queryTokens = tokens(1, 5);
+      const candidateTokens = tokens(0, 5);
+      const threshold = pick([0.5, 0.8, 0.85, 0.9, 1]);
+      const spelled = scoreTokenPairs(scoringQuery(queryTokens), candidateTokens, threshold);
+      const sounded = scoreTokenPairs(
+        scoringQuery(queryTokens),
+        candidateTokens,
+        threshold,
+        soundKeys(),
+      );
+      const expectedPhonetic = queryTokens.filter(
+        (q) =>
+          tokenCoverage([q], candidateTokens, threshold) === 0 &&
+          !isStoplistToken(q) &&
+          key(q).length >= 3 &&
+          candidateTokens.some((c) => !isStoplistToken(c) && key(c) === key(q)),
+      ).length;
+      if (
+        !Object.is(sounded.best, spelled.best) ||
+        sounded.distinctiveCovered !== spelled.distinctiveCovered ||
+        sounded.covered !== spelled.covered + expectedPhonetic ||
+        sounded.phonetic !== expectedPhonetic ||
+        spelled.phonetic !== 0
+      ) {
+        mismatches.push({ queryTokens, candidateTokens, threshold, spelled, sounded });
+      }
+      soundCovered += expectedPhonetic;
+    }
+    expect(mismatches.slice(0, 5)).toEqual([]);
+    expect(soundCovered).toBeGreaterThan(1_000);
+  });
+
+  it.each([
+    { label: 'a long digit run', make: (n: number) => '1'.repeat(n), largest: 320_000 },
+    {
+      label: 'one long line ending in a break',
+      make: (n: number) => `${'x'.repeat(n)}\ny`,
+      largest: 80_000,
+    },
+    { label: 'breaks throughout', make: (n: number) => '  \r\n'.repeat(n / 4), largest: 80_000 },
+    // Each G before N or LI re-tested the whole word for W, K, or CZ.
+    { label: 'G before N', make: (n: number) => 'gn'.repeat(n / 2), largest: 320_000 },
+    { label: 'G before LI', make: (n: number) => 'gli'.repeat(n / 3), largest: 320_000 },
+    {
+      label: 'a C that never opens CZ',
+      make: (n: number) => 'gnc'.repeat(n / 3),
+      largest: 320_000,
+    },
+    { label: 'one Latin word of vowels', make: (n: number) => 'a'.repeat(n), largest: 80_000 },
+  ])(
+    'bounds a sound key’s CPU across increasing input sizes: $label',
+    ({ make, largest }) => {
+      expectBoundedCpuGrowth((input) => soundKeys()(input), make, largest);
+    },
+    0,
+  );
 });
 
 describe('lengthRatio', () => {
@@ -435,6 +639,239 @@ describe('fuzzy stoplist (issue #55)', () => {
   });
 });
 
+describe('legal-form spellings (issue #90)', () => {
+  it('keys each form by its canonical spelling, and every canonical is on the fuzzy stoplist', () => {
+    expect([...LEGAL_FORM_SPELLINGS.keys()]).toEqual([
+      ...['ltd', 'co', 'corp', 'inc', 'llp', 'lp', 'plc', 'ag'],
+      ...['llc', 'jsc', 'pjsc', 'ojsc', 'cjsc'],
+    ]);
+    for (const [canonical, spellings] of LEGAL_FORM_SPELLINGS) {
+      expect(spellings[0], canonical).toBe(canonical);
+      expect(isStoplistToken(canonical), canonical).toBe(true);
+    }
+  });
+
+  it('holds folded spellings, each in exactly one form', () => {
+    const forms = new Map<string, string>();
+    for (const [canonical, spellings] of LEGAL_FORM_SPELLINGS) {
+      for (const spelling of spellings) {
+        expect(tokenize(fold(spelling)).join(' '), spelling).toBe(spelling);
+        expect(forms.get(spelling), spelling).toBeUndefined();
+        forms.set(spelling, canonical);
+      }
+    }
+  });
+
+  it.each([
+    ['OOO', 'llc'],
+    ['ООО', 'llc'],
+    ['Obshchestvo s Ogranichennoi Otvetstvennostyu', 'llc'],
+    ['Общество с ограниченной ответственностью', 'llc'],
+    ['L.L.C.', 'llc'],
+    ['AO', 'jsc'],
+    ['АО', 'jsc'],
+    ['Aktsionernoe Obshchestvo', 'jsc'],
+    ['Акционерное общество', 'jsc'],
+    ['PAO', 'pjsc'],
+    ['ПАО', 'pjsc'],
+    ['Publichnoe Aktsionernoe Obschestvo', 'pjsc'],
+    ['Publichnoye Joint-Stock Company', 'pjsc'],
+    ['Публичное акционерное общество', 'pjsc'],
+    ['OAO', 'ojsc'],
+    ['ОАО', 'ojsc'],
+    ['Otkrytoye Aktsionernoye Obshchestvo', 'ojsc'],
+    ['ZAO', 'cjsc'],
+    ['ЗАО', 'cjsc'],
+    ['Zakrytoe Aktsionernoe Obshchestvo', 'cjsc'],
+    ['Limited', 'ltd'],
+    ['Company', 'co'],
+    ['Corporation', 'corp'],
+    ['Incorporated', 'inc'],
+    ['Limited Liability Partnership', 'llp'],
+    ['Aktiengesellschaft', 'ag'],
+  ])('folds %j to its form %j', (raw, canonical) => {
+    expect(foldLegalForms(fold(raw))).toEqual([canonical]);
+  });
+
+  it('keeps different forms apart: JSC, PJSC, OJSC, CJSC; LLC and Ltd; Company and Corporation', () => {
+    const forms = [
+      'JSC',
+      'Joint Stock Company',
+      'PJSC',
+      'Public Joint Stock Company',
+      'OJSC',
+      'Open Joint-Stock Company',
+      'CJSC',
+      'Closed Joint Stock Company',
+      'LLC',
+      'Limited Liability Company',
+      'Ltd',
+      'Limited',
+      'Co',
+      'Company',
+      'Corp',
+      'Corporation',
+    ].map((raw) => foldLegalForms(fold(raw)).join(' '));
+    expect(forms).toEqual([
+      ...['jsc', 'jsc', 'pjsc', 'pjsc', 'ojsc', 'ojsc', 'cjsc', 'cjsc'],
+      ...['llc', 'llc', 'ltd', 'ltd', 'co', 'co', 'corp', 'corp'],
+    ]);
+  });
+
+  it.each([
+    // One form, spelled two ways.
+    ['JSC', 'Non-Public Joint Stock Company', 'jsc', 'jsc'],
+    ['JSC', 'Непубличное акционерное общество', 'jsc', 'jsc'],
+    ['LLC', 'Limited Liability Corporation', 'llc', 'llc'],
+    ['LLC', 'Limited Liability', 'llc', 'llc'],
+    ['LP', 'Limited Partnership', 'lp', 'lp'],
+    ['PLC', 'Public Limited Company', 'plc', 'plc'],
+    // Two forms, the longer spelled with a word of the other.
+    ['PJSC', 'Non-Public Joint Stock Company', 'pjsc', 'jsc'],
+    ['Ltd', 'Limited Liability Corporation', 'ltd', 'llc'],
+    ['Ltd', 'Limited Liability', 'ltd', 'llc'],
+    ['Ltd', 'Limited Partnership', 'ltd', 'lp'],
+    ['Ltd', 'Public Limited Company', 'ltd', 'plc'],
+  ])('folds %j and %j to %j and %j, never a word of one form left loose', (a, b, foldA, foldB) => {
+    const form = (raw: string) => foldLegalForms(fold(raw)).join(' ');
+    expect([form(a), form(b)]).toEqual([foldA, foldB]);
+  });
+
+  it.each([
+    [
+      'NON PUBLIC JOINT STOCK  COMPANY  "KALMYK OIL  AND GAS  COMPANY',
+      ['jsc', 'kalmyk', 'oil', 'and', 'gas', 'co'],
+    ],
+    [
+      'Non-Public Joint Stock Company “Research and Production Center” Specialized  Devices and Systems',
+      [
+        'jsc',
+        'research',
+        'and',
+        'production',
+        'center',
+        'specialized',
+        'devices',
+        'and',
+        'systems',
+      ],
+    ],
+    [
+      'НЕПУБЛИЧНОЕ  АКЦИОНЕРНОЕ  ОБЩЕСТВО  "КАЛМЫЦКАЯ  НЕФТЕГАЗОВАЯ  КОМПАНИЯ"',
+      ['jsc', 'калмыцкая', 'нефтегазовая', 'компания'],
+    ],
+    ['Limited Liability Corporation Baltech', ['llc', 'baltech']],
+    ['LIMITED LIABILITY CORPORATION GELIOS', ['llc', 'gelios']],
+    [
+      'Al-Amer for Manufacture of Concrete, Flagstone, Limited Liability',
+      ['al', 'amer', 'for', 'manufacture', 'of', 'concrete', 'flagstone', 'llc'],
+    ],
+    [
+      'Beijing Qiji Chuangtan Phase I Venture Capital Center Limited Partnership',
+      ['beijing', 'qiji', 'chuangtan', 'phase', 'i', 'venture', 'capital', 'center', 'lp'],
+    ],
+  ])('folds the published name %j to one form, not a word of another', (raw, expected) => {
+    expect(foldLegalForms(fold(raw))).toEqual(expected);
+  });
+
+  it.each([
+    ['limited liability company spectrum', ['llc', 'spectrum']],
+    ['sky aviator company limited', ['sky', 'aviator', 'co', 'ltd']],
+    [
+      'subsidiary bank sberbank of russia public joint stock company',
+      ['subsidiary', 'bank', 'sberbank', 'of', 'russia', 'pjsc'],
+    ],
+    [
+      'open joint stock oil and gas company syzran',
+      ['open', 'joint', 'stock', 'oil', 'and', 'gas', 'co', 'syzran'],
+    ],
+    ['joint public stock company nevskoe', ['joint', 'public', 'stock', 'co', 'nevskoe']],
+    ['limited liability limited', ['llc', 'ltd']],
+    ['limited liability limited partnership', ['llc', 'lp']],
+    [
+      'public limited company scientific research institute',
+      ['plc', 'scientific', 'research', 'institute'],
+    ],
+    ['edm l l c fz', ['edm', 'llc', 'fz']],
+    ['kim l c', ['kim', 'l', 'c']],
+    ['ооо ромашка', ['llc', 'ромашка']],
+    // ofac_sdn 37481 as published: the preposition is a Latin `c` (U+0063), not `с` (U+0441).
+    ['общество c ограниченнои ответственностью гелиос', ['llc', 'гелиос']],
+    ['общество с ограниченнои ответственностью гелиос', ['llc', 'гелиос']],
+    ['', []],
+  ])('folds %j longest spelling first, left to right', (normalized, expected) => {
+    expect(foldLegalForms(normalized)).toEqual(expected);
+  });
+
+  it('widens each legal form of a fold to every spelling, quoted like the literal match', () => {
+    expect(buildLegalFormFtsMatch(['stg', 'holdings', 'ltd'])).toBe(
+      '"stg" AND "holdings" AND ("ltd" OR "limited")',
+    );
+    expect(buildLegalFormFtsMatch(['jsc', 'vtb', 'bank'])).toBe(
+      '("jsc" OR "joint stock company" OR "non public joint stock company" OR "ao" OR "aktsionernoe obshchestvo" OR "aktsionernoye obshchestvo" OR "aktsionernoe obschestvo" OR "ао" OR "акционерное общество" OR "непубличное акционерное общество") AND "vtb" AND "bank"',
+    );
+  });
+
+  it('quotes each repeated token once, and widens nothing without a legal form', () => {
+    expect(buildLegalFormFtsMatch(['ltd', 'acme', 'ltd', 'ltd'])).toBe(
+      '("ltd" OR "limited") AND "acme"',
+    );
+    expect(buildLegalFormFtsMatch(['ivan', 'volkov'])).toBeNull();
+    expect(buildLegalFormFtsMatch([])).toBeNull();
+  });
+
+  it.each([
+    { label: 'a long digit run', make: (n: number) => '1'.repeat(n), largest: 320_000 },
+    {
+      label: 'one long line ending in a break',
+      make: (n: number) => `${'x'.repeat(n)}\ny`,
+      largest: 80_000,
+    },
+    { label: 'breaks throughout', make: (n: number) => '  \r\n'.repeat(n / 4), largest: 80_000 },
+    {
+      label: 'a form opener with no closer',
+      make: (n: number) => 'limited liability '.repeat(n / 18),
+      largest: 80_000,
+    },
+    {
+      label: 'overlapping openers',
+      make: (n: number) => 'obshchestvo s ogranichennoi '.repeat(n / 28),
+      largest: 80_000,
+    },
+    {
+      label: 'nested openers',
+      make: (n: number) => 'public open closed joint stock '.repeat(n / 31),
+      largest: 80_000,
+    },
+    {
+      label: 'the longest opener with no closer',
+      make: (n: number) => 'non public joint stock '.repeat(n / 23),
+      largest: 80_000,
+    },
+    { label: 'one-letter openers', make: (n: number) => 'l l '.repeat(n / 4), largest: 80_000 },
+    {
+      label: 'Cyrillic openers',
+      make: (n: number) => 'общество с '.repeat(n / 11),
+      largest: 80_000,
+    },
+    {
+      label: 'whole spellings',
+      make: (n: number) => 'ооо ltd company pao '.repeat(n / 20),
+      largest: 80_000,
+    },
+  ])(
+    'bounds the legal-form fold and its match CPU across increasing input sizes: $label',
+    ({ make, largest }) => {
+      expectBoundedCpuGrowth(
+        (input) => buildLegalFormFtsMatch(foldLegalForms(input)),
+        make,
+        largest,
+      );
+    },
+    0,
+  );
+});
+
 describe('similarity over supplementary-plane letters', () => {
   /*
    * Map each lowercase ASCII letter onto its own CJK Extension B code point
@@ -507,5 +944,19 @@ describe('doubleMetaphone', () => {
   it('keys Latin tokens that keep a letter with no decomposition', () => {
     expect(doubleMetaphone(fold('Łukasz'))).toBe('AKS');
     expect(doubleMetaphone(fold('Straße'))).toBe('STRS');
+  });
+
+  /**
+   * Philips' rule for an inner `GN`: primary `N`, unless the word reads as
+   * Slavo-Germanic (it holds `W`, `K`, `CZ`, or `WITZ`), where it stays `KN`.
+   * `magnus` holds none of those letters and takes `N`.
+   */
+  it.each([
+    ['wagner', 'AKNR'],
+    ['magnitsky', 'MKNTSK'],
+    ['sygnowski', 'SKNSK'],
+    ['magnus', 'MNS'],
+  ])('keys the inner GN of %s by whether the word is Slavo-Germanic: %s', (word, key) => {
+    expect(doubleMetaphone(word)).toBe(key);
   });
 });

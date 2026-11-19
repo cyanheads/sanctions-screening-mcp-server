@@ -12,6 +12,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { canonicalLei, LeiInputSchema } from '@/mcp-server/normalize-inputs.js';
 import { crossReferenceEntity } from '@/services/screening/cross-reference.js';
 import { leiChecksumValid } from '@/services/screening/lei-checksum.js';
@@ -42,7 +43,7 @@ const CROSS_REFERENCE_SCREEN_LIMIT = 25;
 export const getEntityTool = tool('sanctions_get_entity', {
   title: 'sanctions-screening-mcp-server: get entity',
   description:
-    "Fetch the full GLEIF Level 1 record for one LEI: legal name, other/trading names, legal and headquarters addresses, registration status, jurisdiction, registration authority and ID, and last-update date — plus a sanctions cross-reference against all loaded watchlists. The cross-reference screens the legal name and every other and transliterated name strict (exact, then all tokens present — never fuzzy, unlike sanctions_screen_name), and looks up the LEI and the registration number as exact non-document identifiers, the registration number matching only an identifier published for the country of the entity's legal jurisdiction. Hits merge to one per designation, an OFAC party both OFAC lists publish to one hit whose sources names both: matchedOn names every input that produced each, and a hit only an identifier produced carries matchedIdentifiers and no matchedName. The screening cross-reference is a screening AID: a hit is a candidate to verify against the official source, and no hit is not a clearance. screeningStatus says whether that cross-reference actually ran — an empty sanctionsHits under not_ready means the sanctions mirror was unavailable, not that nothing matched. sanctionsScreen says whether the hit list is the whole set: it reports how many potential matches existed before the cap, so a capped cross-reference is distinguishable from a complete one. LEI must be a 20-character GLEIF identifier (18 alphanumerics + 2 check digits).",
+    "Fetch the full GLEIF Level 1 record for one LEI: legal name, other/trading names, legal and headquarters addresses, registration status, entity status and successor entities, jurisdiction, registration authority and ID, and last-update date — plus a sanctions cross-reference against all loaded watchlists. The cross-reference screens the legal name and every other and transliterated name strict (exact, then all tokens present with a legal form matching any spelling of the same form, such as Ltd and Limited or LLC and OOO — never fuzzy, unlike sanctions_screen_name), and looks up the LEI and the registration number as exact non-document identifiers, the registration number matching only an identifier published for the country of the entity's legal jurisdiction. Hits merge to one per designation, an OFAC party both OFAC lists publish to one hit whose sources names both: matchedOn names every input that produced each, and a hit only an identifier produced carries matchedIdentifiers and no matchedName. The screening cross-reference is a screening AID: a hit is a candidate to verify against the official source, and no hit is not a clearance. screeningStatus says whether that cross-reference actually ran — an empty sanctionsHits under not_ready means the sanctions mirror was unavailable, not that nothing matched. sanctionsScreen says whether the hit list is the whole set: it reports how many potential matches existed before the cap, so a capped cross-reference is distinguishable from a complete one. A retired, merged, or duplicate LEI can name successors, the entities that took it over: pass a successor's LEI to sanctions_get_entity or sanctions_trace_ownership, since successors are listed, never screened or followed; entityStatusLoaded false means the record was stored before entity status and successors were read, not that it has none. LEI must be a 20-character GLEIF identifier (18 alphanumerics + 2 check digits).",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     lei: LeiInputSchema.describe('The 20-character GLEIF Legal Entity Identifier to look up.'),
@@ -73,6 +74,38 @@ export const getEntityTool = tool('sanctions_get_entity', {
       ),
     jurisdiction: z.string().optional().describe('Legal jurisdiction (ISO code), when published.'),
     status: z.string().optional().describe('Registration status (e.g. ISSUED, LAPSED).'),
+    entityStatus: z
+      .string()
+      .optional()
+      .describe(
+        "GLEIF entity status as published (ACTIVE, INACTIVE, NULL): the legal entity's own state, where status is the LEI's. Absent when entityStatusLoaded is false.",
+      ),
+    successors: z
+      .array(
+        z
+          .object({
+            lei: z
+              .string()
+              .optional()
+              .describe(
+                'Successor LEI — pass to sanctions_get_entity or sanctions_trace_ownership.',
+              ),
+            name: z
+              .string()
+              .optional()
+              .describe('Successor name as published, for a successor without an LEI.'),
+          })
+          .describe('One entity GLEIF names as having taken this one over, by LEI, name, or both.'),
+      )
+      .optional()
+      .describe(
+        'Every successor entity GLEIF publishes, in order. Listed, never screened or followed. Absent when none is published, or when entityStatusLoaded is false.',
+      ),
+    entityStatusLoaded: z
+      .boolean()
+      .describe(
+        'False when this record was stored before entity status and successors were read: their absence then says nothing. A GLEIF refresh that updates the record, or mirror:init, loads them.',
+      ),
     legalAddress: z.string().optional().describe('Single-line legal address, when published.'),
     headquartersAddress: z
       .string()
@@ -226,6 +259,9 @@ export const getEntityTool = tool('sanctions_get_entity', {
       alternateNames: entity.alternateNames,
       ...(entity.jurisdiction ? { jurisdiction: entity.jurisdiction } : {}),
       ...(entity.status ? { status: entity.status } : {}),
+      ...(entity.entityStatus ? { entityStatus: entity.entityStatus } : {}),
+      ...(entity.successors?.length ? { successors: entity.successors } : {}),
+      entityStatusLoaded: entity.entityStatusLoaded,
       ...(entity.legalAddress ? { legalAddress: entity.legalAddress } : {}),
       ...(entity.headquartersAddress ? { headquartersAddress: entity.headquartersAddress } : {}),
       ...(entity.registrationAuthorityId
@@ -265,15 +301,35 @@ export const getEntityTool = tool('sanctions_get_entity', {
   },
 
   format: (r) => {
-    const lines = [`# ${r.legalName}`, '', `**LEI:** \`${r.lei}\``];
-    if (r.otherNames.length > 0) lines.push(`**Other names:** ${r.otherNames.join('; ')}`);
+    const lines = [`# ${escapeMarkdownInline(r.legalName)}`, '', `**LEI:** \`${r.lei}\``];
+    if (r.otherNames.length > 0) {
+      lines.push(`**Other names:** ${r.otherNames.map(escapeMarkdownInline).join('; ')}`);
+    }
     if (r.alternateNames.length > 0) {
       lines.push(
-        `**Names by type:** ${r.alternateNames.map((n) => `${n.name} (${gleifNameTypeText(n.type)})`).join('; ')}`,
+        `**Names by type:** ${r.alternateNames.map((n) => `${escapeMarkdownInline(n.name)} (${gleifNameTypeText(n.type)})`).join('; ')}`,
       );
     }
     if (r.jurisdiction) lines.push(`**Jurisdiction:** ${r.jurisdiction}`);
     if (r.status) lines.push(`**Registration status:** ${r.status}`);
+    if (r.entityStatus) lines.push(`**Entity status:** ${r.entityStatus}`);
+    if (!r.entityStatusLoaded) {
+      lines.push(
+        '**Entity status and successors:** not loaded for this record — it was stored before they were read, so this does not mean no successor. A GLEIF refresh that updates the record, or mirror:init, loads them.',
+      );
+    } else if (r.successors?.length) {
+      // GLEIF names a successor by LEI, by name (one without an LEI), or both.
+      const named = r.successors.map((s) => {
+        const name = s.name === undefined ? '' : escapeMarkdownInline(s.name);
+        if (!s.lei) return `${name} (no LEI)`;
+        return name ? `\`${s.lei}\` (${name})` : `\`${s.lei}\``;
+      });
+      lines.push(
+        `**Successor entities:** ${named.join('; ')} — pass a successor LEI to sanctions_get_entity or sanctions_trace_ownership; successors are not screened here.`,
+      );
+    } else {
+      lines.push('**Successor entities:** none published');
+    }
     if (r.legalAddress) lines.push(`**Legal address:** ${r.legalAddress}`);
     if (r.headquartersAddress) lines.push(`**HQ address:** ${r.headquartersAddress}`);
     if (r.registrationAuthorityId) {

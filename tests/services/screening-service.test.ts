@@ -91,6 +91,236 @@ describe('screenName — strict matching', () => {
   });
 });
 
+describe('screenName — legal-form spellings (issue #90)', () => {
+  /** Published names from the lists, each designation under its own list and entry ID. */
+  const LEGAL_FORM_DESIGNATIONS = [
+    // Reached by `Sberbank Company` only through words of a longer form.
+    withAliases('ofac_sdn', '18715', 'JOINT STOCK COMPANY SBERBANK', []),
+    withAliases('ofac_sdn', '18669', 'LIMITED LIABILITY COMPANY SBERBANK CAPITAL', []),
+    withAliases('ofac_sdn', '18714', 'OPEN JOINT STOCK COMPANY BPS-SBERBANK', []),
+    withAliases(
+      'ofac_consolidated',
+      '18746',
+      'SBERBANK TECHNOLOGIES CLOSED JOINT STOCK COMPANY',
+      [],
+    ),
+    // A shorter form inside a longer one, and the PJSC form the JSC query must not reach.
+    withAliases('ofac_sdn', '17018', 'PUBLIC JOINT STOCK COMPANY SBERBANK OF RUSSIA', []),
+    withAliases('uk', 'RUS0256', 'PJSC Sberbank of Russia', [
+      'PJSC Sberbank (Public Joint-Stock Company Sberbank)',
+    ]),
+    // A form word the name spells inside another form.
+    withAliases(
+      'ofac_sdn',
+      '43121',
+      'LIMITED LIABILITY COMPANY SCIENTIFIC-PRODUCTION FIRM RADIO-ELECTRONIC TECHNOLOGIES',
+      [],
+    ),
+    // Form words that are not adjacent in the name, and an OJSC the JSC query must not reach.
+    withAliases('ofac_sdn', '18290', 'OPEN JOINT-STOCK OIL AND GAS COMPANY SYZRAN', []),
+    withAliases('eu', '181035', 'Open Joint-Stock Oil And Gas Company Syzran', []),
+    withAliases('ofac_sdn', '18291', 'OJSC Syzran Refinery', []),
+    // Equal to a query up to legal-form spelling.
+    withAliases('ofac_sdn', '16830', 'STG HOLDINGS LIMITED', []),
+    withAliases('bis_el', 'STG-1', 'STG Holdings Limited', []),
+    withAliases('uk', 'RUS2624', 'ELECTRONIC SCIENTIFIC ENGINEERING LTD', []),
+    withAliases('uk', 'RUS3162', 'PJSC TATNEFT named after V.D. Shashin', [
+      'ПАО "Татнефть" имени В.Д. Шашина',
+    ]),
+    withAliases('ofac_sdn', '19037', 'INRESBANK OOO', []),
+    // The public form half transliterated: `publichnoye` before an English `joint stock company`.
+    withAliases('ofac_consolidated', '20002', 'PUBLICHNOYE JOINT-STOCK COMPANY BM BANK', []),
+    // The same words under a different form.
+    withAliases('eu', 'SPEC-1', 'Limited Liability Company Spectrum', []),
+    withAliases('uk', 'VTB-1', 'VTB Bank, Public Joint Stock Company', []),
+    withAliases('ofac_sdn', 'DAE-1', 'Korea Daesong Trading Company', []),
+    // A longer form spelled with a word of another: `public` of PJSC, `limited` of Ltd.
+    withAliases(
+      'eu',
+      '184224',
+      'NON PUBLIC JOINT STOCK  COMPANY  "KALMYK OIL  AND GAS  COMPANY',
+      [],
+    ),
+    withAliases('ofac_consolidated', '19992', 'Limited Liability Corporation Baltech', []),
+  ];
+
+  beforeEach(async () => {
+    await svc.ingestDesignations(LEGAL_FORM_DESIGNATIONS);
+  });
+
+  const strictOnly = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, limit: 100, query, autoFallback: false, ...extra }, ctx);
+  const rows = (
+    hits: readonly { designationId: string; matchType: string; matchedName: string }[],
+  ) => hits.map((hit) => `${hit.designationId} ${hit.matchType} ${hit.matchedName}`);
+
+  it.each([
+    [
+      'Sberbank Company',
+      [
+        'ofac_sdn:17018 strong PUBLIC JOINT STOCK COMPANY SBERBANK OF RUSSIA',
+        'ofac_sdn:18669 strong LIMITED LIABILITY COMPANY SBERBANK CAPITAL',
+        'ofac_sdn:18714 strong OPEN JOINT STOCK COMPANY BPS-SBERBANK',
+        'ofac_sdn:18715 strong JOINT STOCK COMPANY SBERBANK',
+        'ofac_consolidated:18746 strong SBERBANK TECHNOLOGIES CLOSED JOINT STOCK COMPANY',
+        'uk:RUS0256 strong PJSC Sberbank (Public Joint-Stock Company Sberbank)',
+      ],
+    ],
+    [
+      'Joint Stock Company Sberbank of Russia',
+      ['ofac_sdn:17018 strong PUBLIC JOINT STOCK COMPANY SBERBANK OF RUSSIA'],
+    ],
+    [
+      'Radio-Electronic Technologies Limited',
+      [
+        'ofac_sdn:43121 strong LIMITED LIABILITY COMPANY SCIENTIFIC-PRODUCTION FIRM RADIO-ELECTRONIC TECHNOLOGIES',
+      ],
+    ],
+    [
+      'Joint Stock Company Syzran',
+      [
+        'ofac_sdn:18290 strong OPEN JOINT-STOCK OIL AND GAS COMPANY SYZRAN',
+        'eu:181035 strong Open Joint-Stock Oil And Gas Company Syzran',
+      ],
+    ],
+    ['Baltech Limited', ['ofac_consolidated:19992 strong Limited Liability Corporation Baltech']],
+  ])(
+    'keeps every strict hit of %j that every query word reaches (characterization)',
+    async (query, expected) => {
+      expect(rows((await strictOnly(query)).hits)).toEqual(expected);
+    },
+  );
+
+  it.each([
+    [
+      'STG Holdings Ltd.',
+      ['ofac_sdn:16830 strong STG HOLDINGS LIMITED', 'bis_el:STG-1 strong STG Holdings Limited'],
+    ],
+    [
+      'ELECTRONIC SCIENTIFIC ENGINEERING LIMITED',
+      ['uk:RUS2624 strong ELECTRONIC SCIENTIFIC ENGINEERING LTD'],
+    ],
+    [
+      'Public Joint Stock Company TATNEFT named after V.D. Shashin',
+      ['uk:RUS3162 strong PJSC TATNEFT named after V.D. Shashin'],
+    ],
+    [
+      'Публичное акционерное общество "Татнефть" имени В.Д. Шашина',
+      ['uk:RUS3162 strong ПАО "Татнефть" имени В.Д. Шашина'],
+    ],
+    ['"INRESBANK" LLC', ['ofac_sdn:19037 strong INRESBANK OOO']],
+    ['BM Bank PJSC', ['ofac_consolidated:20002 strong PUBLICHNOYE JOINT-STOCK COMPANY BM BANK']],
+    ['Spectrum LLC', ['eu:SPEC-1 strong Limited Liability Company Spectrum']],
+    ['Syzran Refinery Open Joint Stock Company', ['ofac_sdn:18291 strong OJSC Syzran Refinery']],
+    ['Korea Daesong Trading Co.', ['ofac_sdn:DAE-1 strong Korea Daesong Trading Company']],
+    [
+      'JSC Kalmyk Oil and Gas Company',
+      ['eu:184224 strong NON PUBLIC JOINT STOCK  COMPANY  "KALMYK OIL  AND GAS  COMPANY'],
+    ],
+    ['Baltech LLC', ['ofac_consolidated:19992 strong Limited Liability Corporation Baltech']],
+  ])(
+    'matches %j where a legal form differs only in spelling, as strong',
+    async (query, expected) => {
+      expect(rows((await strictOnly(query)).hits)).toEqual(expected);
+    },
+  );
+
+  it.each([
+    ['Spectrum Ltd', 'eu:SPEC-1'],
+    ['JSC VTB Bank', 'uk:VTB-1'],
+    ['Sberbank of Russia JSC', 'uk:RUS0256'],
+    ['BM Bank JSC', 'ofac_consolidated:20002'],
+    ['Syzran Refinery JSC', 'ofac_sdn:18291'],
+    ['Korea Daesong Trading Corp', 'ofac_sdn:DAE-1'],
+    ['PJSC Kalmyk Oil and Gas Company', 'eu:184224'],
+    ['Baltech Ltd', 'ofac_consolidated:19992'],
+  ])('never reaches a different form: %j does not match %s', async (query, designationId) => {
+    const res = await strictOnly(query);
+    expect(res.hits.map((hit) => hit.designationId)).not.toContain(designationId);
+  });
+
+  it('keeps exact for normalized equality and leaves the normalized query unfolded', async () => {
+    const exact = await strictOnly('STG HOLDINGS LIMITED');
+    expect(rows(exact.hits)).toEqual([
+      'ofac_sdn:16830 exact STG HOLDINGS LIMITED',
+      'bis_el:STG-1 exact STG Holdings Limited',
+    ]);
+    const spelled = await strictOnly('STG Holdings Ltd.');
+    expect(spelled.normalizedQuery).toBe('stg holdings ltd');
+    expect(spelled.hits.map((hit) => hit.matchType)).toEqual(['strong', 'strong']);
+    expect(spelled).toMatchObject({ totalAvailable: 2, totalAvailableBasis: 'exact' });
+  });
+
+  it('keeps the name the literal rule matched when another alias matches only up to spelling (characterization)', async () => {
+    // The primary name is written first, so it is the first row any pass reads.
+    await svc.ingestDesignations([
+      withAliases('eu', 'ACME-1', 'Acme Limited', ['Acme Ltd Trading House']),
+    ]);
+    expect(rows((await strictOnly('Acme Ltd')).hits)).toEqual([
+      'eu:ACME-1 strong Acme Ltd Trading House',
+    ]);
+    expect(rows((await strictOnly('Acme Limited')).hits)).toEqual(['eu:ACME-1 exact Acme Limited']);
+  });
+
+  it('completes only the lists a legal-form match left empty, with full-coverage candidates', async () => {
+    await svc.ingestDesignations([
+      // Shares one distinctive word: a full fuzzy pass admits it, a completion never does.
+      withAliases('uk', 'RG-1', 'RG HOLDINGS LTD', []),
+    ]);
+    const res = await svc.screenName({ ...screenDefaults, query: 'STG Holdings Ltd.' }, ctx);
+    expect(res.modeUsed).toBe('strict');
+    expect(res.hits.map((hit) => hit.designationId)).toEqual(['ofac_sdn:16830', 'bis_el:STG-1']);
+    expect(res.fuzzySources).toEqual(
+      SOURCE_CODES.filter((code) => code !== 'ofac_sdn' && code !== 'bis_el'),
+    );
+  });
+
+  it('groups an OFAC party whose two records spell the form differently into one hit naming both lists', async () => {
+    await svc.ingestDesignations([
+      withAliases('ofac_sdn', 'MER-1', 'MERIDIAN TRADE HOLDINGS LIMITED', []),
+      withAliases('ofac_consolidated', 'MER-1', 'Meridian Trade Holdings Ltd', []),
+    ]);
+    const both = { sources: ['ofac_sdn', 'ofac_consolidated'] as SourceCode[] };
+    for (const [query, source, matchType] of [
+      ['Meridian Trade Holdings Ltd', 'ofac_consolidated', 'exact'],
+      ['Meridian Trade Holdings Limited', 'ofac_sdn', 'exact'],
+    ] as const) {
+      const res = await strictOnly(query, both);
+      expect(res.hits, query).toHaveLength(1);
+      expect(res.hits[0], query).toMatchObject({
+        source,
+        matchType,
+        sources: ['ofac_sdn', 'ofac_consolidated'],
+      });
+      expect(res.totalAvailable, query).toBe(1);
+    }
+    // The other list's record alone, reached only up to spelling.
+    const consolidated = await strictOnly('Meridian Trade Holdings Limited', {
+      sources: ['ofac_consolidated'],
+    });
+    expect(rows(consolidated.hits)).toEqual([
+      'ofac_consolidated:MER-1 strong Meridian Trade Holdings Ltd',
+    ]);
+    expect(consolidated.hits[0]?.sources).toEqual(['ofac_consolidated']);
+  });
+
+  it('accepts the longest name and a name of legal-form words alone up to the word bound', async () => {
+    const forms =
+      'Limited Liability Company LLC L.L.C. OOO ООО Ltd Limited Co Company JSC Joint Stock Company AO АО PJSC PAO ПАО OJSC OAO ОАО CJSC ZAO ЗАО Corp Corporation Inc Incorporated LLP AG'.split(
+        ' ',
+      );
+    const formWords = Array.from({ length: 64 }, (_, i) => forms[i % forms.length]);
+    const longest = `${'Sberbank '.repeat(113)}Ltd`.slice(0, 1024);
+    for (const query of [formWords.slice(0, 64).join(' '), longest]) {
+      const res = await strictOnly(query);
+      expect(res.normalizedQuery.length).toBeGreaterThan(0);
+      expect(res.totalAvailableBasis).toBe('exact');
+    }
+  });
+});
+
 describe('screenName — fuzzy fallback', () => {
   it('keeps original query-token coverage when romanization removes a standalone sign', async () => {
     await svc.ingestDesignations([namedDesignation('SIGN-ROSNEFT', 'Rosneft')]);
@@ -2443,7 +2673,12 @@ describe('per-list strict→fuzzy completion (issue #59)', () => {
       listed('ofac_sdn', 'LLC-3', 'Limited Liability Partnership', 'organization'),
     ]);
     const completed = await screen('Limited Liability Company');
-    expect(ids(completed.hits)).toEqual(['eu:LLC-1', 'ofac_sdn:LLC-2']);
+    // The seeded `Fictional Trading Company LLC` holds the same form spelled LLC (issue #90).
+    expect(ids(completed.hits)).toEqual([
+      'eu:LLC-1',
+      'ofac_consolidated:FX-2002',
+      'ofac_sdn:LLC-2',
+    ]);
     const fuzzy = await screen('Limited Liability Company', { matchMode: 'fuzzy' });
     expect(ids(fuzzy.hits)).toContain('ofac_sdn:LLC-3');
   });
@@ -2484,5 +2719,349 @@ describe('per-list strict→fuzzy completion (issue #59)', () => {
       'state_acn',
     ]);
     expect(ids(res.hits)).toEqual(['ofac_sdn:GRP-59', 'eu:POU-1', 'uk:PUT-UK']);
+  });
+});
+
+describe('per-list completion of a name in another script (issue #87)', () => {
+  /** One designation on `source` named `name`, also published under each of `aliases`. */
+  const aliased = (
+    source: NormalizedDesignation['source'],
+    entryId: string,
+    name: string,
+    aliases: string[],
+    entityType: NormalizedDesignation['entityType'] = 'person',
+  ): NormalizedDesignation => {
+    const designation = listed(source, entryId, name, entityType);
+    return {
+      ...designation,
+      payload: {
+        ...designation.payload,
+        aliases: aliases.map((alias) => ({ name: alias, nameType: 'aka' as const })),
+      },
+    };
+  };
+  const BORTNIKOV = 'Александр Васильевич БОРТНИКОВ';
+
+  beforeEach(async () => {
+    await svc.ingestDesignations([
+      // The UK names one person once per regime and gives only some of those
+      // records a native-script name: RUS0084 publishes the Cyrillic, CHW0014 does not.
+      aliased('uk', 'RUS0084', 'Aleksandr Vasilyevich BORTNIKOV', [BORTNIKOV]),
+      listed('uk', 'CHW0014', 'Aleksandr Vasilyevich BORTNIKOV'),
+      // Covers one of the three words: never a completion candidate.
+      listed('uk', 'SMI-1', 'Aleksandr Petrovich SMIRNOV'),
+    ]);
+  });
+
+  const screen = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, limit: 100, query, ...extra }, ctx);
+  const ids = (hits: readonly { designationId: string }[]) => hits.map((hit) => hit.designationId);
+  /** Each hit as `id matchType`, with its coverage when it carries one. */
+  const rows = (
+    hits: readonly {
+      designationId: string;
+      matchType: string;
+      queryTokenCoverage?: { covered: number; total: number };
+    }[],
+  ) =>
+    hits.map(({ designationId, matchType, queryTokenCoverage: cov }) =>
+      [designationId, matchType, cov && `${cov.covered}/${cov.total}`].filter(Boolean).join(' '),
+    );
+
+  it('completes the list a native-script strict hit reached with its Latin-only records, after the strict hits', async () => {
+    const res = await screen(BORTNIKOV);
+    expect(rows(res.hits)).toEqual(['uk:RUS0084 exact', 'uk:CHW0014 approximate 3/3']);
+    expect(res).toMatchObject({
+      modeUsed: 'strict',
+      fuzzyFallbackTriggered: false,
+      fuzzySources: [...SOURCE_CODES],
+      totalAvailable: 2,
+      totalAvailableBasis: 'lower_bound',
+    });
+  });
+
+  it('returns the strictly matched designation once, as its strict hit, though the completion scored it', async () => {
+    const { pooled, result } = await traceNameIndex(await svc.designations.raw(), () =>
+      screen(BORTNIKOV, { sources: ['uk'] }),
+    );
+    expect([...pooled.values()]).toContain('uk:RUS0084');
+    expect(result.hits.filter((hit) => hit.designationId === 'uk:RUS0084')).toEqual([
+      expect.objectContaining({ matchType: 'exact', matchedName: BORTNIKOV }),
+    ]);
+    expect(result.hits[0]).not.toHaveProperty('score');
+    // Strict hit the one selected list, and the completion still searched it.
+    expect(result).toMatchObject({
+      modeUsed: 'strict',
+      fuzzyFallbackTriggered: false,
+      fuzzySources: ['uk'],
+      poolBounded: false,
+      totalAvailable: 2,
+      totalAvailableBasis: 'lower_bound',
+    });
+  });
+
+  it('keeps a Latin-script strict hit settling its list (characterization)', async () => {
+    await svc.ingestDesignations([
+      listed('uk', 'LAT-1', 'Aleksandr BORTNIKOV'),
+      listed('uk', 'LAT-2', 'Alexandr BORTNIKOFF'),
+      listed('eu', 'LAT-3', 'Alexandr BORTNIKOFF'),
+    ]);
+    const res = await screen('Aleksandr Bortnikov');
+    expect(res.fuzzySources).not.toContain('uk');
+    expect(res.fuzzySources).toContain('eu');
+    expect(rows(res.hits)).toEqual([
+      'uk:LAT-1 exact',
+      'uk:CHW0014 strong',
+      'uk:RUS0084 strong',
+      'eu:LAT-3 approximate 2/2',
+    ]);
+    // The UK spelling variant is a candidate the strict hit leaves unsearched.
+    const fuzzy = await screen('Aleksandr Bortnikov', { matchMode: 'fuzzy' });
+    expect(ids(fuzzy.hits)).toContain('uk:LAT-2');
+  });
+
+  it('completes the UK list for a name mixing scripts', async () => {
+    await svc.ingestDesignations([
+      aliased('uk', 'ALM-1', 'Almaz Joint Venture', ['АО Almaz'], 'organization'),
+      listed('uk', 'ALM-2', 'ALMAZ Trading', 'organization'),
+    ]);
+    const res = await screen('АО Almaz');
+    expect(rows(res.hits)).toEqual(['uk:ALM-1 exact', 'uk:ALM-2 approximate 1/2']);
+    expect(res.fuzzySources).toEqual([...SOURCE_CODES]);
+  });
+
+  it('completes the UN list the same way, and leaves every other list settled by its native-script strict hit', async () => {
+    await svc.ingestDesignations([
+      aliased('un', 'UN-1', 'Aleksandr Vasilyevich BORTNIKOV', [BORTNIKOV]),
+      listed('un', 'UN-2', 'Aleksandr Vasilyevich BORTNIKOV'),
+      aliased('eu', 'EU-1', 'Aleksandr Vasilyevich BORTNIKOV', [BORTNIKOV]),
+      listed('eu', 'EU-2', 'Aleksandr Vasilyevich BORTNIKOV'),
+    ]);
+    const res = await screen(BORTNIKOV);
+    expect(res.fuzzySources).toEqual(SOURCE_CODES.filter((code) => code !== 'eu'));
+    expect(rows(res.hits).sort()).toEqual([
+      'eu:EU-1 exact',
+      'uk:CHW0014 approximate 3/3',
+      'uk:RUS0084 exact',
+      'un:UN-1 exact',
+      'un:UN-2 approximate 3/3',
+    ]);
+    // The EU's Latin-only record is a candidate its strict hit leaves unsearched.
+    const fuzzy = await screen(BORTNIKOV, { matchMode: 'fuzzy' });
+    expect(ids(fuzzy.hits)).toContain('eu:EU-2');
+  });
+
+  it('runs no fuzzy pass for a native-script name with autoFallback off (characterization)', async () => {
+    let res: Awaited<ReturnType<typeof screen>> | undefined;
+    const prefixes = await indexPrefixes(await svc.designations.raw(), async () => {
+      res = await screen(BORTNIKOV, { autoFallback: false });
+    });
+    expect(prefixes).toEqual([]);
+    expect(ids(res?.hits ?? [])).toEqual(['uk:RUS0084']);
+    expect(res).toMatchObject({ modeUsed: 'strict', totalAvailableBasis: 'exact' });
+    expect(res?.fuzzySources).toBeUndefined();
+  });
+});
+
+describe('words that sound alike (issue #92)', () => {
+  const screen = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, limit: 100, query, ...extra }, ctx);
+  const ids = (hits: readonly { designationId: string }[]) => hits.map((hit) => hit.designationId);
+  /** Each hit as `id matchType`, with its coverage and sound count when it carries them. */
+  const rows = (
+    hits: readonly {
+      designationId: string;
+      matchType: string;
+      queryTokenCoverage?: { covered: number; phonetic?: number; total: number };
+    }[],
+  ) =>
+    hits.map(({ designationId, matchType, queryTokenCoverage: cov }) =>
+      [designationId, matchType, cov && `${cov.covered}/${cov.total}`, cov?.phonetic]
+        .filter((part) => part !== undefined)
+        .join(' '),
+    );
+
+  describe('completing a strict hit on the other lists', () => {
+    beforeEach(async () => {
+      await svc.ingestDesignations([
+        // The strict hit, and the same person under the other lists' spelling.
+        listed('ofac_sdn', '12627', 'Hannibal Muammar GADDAFI'),
+        listed('eu', '6093', 'Hannibal Muammar QADHAFI'),
+        listed('uk', 'LIB0051', 'HANNIBAL MUAMMAR QADHAFI'),
+        listed('un', '690771', 'Hannibal Muammar Qadhafi'),
+        listed('ofac_sdn', '12608', 'Saif al-Islam GADDAFI'),
+        listed('eu', '6097', 'Saif al-Islam QADHAFI'),
+        listed('uk', 'LIB0064', 'SAIF AL-ISLAM QADHAFI'),
+        listed('un', '690778', 'SAIF AL-ISLAM QADHAFI'),
+        // Shares both keys (HNPL, KTF) and no spelling: 0.7214 and 0.
+        listed('bis_el', 'SND-1', 'Honebul Kotov'),
+      ]);
+    });
+
+    it.each([
+      [
+        'Hannibal Gaddafi',
+        [
+          'ofac_sdn:12627 strong',
+          'eu:6093 approximate 2/2 1',
+          'uk:LIB0051 approximate 2/2 1',
+          'un:690771 approximate 2/2 1',
+        ],
+      ],
+      [
+        'Saif al-Islam Gaddafi',
+        [
+          'ofac_sdn:12608 exact',
+          'eu:6097 approximate 4/4 1',
+          'uk:LIB0064 approximate 4/4 1',
+          'un:690778 approximate 4/4 1',
+        ],
+      ],
+    ])(
+      'completes %j with a sound-alike surname on each list strict missed',
+      async (query, expected) => {
+        const res = await screen(query);
+        expect(rows(res.hits)).toEqual(expected);
+        expect(res).toMatchObject({ modeUsed: 'strict', fuzzyFallbackTriggered: false });
+      },
+    );
+
+    it('scores a sound-completed hit on spelling alone', async () => {
+      const res = await screen('Hannibal Gaddafi', { sources: ['un'] });
+      // `hannibal` is exact; `gaddafi` ~ `qadhafi` (0.8095) never reaches the score.
+      expect(res.hits).toMatchObject([
+        { designationId: 'un:690771', score: 1, queryTokenCoverage: { covered: 2, phonetic: 1 } },
+      ]);
+    });
+
+    it('omits phonetic from an approximate hit that matched no word by sound', async () => {
+      const res = await screen('Hannibal Gaddafi', { matchMode: 'fuzzy' });
+      const spelled = res.hits.find((hit) => hit.designationId === 'ofac_sdn:12608');
+      expect(spelled?.queryTokenCoverage).toStrictEqual({ covered: 1, total: 2 });
+    });
+
+    it('never returns a candidate whose only link to the query is a shared key', async () => {
+      for (const extra of [{}, { matchMode: 'fuzzy' as const }, { sources: ['bis_el' as const] }]) {
+        const { result: res, ...trace } = await traceNameIndex(await svc.designations.raw(), () =>
+          screen('Hannibal Gaddafi', extra),
+        );
+        expect(phoneticallyPooled(trace, 'bis_el:SND-1'), JSON.stringify(extra)).toBe(true);
+        expect(ids(res.hits), JSON.stringify(extra)).not.toContain('bis_el:SND-1');
+      }
+    });
+
+    it('admits only on spelling in fuzzy mode, ranking a sound-completed hit by its coverage', async () => {
+      const res = await screen('Hannibal Gaddafi', { matchMode: 'fuzzy' });
+      // The Saif QADHAFI records share no spelled word with the query, so sound adds none.
+      expect(rows(res.hits)).toEqual([
+        'ofac_sdn:12627 strong',
+        'eu:6093 approximate 2/2 1',
+        'uk:LIB0051 approximate 2/2 1',
+        'un:690771 approximate 2/2 1',
+        'ofac_sdn:12608 approximate 1/2',
+      ]);
+    });
+  });
+
+  it('ranks by score, then words covered, then words covered by spelling', async () => {
+    await svc.ingestDesignations([
+      listed('ofac_sdn', '12610', 'Aisha GADHAFI'),
+      listed('eu', 'AB-1', 'AISHA Abu Bakr'),
+      listed('eu', 'KH-1', 'GADDAFI Khamis'),
+      listed('uk', 'LIB0047', 'Aisha QADHAFI'),
+      listed('un', '690757', 'Aisha Qadhafi'),
+      listed('eu', 'HUS-1', 'Ahmed HUSSEIN'),
+      // `hasan` ~ `hassan` (0.97) by spelling, so strict never reaches it.
+      listed('un', 'HAS-1', 'HASAN Ahmed Ali'),
+      listed('ofac_sdn', 'AH-1', 'Ahmed Zorvani'),
+    ]);
+    const aisha = await screen('Aisha Gaddafi');
+    expect(aisha.modeUsed).toBe('fuzzy');
+    expect(rows(aisha.hits)).toEqual([
+      'ofac_sdn:12610 approximate 2/2',
+      'uk:LIB0047 approximate 2/2 1',
+      'un:690757 approximate 2/2 1',
+      'eu:AB-1 approximate 1/2',
+      'eu:KH-1 approximate 1/2',
+    ]);
+    expect(aisha.hits[0]?.queryTokenCoverage).toStrictEqual({ covered: 2, total: 2 });
+    // Score 1 and 2/2 each: `hassan` spelled outranks `hussein` sounded, whatever the list order.
+    const ahmed = await screen('Ahmed Hassan', { matchMode: 'fuzzy' });
+    expect(rows(ahmed.hits)).toEqual([
+      'un:HAS-1 approximate 2/2',
+      'eu:HUS-1 approximate 2/2 1',
+      'ofac_sdn:AH-1 approximate 1/2',
+    ]);
+    expect(new Set(ahmed.hits.map((hit) => hit.score))).toEqual(new Set([1]));
+  });
+
+  it.each([
+    // `ali` ~ `el`: key AL, two characters, and `el` is stoplisted.
+    ['Mohammed Ali', 'Mohammed ALI', 'EL BARDAWIL Salah Mohammad'],
+    // `wei` ~ `yu`: key A; `zhang` ~ `han` clears the floor by spelling (0.8667).
+    ['Zhang Wei', 'ZHANG Wei', 'Yu-ro Han'],
+    // `jun` ~ `jin`: key JN, two characters.
+    ['Wang Jun', 'WANG Jun', 'Jin Wang'],
+    // `anita` ~ `and`: key ANT, but `and` is stoplisted.
+    ['Anita Rahimi', 'Anita RAHIMI', 'Rahimi and Sons'],
+  ])(
+    'keeps no %j completion candidate whose sound match is a short key or a stoplisted word',
+    async (query, strictName, soundAlike) => {
+      await svc.ingestDesignations([
+        listed('un', 'STRICT-1', strictName),
+        listed('eu', 'SOUND-1', soundAlike),
+      ]);
+      const completed = await screen(query);
+      expect(ids(completed.hits)).toEqual(['un:STRICT-1']);
+      // A full pass admits it on its spelled word, and covers only that word.
+      const fuzzy = await screen(query, { matchMode: 'fuzzy', sources: ['eu'] });
+      expect(fuzzy.hits).toMatchObject([
+        { designationId: 'eu:SOUND-1', queryTokenCoverage: { covered: 1, total: 2 } },
+      ]);
+      expect(fuzzy.hits[0]?.queryTokenCoverage?.phonetic).toBeUndefined();
+    },
+  );
+
+  it('leaves a fuzzy LEI resolution unchanged by a sound-alike candidate', async () => {
+    const resolve = async () =>
+      (
+        await svc.resolveEntity(
+          { query: 'Hannibal Gaddafi Trading', matchMode: 'fuzzy', status: 'any', limit: 25 },
+          ctx,
+        )
+      ).matches.filter((match) => match.lei.startsWith('92'));
+    await svc.ingestLeiEntities([
+      {
+        lei: '92000000000000SPELL1',
+        legalName: 'Hannibal Zorvex Trading Ltd',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+    ]);
+    const without = await resolve();
+    // Sorts after the spelled LEI, and sanctions screening would rank it first at 3/3.
+    await svc.ingestLeiEntities([
+      {
+        lei: '92ZZZZZZZZZZZZSOUND1',
+        legalName: 'Hannibal Qadhafi Trading Ltd',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+    ]);
+    const withSoundAlike = await resolve();
+    expect(
+      withSoundAlike.map((match) => [match.lei, match.score, match.queryTokenCoverage]),
+    ).toEqual([
+      ['92000000000000SPELL1', 1, { covered: 2, total: 3 }],
+      ['92ZZZZZZZZZZZZSOUND1', 1, { covered: 2, total: 3 }],
+    ]);
+    expect(withSoundAlike[0]).toEqual(without[0]);
+    expect(without).toHaveLength(1);
   });
 });

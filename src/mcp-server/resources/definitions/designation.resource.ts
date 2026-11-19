@@ -2,8 +2,9 @@
  * @fileoverview `sanctions://designation/{source}/{entryId}` — read-only mirror
  * of sanctions_get_designation for clients that inject context by URI. All data
  * here is reachable via the tool, which is the primary path for tool-only
- * clients. Resolves the entry ID the way the tool does — entry ID or published
- * reference number, trimmed and case-insensitive.
+ * clients. Resolves the entry ID the way the tool does — entry ID, published
+ * reference number, then (UK and EU) UN reference number, trimmed and
+ * case-insensitive, a UN reference number regardless of zero padding.
  * @module mcp-server/resources/definitions/designation.resource
  */
 
@@ -32,7 +33,7 @@ export const designationResource = resource('sanctions://designation/{source}/{e
   name: 'sanctions-screening-mcp-server: designation',
   title: 'sanctions-screening-mcp-server: designation',
   description:
-    "Fetch one sanctions designation by source list + entry ID or the list's published reference number — a read-only URI mirror of sanctions_get_designation. The record is what the source published; a screening aid, not a determination.",
+    "Fetch one sanctions designation by source list + entry ID, the list's published reference number, or, for a UK or EU designation, the UN reference number it implements — a read-only URI mirror of sanctions_get_designation. The record is what the source published; a screening aid, not a determination.",
   mimeType: 'application/json',
   // A designation only changes when its source list republishes, which this
   // server picks up on the daily refresh cron. Scoped private, not public: the
@@ -45,20 +46,21 @@ export const designationResource = resource('sanctions://designation/{source}/{e
       .string()
       .min(1)
       .describe(
-        "The source list's own entry ID, or the reference number the list publishes for the entry, percent-encoded as a URI segment. Matched trimmed and case-insensitive, entry ID first.",
+        "The source list's own entry ID, the reference number the list publishes for the entry, or, on uk and eu, the UN reference number the entry implements, percent-encoded as a URI segment. Matched trimmed and case-insensitive: entry ID first, then reference number, then UN reference number, then a UN reference number in another zero padding (LYi.28, LYi.028).",
       ),
   }),
   errors: [
     {
       reason: 'designation_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No designation in the given source has that entry ID or reference number in the mirror.',
-      recovery: 'Use sanctions_screen_name to discover valid source/entryId pairs first.',
+      when: 'No designation in the given source has that entry ID, reference number, or UN reference number (in any zero padding) in the mirror.',
+      recovery:
+        'Use sanctions_screen_name to discover valid source/entryId pairs first; for a UN reference number on a source other than un, read it with source un to get the party to screen.',
     },
     {
       reason: 'reference_ambiguous',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'The entry ID is a reference number more than one designation in the source publishes.',
+      when: 'The entry ID is a reference number or UN reference number more than one designation in the source carries.',
       recovery:
         'Read the resource again with one of the sourceEntryIds this error names; each one identifies a single designation.',
     },
@@ -83,16 +85,20 @@ export const designationResource = resource('sanctions://designation/{source}/{e
       ? await svc.resolveDesignation(params.source as SourceCode, entryId)
       : ({ kind: 'not_found' } as const);
     if (lookup.kind === 'ambiguous') {
+      const held =
+        lookup.key === 'referenceNumber'
+          ? `Reference number "${entryId?.trim()}" is published by`
+          : `UN reference number "${entryId?.trim()}" is carried by`;
       throw ctx.fail(
         'reference_ambiguous',
-        `Reference number "${entryId?.trim()}" is published by ${lookup.sourceEntryIds.length} ${params.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
+        `${held} ${lookup.sourceEntryIds.length} ${params.source} designations: ${lookup.sourceEntryIds.join(', ')}.`,
         { sourceEntryIds: lookup.sourceEntryIds },
       );
     }
     if (lookup.kind === 'not_found') {
       throw ctx.fail(
         'designation_not_found',
-        `No ${params.source} designation with entry ID or reference number "${entryId ?? params.entryId}".`,
+        `No ${params.source} designation with entry ID, reference number, or UN reference number "${entryId ?? params.entryId}".`,
       );
     }
     const d = lookup.designation;
@@ -101,6 +107,7 @@ export const designationResource = resource('sanctions://designation/{source}/{e
       sourceLabel: SOURCE_LABELS[d.source],
       sourceEntryId: d.sourceEntryId,
       referenceNumber: d.referenceNumber,
+      unReferenceNumber: d.unReferenceNumber,
       entityType: d.entityType,
       primaryName: d.primaryName,
       program: d.program,

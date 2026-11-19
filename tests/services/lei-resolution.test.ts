@@ -85,6 +85,8 @@ describe('getLeiEntity — stored payload', () => {
     expect(await svc.getLeiEntity('5493001KJTIIGC8Y1R12')).toEqual({
       ...FIXTURE_LEI_ENTITIES[0],
       alternateNames: [{ name: 'Fictional Trading Co', type: 'PREVIOUS_LEGAL_NAME' }],
+      // The fixture carries entityStatus ACTIVE, so its payload reads as loaded.
+      entityStatusLoaded: true,
     });
   });
 
@@ -97,6 +99,8 @@ describe('getLeiEntity — stored payload', () => {
       legalName: 'Untyped Read Ltd',
       otherNames: ['Untyped Trading'],
       alternateNames: [{ name: 'Untyped Trading', type: 'UNKNOWN' }],
+      // Stored with no entityStatus, as a release before #94 stored every record.
+      entityStatusLoaded: false,
     });
   });
 });

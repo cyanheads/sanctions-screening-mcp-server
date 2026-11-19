@@ -47,6 +47,12 @@ const HitSchema = z
       .describe(
         "The list's published reference number (UN, EU, UK OFSI Group ID); absent when the list publishes none for the entry.",
       ),
+    unReferenceNumber: z
+      .string()
+      .optional()
+      .describe(
+        "The UN reference number a UK or EU hit's designation implements, as the list publishes it; absent when it publishes none. Never corrected, and two designations can carry one — a link to check against the un record, not proof of identity.",
+      ),
     entityType: z
       .enum(['person', 'organization', 'vessel', 'aircraft', 'unknown'])
       .describe('Entity classification as published by the source.'),
@@ -58,7 +64,7 @@ const HitSchema = z
     matchType: z
       .enum(['exact', 'strong', 'approximate'])
       .describe(
-        'exact = native normalized name equality; strong = all native query tokens present; approximate = fuzzy/phonetic, optionally comparing Russian-alphabet romanizations while retaining the published matchedName.',
+        'exact = native normalized name equality; strong = all native query tokens present, a legal form counting in any spelling of the same form (Ltd and Limited, LLC and OOO; never LLC and Ltd); approximate = fuzzy/phonetic, optionally comparing Russian-alphabet romanizations while retaining the published matchedName.',
       ),
     score: z
       .number()
@@ -72,13 +78,20 @@ const HitSchema = z
           .number()
           .int()
           .describe(
-            "Query tokens individually matched by one of this candidate's tokens at the applied score floor.",
+            "Query tokens individually matched by one of this candidate's tokens: by spelling at the applied score floor, or by sound (counted again in phonetic).",
+          ),
+        phonetic: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            `Of covered, the query tokens matched by sound alone: no candidate token clears the score floor against them, but one shares their primary Double-Metaphone key, at least three characters long (gaddafi and qadhafi, both KTF), and neither word is one of ${UNCOUNTED_WORDS}. A sound match never admits a candidate or raises its score. Absent when zero.`,
           ),
         total: z.number().int().describe('Total tokens in the normalized query.'),
       })
       .optional()
       .describe(
-        'How much of the query this candidate explains, as a literal token count — a second real measurement, never folded into score. It is the tie-break applied after score, because one shared exact token pins several candidates at the same score. Absent for exact/strong hits.',
+        'How much of the query this candidate explains, as a literal token count — a second real measurement, never folded into score. It is the tie-break applied after score, because one shared exact token pins several candidates at the same score; of two equal counts, the one with fewer words matched by sound ranks first. Absent for exact/strong hits.',
       ),
     program: z
       .string()
@@ -119,7 +132,7 @@ const HitSchema = z
 
 export const screenNameTool = tool('sanctions_screen_name', {
   title: 'sanctions-screening-mcp-server: screen name',
-  description: `Screen a name (person, company, vessel, aircraft) against loaded sanctions and export-control watchlists — OFAC SDN + Consolidated, EU, UK, UN, and the six BIS/State CSL lists — alias- and fuzzy-aware. Check sanctions_list_sources for coverage before interpreting an empty result; zero-record CSL lists are not loaded. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias; an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists. Strict mode (default) matches exact-normalized then all-tokens-present, then runs a fuzzy pass over each selected list strict finds nothing on: a full pass when strict finds nothing on any list, otherwise one that adds only candidates covering every word of the name other than ${UNCOUNTED_WORDS}, ranked after the strict hits. Fuzzy mode runs the fuzzy pass over every selected list. It adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score; fuzzySources names the lists it searched. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."`,
+  description: `Screen a name (person, company, vessel, aircraft) against loaded sanctions and export-control watchlists — OFAC SDN + Consolidated, EU, UK, UN, and the six BIS/State CSL lists — alias- and fuzzy-aware. Check sanctions_list_sources for coverage before interpreting an empty result; zero-record CSL lists are not loaded. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias; an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists. Strict mode (default) matches exact-normalized then all-tokens-present, a legal form matching any spelling of the same form (Ltd and Limited, LLC and OOO), then runs a fuzzy pass over each selected list strict finds nothing on, and over the UK and UN lists either way for a name holding a letter outside the Latin script: a full pass when strict finds nothing on any list, otherwise one that adds only candidates covering every word of the name other than ${UNCOUNTED_WORDS}, by spelling or by sound, ranked after the strict hits. Fuzzy mode runs the fuzzy pass over every selected list. It adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score; fuzzySources names the lists it searched. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z
@@ -138,7 +151,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .enum(['strict', 'fuzzy'])
       .default('strict')
       .describe(
-        `strict (default): exact-normalized then all-tokens-present, then a fuzzy pass over each selected list strict finds nothing on — a full pass when strict finds nothing on any list, otherwise adding only candidates that cover every word of the name other than ${UNCOUNTED_WORDS}. fuzzy: a scored Jaro-Winkler + phonetic pass over every selected list.`,
+        `strict (default): exact-normalized, then all-tokens-present with a legal form matching any spelling of the same form (Ltd and Limited, LLC and OOO), then a fuzzy pass over each selected list strict finds nothing on, and over the UK and UN lists either way for a name holding a letter outside the Latin script — a full pass when strict finds nothing on any list, otherwise adding only candidates that cover every word of the name other than ${UNCOUNTED_WORDS}, by spelling or by sound. fuzzy: a scored Jaro-Winkler + phonetic pass over every selected list.`,
       ),
     minScore: z
       .number()
@@ -146,7 +159,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .max(1)
       .optional()
       .describe(
-        "Score floor for approximate hits (0–1), applied uniformly to every fuzzy candidate regardless of how it was matched (Jaro-Winkler, token, or phonetic); a query token counts toward queryTokenCoverage only when its match clears it too. It governs every fuzzy pass: fuzzy mode, and in strict mode the pass over the lists strict found nothing on, so raising it can remove approximate hits from a strict screen as well. Exact and strong hits are unaffected. Defaults to the server's configured floor.",
+        "Score floor for approximate hits (0–1), applied uniformly to every fuzzy candidate regardless of how it was matched (Jaro-Winkler, token, or phonetic); a query token counts toward queryTokenCoverage by spelling only when its match clears it too, and a token matched by sound counts toward coverage without admitting a candidate on its own. It governs every fuzzy pass: fuzzy mode, and in strict mode the pass that follows strict matching, so raising it can remove approximate hits from a strict screen as well. Exact and strong hits are unaffected. Defaults to the server's configured floor.",
       ),
     sources: z
       .array(SOURCE_ENUM)
@@ -183,13 +196,13 @@ export const screenNameTool = tool('sanctions_screen_name', {
     matchModeUsed: z
       .string()
       .describe(
-        'fuzzy when every selected list was fuzzy-searched (fuzzy mode, or a strict screen that found nothing on any list); strict otherwise, including a strict screen whose strict-empty lists were completed by a fuzzy pass.',
+        'fuzzy when a full fuzzy pass searched every selected list (fuzzy mode, or a strict screen that found nothing on any list); strict otherwise, including a strict screen completed by a fuzzy pass over its strict-empty lists and, for a name holding a letter outside the Latin script, the UK and UN lists.',
       ),
     fuzzySources: z
       .array(SOURCE_ENUM)
       .optional()
       .describe(
-        `The selected lists the fuzzy pass searched, in list order; absent when no fuzzy pass ran. Beside strict hits these are the lists strict found nothing on, and only their candidates covering every word of the name other than ${UNCOUNTED_WORDS} were added.`,
+        `The selected lists the fuzzy pass searched, in list order; absent when no fuzzy pass ran. Beside strict hits these are the lists strict found nothing on, plus the UK and UN lists for a name holding a letter outside the Latin script, and only their candidates covering every word of the name other than ${UNCOUNTED_WORDS}, by spelling or by sound, were added.`,
       ),
     totalCount: z.number().describe('Number of potential matches returned in this page.'),
     totalAvailable: z
@@ -200,7 +213,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
     totalAvailableBasis: z
       .enum(['exact', 'lower_bound'])
       .describe(
-        'How to read totalAvailable: exact = the complete strict match set, strict having found a match on every selected list; lower_bound = a fuzzy pass ran (fuzzySources is present), which scores only the candidates blocking pooled, so more matches may exist beyond the result set.',
+        'How to read totalAvailable: exact = the complete strict match set, no fuzzy pass having run (fuzzySources is absent); lower_bound = a fuzzy pass ran (fuzzySources is present), which scores only the candidates blocking pooled, so more matches may exist beyond the result set.',
       ),
     hasMore: z
       .boolean()
@@ -319,6 +332,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
         sourceEntryId: h.sourceEntryId,
         sources: h.sources,
         ...(h.referenceNumber ? { referenceNumber: h.referenceNumber } : {}),
+        ...(h.unReferenceNumber ? { unReferenceNumber: h.unReferenceNumber } : {}),
         entityType: h.entityType,
         primaryName: h.primaryName,
         matchedName: h.matchedName,
@@ -347,11 +361,13 @@ export const screenNameTool = tool('sanctions_screen_name', {
       for (const h of result.hits) {
         const scoreStr = h.score !== undefined ? ` · score ${h.score}` : '';
         const cov = h.queryTokenCoverage;
-        const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
+        const coverStr = cov
+          ? ` · covers ${cov.covered}/${cov.total} query tokens${cov.phonetic ? ` (${cov.phonetic} by sound)` : ''}`
+          : '';
         const also = alsoListedText(h.source, h.sources);
         lines.push(`### ${h.primaryName} — ${h.matchType}${scoreStr}${coverStr}`);
         lines.push(
-          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${h.sourceEntryId}${h.referenceNumber ? ` | **Reference:** ${h.referenceNumber}` : ''} | **Type:** ${h.entityType}`,
+          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${h.sourceEntryId}${h.referenceNumber ? ` | **Reference:** ${h.referenceNumber}` : ''}${h.unReferenceNumber ? ` | **UN reference:** ${escapeMarkdownInline(h.unReferenceNumber)}` : ''} | **Type:** ${h.entityType}`,
         );
         lines.push(`**Matched on:** "${h.matchedName}" (${h.matchedNameType})`);
         if (h.program) lines.push(`**Program:** ${h.program}`);

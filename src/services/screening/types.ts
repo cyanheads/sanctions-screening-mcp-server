@@ -152,6 +152,14 @@ export interface NormalizedDesignation {
   source: SourceCode;
   /** The list's own entry ID (for `get_designation`). */
   sourceEntryId: string;
+  /**
+   * The UN reference a UK or EU designation implements, as the list publishes it:
+   * UK `UNReferenceNumber`, EU `unitedNationId`. Trimmed; a placeholder (UK `N/A`)
+   * is absent. Never corrected — a published value can differ from the UN's own
+   * in case (`QDE.145`), be unpadded (`LYi.28`), name no current UN listing, or
+   * be carried by two designations.
+   */
+  unReferenceNumber?: string;
 }
 
 /** The type the name index gives an entity's legal name. */
@@ -176,6 +184,16 @@ export interface LeiAlternateName {
   type: string;
 }
 
+/**
+ * One `SuccessorEntity` a GLEIF record publishes: the entity that took this one
+ * over, by `SuccessorLEI`, by `SuccessorEntityName` (for a successor without an
+ * LEI), or both. Never one with neither.
+ */
+export interface LeiSuccessor {
+  lei?: string;
+  name?: string;
+}
+
 /** A GLEIF Level 1 entity record (who-is-who). */
 export interface NormalizedLeiEntity {
   /**
@@ -184,6 +202,13 @@ export interface NormalizedLeiEntity {
    * names were typed; the read path then derives it from {@link otherNames}.
    */
   alternateNames?: LeiAlternateName[];
+  /**
+   * `EntityStatus` as published (`ACTIVE`, `INACTIVE`, `NULL`): the legal entity's
+   * own state, a different vocabulary from {@link status}. GLEIF publishes it on
+   * every record, so a stored record without it was written before this field
+   * was read.
+   */
+  entityStatus?: string;
   /** Single-line headquarters address. */
   headquartersAddress?: string;
   /**
@@ -205,14 +230,21 @@ export interface NormalizedLeiEntity {
   registrationAuthorityId?: string;
   /** `RegistrationStatus` (ISSUED, LAPSED, RETIRED, …); absent when the record states none. */
   status?: string;
+  /** Every published `SuccessorEntity`, in document order; absent when none is published. */
+  successors?: LeiSuccessor[];
 }
 
 /**
  * A stored entity as the read path returns it, in one shape whichever release
  * stored it: `alternateNames` always present, derived from bare `otherNames` as
- * {@link UNKNOWN_NAME_TYPE} for a record stored before names were typed.
+ * {@link UNKNOWN_NAME_TYPE} for a record stored before names were typed; and
+ * `entityStatusLoaded`, false for a record stored before `entityStatus` and
+ * `successors` were read, whose absent successors then say nothing.
  */
-export type LeiEntityRecord = NormalizedLeiEntity & { alternateNames: LeiAlternateName[] };
+export type LeiEntityRecord = NormalizedLeiEntity & {
+  alternateNames: LeiAlternateName[];
+  entityStatusLoaded: boolean;
+};
 
 /** A GLEIF Level 2 relationship record (who-owns-whom). */
 export interface NormalizedLeiRelationship {
@@ -273,7 +305,8 @@ export type MatchType = 'exact' | 'strong' | 'approximate';
 /**
  * How much of a multi-token query a candidate actually explains: a literal count
  * of query tokens that individually clear the applied score floor against one of
- * the candidate's tokens, alongside the query's total token count.
+ * the candidate's tokens — or, in sanctions screening, sound like one (see
+ * `soundKeys`) — alongside the query's total token count.
  *
  * This is a second real measurement, never a blend — `score` stays the raw
  * Jaro-Winkler value. It exists because `score` is the max over a whole-string
@@ -283,8 +316,14 @@ export type MatchType = 'exact' | 'strong' | 'approximate';
  * account for the resulting order.
  */
 export interface QueryTokenCoverage {
-  /** Query tokens individually matched by some candidate token, at the applied floor. */
+  /** Query tokens individually matched by some candidate token, at the applied floor or by sound. */
   covered: number;
+  /**
+   * Of `covered`, the tokens matched by sound alone: no candidate token clears
+   * the floor against them, but one shares their primary Double-Metaphone key.
+   * Absent when zero, and always on LEI matches, which never match by sound.
+   */
+  phonetic?: number;
   /** Total tokens in the folded query. */
   total: number;
 }
@@ -336,6 +375,8 @@ export interface ScreeningHit {
    * OFAC lists store, whether the screen reached one of its records or both.
    */
   sources: SourceCode[];
+  /** The UN reference the matched designation implements — {@link NormalizedDesignation.unReferenceNumber}. */
+  unReferenceNumber?: string;
 }
 
 /** A scored LEI resolution candidate. */

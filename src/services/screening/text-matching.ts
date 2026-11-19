@@ -1,7 +1,8 @@
 /**
  * @fileoverview Pure text-matching primitives for sanctions screening:
- * name folding/normalization, tokenization, Double-Metaphone phonetic keys, and
- * Jaro-Winkler similarity. These produce the *real signal* the matching engine
+ * name folding/normalization, tokenization, the legal-form spelling fold strict
+ * matching reads, Double-Metaphone phonetic keys, and Jaro-Winkler similarity.
+ * These produce the *real signal* the matching engine
  * surfaces — Jaro-Winkler returns a genuine 0–1 measurement, never a fabricated
  * composite "confidence". The index and the query are both folded before the FTS5
  * tokenizer (`unicode61 remove_diacritics 2`) sees them, and the tokenizer splits a
@@ -22,6 +23,20 @@ const SEPARATOR_RUNS = /(?:[^\p{L}\p{N}]|[ʰ-˿])+/gu;
 
 /** A token written entirely in Latin script (digits allowed) — the only kind Double Metaphone keys. */
 const LATIN_TOKEN = /^[\p{Script=Latin}\p{N}]+$/u;
+
+/** A letter of a script other than Latin and Common (see {@link hasOtherScriptLetter}). */
+const OTHER_SCRIPT_LETTER = /[^\P{L}\p{Script=Latin}\p{Script=Common}]/u;
+
+/**
+ * True when `text` holds a letter of a script other than Latin. Script-neutral
+ * letters (Common: `µ`, the modifier apostrophe `ʼ`) belong to no script and do
+ * not count, and neither do digits, marks, or punctuation, so a name mixing
+ * scripts (`АО Almaz`) holds one and a Latin name with digits does not. One
+ * character class, so a read is linear in `text`.
+ */
+export function hasOtherScriptLetter(text: string): boolean {
+  return OTHER_SCRIPT_LETTER.test(text);
+}
 
 /**
  * Fold a raw name to its normalized form: NFKD-decompose, strip every combining
@@ -297,33 +312,77 @@ export function scoringQuery(queryTokens: readonly string[]): ScoringToken[] {
   }));
 }
 
+/**
+ * A folded token's key for matching by sound in {@link scoreTokenPairs}, or
+ * undefined when the token never matches by sound. Two tokens sound alike when
+ * both have a key and the keys are equal.
+ */
+export type SoundKey = (token: string) => string | undefined;
+
+/**
+ * The shortest primary Double-Metaphone key a token matches by sound on. A
+ * shorter key joins unrelated words: `wei` and `yu` are both `A`.
+ */
+const MIN_SOUND_KEY_LENGTH = 3;
+
+/**
+ * A memoized {@link SoundKey} for one fuzzy pass: a token's primary
+ * Double-Metaphone key ({@link doubleMetaphone}), or undefined when the token is
+ * on {@link FUZZY_STOPLIST} (`al` and `el` are both `AL`), has no key (a
+ * non-Latin token), or its key is shorter than three characters. The memo lives
+ * as long as the returned function, so a pass over thousands of candidate names
+ * keys each distinct token once.
+ */
+export function soundKeys(): SoundKey {
+  const memo = new Map<string, string | undefined>();
+  return (token) => {
+    if (memo.has(token)) return memo.get(token);
+    const key = isStoplistToken(token) ? '' : doubleMetaphone(token);
+    const soundKey = key.length >= MIN_SOUND_KEY_LENGTH ? key : undefined;
+    memo.set(token, soundKey);
+    return soundKey;
+  };
+}
+
 /** One candidate's token-pair measurements against a query — see {@link scoreTokenPairs}. */
 export interface TokenPairScores {
   /** {@link bestTokenScore} of the query and candidate tokens. */
   best: number;
-  /** {@link tokenCoverage} of every query token at the threshold. */
+  /** Query tokens covered by spelling ({@link tokenCoverage} at the threshold) or by sound. */
   covered: number;
-  /** {@link tokenCoverage} of the distinctive query tokens alone at the threshold. */
+  /** {@link tokenCoverage} of the distinctive query tokens alone at the threshold: spelling only. */
   distinctiveCovered: number;
+  /** Of `covered`, the tokens covered by sound alone; every one is distinctive. 0 without a {@link SoundKey}. */
+  phonetic: number;
 }
 
 /**
- * {@link bestTokenScore}, {@link tokenCoverage} of every query token, and
+ * {@link bestTokenScore}, the coverage of every query token, and
  * {@link tokenCoverage} of the distinctive ones, from one pass over the query ×
  * candidate token pairs: each pair's Jaro-Winkler is computed at most once, and
  * each token is split into code points once. A query token's remaining pairs are
  * skipped only once it is covered and the best score is already 1, when none of
- * them can change a result — so all three equal the separate helpers' results.
+ * them can change a result — so `best` and `distinctiveCovered` equal the
+ * separate helpers' results, and so does `covered` without a `soundKey`.
+ *
+ * With a `soundKey`, a distinctive query token that no candidate token clears
+ * the threshold against is covered by sound when its key equals a candidate
+ * token's (`gaddafi` and `qadhafi`, both `KTF`, at Jaro-Winkler 0.8095): it counts
+ * in `covered` and in `phonetic`, never in `best` or `distinctiveCovered`. So
+ * `distinctiveCovered + phonetic` is the distinctive tokens covered either way,
+ * and a gate on `distinctiveCovered` admits nothing by sound.
  */
 export function scoreTokenPairs(
   query: readonly ScoringToken[],
   candidateTokens: readonly string[],
   threshold: number,
+  soundKey?: SoundKey,
 ): TokenPairScores {
   const candidate = candidateTokens.map((text) => ({ text, codePoints: codePoints(text) }));
   let best = 0;
   let covered = 0;
   let distinctiveCovered = 0;
+  let phonetic = 0;
   for (const q of query) {
     let hit = false;
     for (const c of candidate) {
@@ -337,9 +396,15 @@ export function scoreTokenPairs(
     if (hit) {
       covered++;
       if (q.distinctive) distinctiveCovered++;
+    } else if (soundKey && q.distinctive) {
+      const key = soundKey(q.text);
+      if (key !== undefined && candidateTokens.some((c) => soundKey(c) === key)) {
+        covered++;
+        phonetic++;
+      }
     }
   }
-  return { best, covered, distinctiveCovered };
+  return { best, covered, distinctiveCovered, phonetic };
 }
 
 /**
@@ -385,10 +450,10 @@ export function lengthRatio(a: string, b: string): number {
  * still covers its other words, so it keeps its place; the syllable only stops
  * counting toward admission and stops forming a blocking lookup of its own.
  *
- * The list changes the fuzzy admission gate and blocking only (see
- * `ScreeningService.admitFuzzy` and `poolCandidates`). The normalized query,
- * strict matching, the surfaced score, the whole-string arm, and
- * `queryTokenCoverage` count every token.
+ * The list changes the fuzzy admission gate, blocking, and matching by sound
+ * only (see `ScreeningService.admitFuzzy`, `poolCandidates`, and
+ * {@link soundKeys}). The normalized query, strict matching, the surfaced score,
+ * the whole-string arm, and `queryTokenCoverage` by spelling count every token.
  */
 export const FUZZY_STOPLIST: ReadonlySet<string> = new Set(
   [
@@ -432,6 +497,174 @@ export function splitOnStoplist(tokens: readonly string[]): {
   return distinctive.length === 0
     ? { distinctive: [...tokens], stoplisted: [] }
     : { distinctive, stoplisted: tokens.filter(isStoplistToken) };
+}
+
+// ─── Legal-form spellings ─────────────────────────────────────────────────────
+
+/**
+ * Each legal form strict matching reads as one word, keyed by its canonical
+ * token, with every folded spelling of it — the canonical first. A
+ * transliterated or Cyrillic Russian form is a spelling of its English form:
+ * `OOO`, `ООО`, and `Obshchestvo s Ogranichennoi Otvetstvennostyu` are `LLC`.
+ *
+ * Built from the alias pairs of one designation that differ only in how a form
+ * is spelled, over the 2026-11-19 lists; every spelling here is paired so at
+ * least once, except those held so a longer form never reads as a word of
+ * another (`Limited Partnership` as `Ltd`): the non-public JSC, a bare
+ * `limited liability`, and the LP and PLC rows. Forms the lists pair for one
+ * entity's re-registration or in translation are different forms, never one
+ * row: JSC, PJSC, OJSC, and CJSC are four forms, LLC and Ltd two, Company and
+ * Corporation two.
+ *
+ * Every canonical is on {@link FUZZY_STOPLIST}. The table reaches strict
+ * matching only, through {@link foldLegalForms} and
+ * {@link buildLegalFormFtsMatch}; the normalized query, the stored name index,
+ * and GLEIF name resolution never see it.
+ */
+export const LEGAL_FORM_SPELLINGS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['ltd', ['ltd', 'limited']],
+  ['co', ['co', 'company']],
+  ['corp', ['corp', 'corporation']],
+  ['inc', ['inc', 'incorporated']],
+  ['llp', ['llp', 'limited liability partnership']],
+  ['lp', ['lp', 'limited partnership']],
+  ['plc', ['plc', 'public limited company']],
+  ['ag', ['ag', 'aktiengesellschaft']],
+  [
+    'llc',
+    [
+      'llc',
+      'limited liability company',
+      'limited liability corporation',
+      'limited liability',
+      'l l c',
+      'ooo',
+      'obshchestvo s ogranichennoi otvetstvennostyu',
+      'obshchestvo s ogranichennoy otvetstvennostyu',
+      'obschestvo s ogranichennoi otvetstvennostyu',
+      'obschestvo s ogranichennoy otvetstvennostyu',
+      'ооо',
+      'общество с ограниченнои ответственностью',
+      // The same form as the lists also publish it, the preposition a Latin `c` (U+0063).
+      'общество c ограниченнои ответственностью',
+    ],
+  ],
+  [
+    'jsc',
+    [
+      'jsc',
+      'joint stock company',
+      'non public joint stock company',
+      'ao',
+      'aktsionernoe obshchestvo',
+      'aktsionernoye obshchestvo',
+      'aktsionernoe obschestvo',
+      'ао',
+      'акционерное общество',
+      'непубличное акционерное общество',
+    ],
+  ],
+  [
+    'pjsc',
+    [
+      'pjsc',
+      'public joint stock company',
+      'pao',
+      'publichnoe aktsionernoe obshchestvo',
+      'publichnoye aktsionernoye obshchestvo',
+      'publichnoe aktsionernoe obschestvo',
+      'publichnoye joint stock company',
+      'пао',
+      'публичное акционерное общество',
+    ],
+  ],
+  [
+    'ojsc',
+    [
+      'ojsc',
+      'open joint stock company',
+      'oao',
+      'otkrytoe aktsionernoe obshchestvo',
+      'otkrytoye aktsionernoye obshchestvo',
+      'otkrytoe aktsionernoe obschestvo',
+      'оао',
+      'открытое акционерное общество',
+    ],
+  ],
+  [
+    'cjsc',
+    [
+      'cjsc',
+      'closed joint stock company',
+      'zao',
+      'zakrytoe aktsionernoe obshchestvo',
+      'zakrytoye aktsionernoye obshchestvo',
+      'зао',
+      'закрытое акционерное общество',
+    ],
+  ],
+]);
+
+/** One spelling's tokens and its form's canonical token. */
+interface LegalFormSpelling {
+  readonly canonical: string;
+  readonly tokens: readonly string[];
+}
+
+/** Every spelling, keyed by its first token, the longest first within a key. */
+const SPELLINGS_BY_FIRST_TOKEN = new Map<string, LegalFormSpelling[]>();
+for (const [canonical, spellings] of LEGAL_FORM_SPELLINGS) {
+  for (const spelling of spellings) {
+    // `split` always returns at least one element.
+    const tokens = spelling.split(' ') as [string, ...string[]];
+    const bucket = SPELLINGS_BY_FIRST_TOKEN.get(tokens[0]) ?? [];
+    bucket.push({ canonical, tokens });
+    SPELLINGS_BY_FIRST_TOKEN.set(tokens[0], bucket);
+  }
+}
+for (const bucket of SPELLINGS_BY_FIRST_TOKEN.values()) {
+  bucket.sort((a, b) => b.tokens.length - a.tokens.length);
+}
+
+/**
+ * A folded name's tokens with every legal-form spelling replaced by its form's
+ * canonical token ({@link LEGAL_FORM_SPELLINGS}). The scan runs left to right
+ * and takes the longest spelling that opens at each token, so `limited liability
+ * company` is `llc`, never `ltd liability co`, and `public joint stock company`
+ * is `pjsc`, never `public jsc`. Linear in the token count: a token tries only
+ * the few spellings that open with it, each at most five tokens long.
+ */
+export function foldLegalForms(normalized: string): string[] {
+  const tokens = tokenize(normalized);
+  const folded: string[] = [];
+  let next = 0;
+  for (const [i, token] of tokens.entries()) {
+    if (i < next) continue;
+    const spelling = SPELLINGS_BY_FIRST_TOKEN.get(token)?.find((candidate) =>
+      candidate.tokens.every((part, k) => tokens[i + k] === part),
+    );
+    folded.push(spelling?.canonical ?? token);
+    next = i + (spelling?.tokens.length ?? 1);
+  }
+  return folded;
+}
+
+/**
+ * The FTS5 `MATCH` expression for a legal-form fold ({@link foldLegalForms}):
+ * each distinct token quoted as {@link buildFtsMatch} quotes it, a canonical one
+ * widened to any spelling of its form — a multi-word spelling as a phrase, which
+ * FTS5 matches on adjacent tokens only. Null when the fold holds no legal form,
+ * where the query's own match is the whole strict set.
+ */
+export function buildLegalFormFtsMatch(foldTokens: readonly string[]): string | null {
+  const distinct = [...new Set(foldTokens)];
+  if (!distinct.some((token) => LEGAL_FORM_SPELLINGS.has(token))) return null;
+  return distinct
+    .map((token) => {
+      const spellings = LEGAL_FORM_SPELLINGS.get(token);
+      return spellings ? `(${spellings.map((s) => `"${s}"`).join(' OR ')})` : `"${token}"`;
+    })
+    .join(' AND ');
 }
 
 // ─── Double Metaphone (single primary key) ─────────────────────────────────────
@@ -483,6 +716,8 @@ function stringAt(s: string, start: number, len: number, list: string[]): boolea
 function encodeWord(word: string): string {
   const s = word.toUpperCase().replace(/[^A-Z]/g, '');
   if (s.length === 0) return '';
+  // Tested once: a test per G would rescan the word, quadratic in a long run of `GN`.
+  const slavic = slavoGermanic(s);
 
   let primary = '';
   const length = s.length;
@@ -542,7 +777,7 @@ function encodeWord(word: string): string {
         current += s.charAt(current + 1) === 'F' ? 2 : 1;
         break;
       case 'G':
-        current = encodeG(s, current, add);
+        current = encodeG(s, current, add, slavic);
         break;
       case 'H':
         if ((current === 0 || isVowel(s, current - 1)) && isVowel(s, current + 1)) {
@@ -714,7 +949,8 @@ function encodeC(s: string, current: number, add: (p: string) => void): number {
   return current + 1;
 }
 
-function encodeG(s: string, current: number, add: (p: string) => void): number {
+/** `slavic` is {@link slavoGermanic} of the whole word, tested once by the caller. */
+function encodeG(s: string, current: number, add: (p: string) => void, slavic: boolean): number {
   if (s.charAt(current + 1) === 'H') {
     if (current > 0 && !isVowel(s, current - 1)) {
       add('K');
@@ -743,22 +979,18 @@ function encodeG(s: string, current: number, add: (p: string) => void): number {
     return current + 2;
   }
   if (s.charAt(current + 1) === 'N') {
-    if (current === 1 && isVowel(s, 0) && !slavoGermanic(s)) {
+    if (current === 1 && isVowel(s, 0) && !slavic) {
       add('KN');
       return current + 2;
     }
-    if (
-      !stringAt(s, current + 2, 2, ['EY']) &&
-      s.charAt(current + 1) !== 'Y' &&
-      !slavoGermanic(s)
-    ) {
+    if (!stringAt(s, current + 2, 2, ['EY']) && s.charAt(current + 1) !== 'Y' && !slavic) {
       add('N');
       return current + 2;
     }
     add('KN');
     return current + 2;
   }
-  if (stringAt(s, current + 1, 2, ['LI']) && !slavoGermanic(s)) {
+  if (stringAt(s, current + 1, 2, ['LI']) && !slavic) {
     add('KL');
     return current + 2;
   }
