@@ -19,15 +19,15 @@ Entity screening and resolution over eleven sanctions and export-control lists p
 
 **The data path is a local mirror, not a live API.** All eleven watchlists and GLEIF use keyless bulk downloads. The six BIS/State lists share one CSL download per sync; skip CSL Treasury copies, preserve provider id verbatim, and retain missing type as unknown. They are normalized into two local SQLite + FTS5 mirrors via the framework `MirrorService` — a sanctions `designation` mirror with a per-alias `name` index (Double-Metaphone phonetic keys) and a per-identifier `designation_identifier` index, and a GLEIF `lei_entity` mirror with a per-name `lei_name` index (legal, other, and transliterated names, typed) and a `lei_relationship` ownership table. The real corpus loads out-of-band via `bun run mirror:init`; the read path gates on mirror readiness. **Do not commit or modify the populated `data/` mirrors** — they are environment state, not source.
 
-**Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in, or runs on its own over each selected list a strict screen found nothing on (all of them when strict found nothing anywhere). Surface only real signal: `matchType` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains. Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
+**Match signal is the raw Jaro-Winkler value (0–1) — never a fabricated confidence percentage.** Strict matching (exact-normalized → all-tokens-present via FTS5, a legal form counting in any spelling of the same form) is the default and the ~90% path; fuzzy (Jaro-Winkler + phonetic) is opt-in, or runs on its own over each selected list a strict screen found nothing on (all of them when strict found nothing anywhere; the UK and UN lists either way when the name holds a letter outside the Latin script). Surface only real signal: `matchType` (`exact`/`strong`/`approximate`), the matched name and its type, the raw score for approximate hits, and `queryTokenCoverage` — a literal count of the query tokens a candidate explains, by spelling or by sound (`phonetic` counts those matched by sound alone, which never admit a candidate or raise the score). Coverage ranks candidates the score ties (one shared exact token pins several at 1.0) and is surfaced so a caller can account for that order; it is a second measurement beside the score, never a term blended into it.
 
 ---
 
 ## Core Rules
 
 - Source membership derives from `SOURCE_CODES`; keep default screens, cross-references, source listings, and schemas aligned automatically. OFAC grouping remains limited to its two direct feeds. CSL restrictions, notices, end dates, and provenance URLs remain labeled features, never inferred legal status.
-- Ownership traces page nodes, then edges, then boundaries (50 default, 100 maximum records; soft 64-KiB target with intact oversized records). Drain a segment before same-side boundary re-rooting; deduplicate branch roots and edges. Topology fingerprints invalidate changed graphs; entity and screening values remain current rather than frozen. Completeness covers loaded accounting-consolidation data only.
-- `sanctionsAsOf` is the last successful local all-list sync, not upstream publication freshness. Existing mirrors need `mirror:refresh` to load newly supported sources; configured source rows can have zero stored records before that refresh.
+- Ownership traces page nodes, then edges, then boundaries (`limit` records per page, 50 default, 100 maximum; every page but the last holds exactly `limit`, and a cursor carrying a key the server did not write is invalid). Drain a segment before same-side boundary re-rooting; deduplicate branch roots and edges. Topology fingerprints invalidate changed graphs; entity and screening values remain current rather than frozen. Completeness covers loaded accounting-consolidation data only.
+- `sanctionsAsOf` is the last successful local all-list sync, not upstream publication freshness. Each list's `lastHarvestedAt` is its own last successful harvest and `publishedAt` the publisher's date on that document (not when the list changed); both stay absent until this server records a harvest of the list, which means unknown, not stale. Existing mirrors need `mirror:refresh` to load newly supported sources; configured source rows can have zero stored records before that refresh.
 
 - **Logic throws, framework catches.** Tool/resource handlers are pure — throw on failure, no `try/catch`. Plain `Error` is fine; the framework catches, classifies, and formats. Use error factories (`notFound()`, `validationError()`, etc.) when the error code matters.
 - **Use `ctx.log`** for request-scoped logging. No `console` calls.
@@ -68,7 +68,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
   }),
   enrichment: {
     normalizedQuery: z.string().describe('The name as the server folded it for matching.'),
-    matchModeUsed: z.string().describe('fuzzy when every selected list was fuzzy-searched; strict otherwise, including a strict screen whose strict-empty lists were completed.'),
+    matchModeUsed: z.string().describe('fuzzy when a full fuzzy pass searched every selected list; strict otherwise, including a strict screen whose strict-empty lists were completed.'),
     totalCount: z.number().describe('Number of potential matches returned.'),
     notice: z.string().optional().describe('Guidance when no candidate matched.'),
   },
@@ -295,13 +295,13 @@ src/
   services/
     screening/
       screening-service.ts              # Owns the local mirrors + matching engine (init/accessor pattern)
-      schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_name/lei_relationship schema + MirrorService defs + each spec's v2 migration
+      schema.ts                         # Normalized designation/name/identifier/lei_entity/lei_name/lei_relationship schema + the `source_harvest` and `lei_entity_status_stamp` aux tables + MirrorService defs + each spec's migrations (designation v3, GLEIF v2)
       sanctions-ingest.ts               # OFAC/EU/UK/UN streaming ingesters (record-at-a-time XML → normalized designations)
       csl-ingest.ts                     # Shared trade.gov download and per-list spools for six BIS/State lists
       gleif-ingest.ts                   # GLEIF files — publication index, header-first streaming of L1/L2/reporting-exception files, deletion markers
       gleif-sync.ts                     # GLEIF lifecycles — golden-copy load + checkpointed delta refresh (window per dataset, one commit)
-      ingest-validation.ts              # Shared drop predicate + per-source rejection tally — no source identity or no usable name means no row
-      text-matching.ts                  # Fold/tokenize, Jaro-Winkler, Double-Metaphone, the fuzzy-admission stoplist (FUZZY_STOPLIST)
+      ingest-validation.ts              # Shared drop predicate + per-source rejection tally — no source identity or no usable name means no row; the shared readers (`componentText`, `isoDocumentDate`)
+      text-matching.ts                  # Fold/tokenize, Jaro-Winkler, Double-Metaphone and sound keys, the fuzzy-admission stoplist (FUZZY_STOPLIST), legal-form spellings (LEGAL_FORM_SPELLINGS) for strict matching
       candidate-pool.ts                 # Fuzzy blocking pool — whole blocks, smallest first, under one budget, then pair lookups
       cross-reference.ts                # get_entity / trace_ownership cross-reference — strict name screens + LEI and registration-number lookups, merged per designation
       country-codes.ts                  # Published country names → ISO 3166-1 alpha-2 (the registration-number country gate)
@@ -354,7 +354,7 @@ Development skills are modular instructions. Read them directly when a task matc
 
 A published skill in root `skills/` reaches plugin installs and the `.mcpb` bundle as-is, ships in the npm package and the Docker image, and reaches MCP clients when the server opts in with `createApp({ skills: 'skills' })`. `lint:packaging` validates the tree.
 
-`skills/sanctions-screening-guide/SKILL.md` is the published consumer guide: identity confirmation, ownership continuation, capped cross-reference recovery, and screening uncertainty.
+`skills/sanctions-screening-guide/SKILL.md` is the published consumer guide: identity confirmation, successor entities, ownership continuation, capped cross-reference recovery, list freshness, and screening uncertainty.
 
 **Agent skill directory:** Copy `framework-skills/` into the directory your agent discovers (Claude Code: `.claude/skills/`, others: equivalent). Skills then load as context without referencing `framework-skills/` paths. After framework updates, run the `maintenance` skill — Phase B re-syncs the agent directory.
 
@@ -433,6 +433,8 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
 | `bun run release:github` | Create the GitHub release from the changelog/tag. |
+
+**Held dependency.** `vitest` and `@vitest/coverage-istanbul` are pinned to exactly `5.1.0`. vitest 5.1.1's forks pool calls `child.channel.unref()`, which Bun 1.4.4 does not implement, so under Bun no test file starts (`Failed to start forks worker`). Lift the pin once a vitest release starts its workers under Bun: `bun --bun ./node_modules/vitest/vitest.mjs run` is the check.
 
 **CI is one file.** `.github/workflows/codeql.yml` is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 

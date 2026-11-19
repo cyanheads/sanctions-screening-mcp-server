@@ -4,7 +4,7 @@ description: Investigate ambiguous counterparties with sanctions_* tools, recove
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Gates
@@ -13,13 +13,21 @@ Before attributing an ownership graph to a counterparty, compare the candidate G
 
 Before treating a search as exhausted, distinguish an empty page from an empty result set and a finished result set from a bounded candidate search. Drain available pages; where the search reports a lower bound, narrow with another identifying name word or a known jurisdiction. If an entity is absent under the default registration-status filter, broaden the status search before concluding it was not found. An unavailable alternate-name index is a coverage gap, not evidence that a trading or former name has no LEI.
 
+Before relying on an inactive, merged, or duplicate counterparty's LEI, read its `successors`: the successor entity is the one to vet, and each is listed by LEI, by name, or both, never screened or followed, so resolve and screen it yourself. `entityStatusLoaded: false` on a record means entity status and successors were not read for it, which is not evidence that it has no successor; `mirror:init` loads them.
+
 Before using a designation to identify a person or organization, compare the published identifiers and corroborating details. Preserve partial or approximate birth dates; do not pair separate dates and birthplaces unless the record pairs them. Descriptive features can corroborate a candidate but are not searchable identifiers. Keep source-specific labels and units: similar feature names do not establish equivalent measurements. A CSL record with unknown entity type remains unknown; neither its list membership nor an end date establishes its current legal effect. Verify export-control restrictions against the named agency list and Federal Register material, using the published provenance when available.
+
+A UK or EU record's `unReferenceNumber` names the UN listing it implements. Check it against the `un` record by looking it up with `sanctions_get_designation` on source `un`; it is a lead, not proof of identity, because it can differ from the UN list's in case or padding (the lookup ignores both), name no current UN listing, or be carried by two designations (a lookup by it then fails as `reference_ambiguous`, naming both). The UK measures imposed and designation source are features: they describe the designation and are not searchable.
+
+A `strong` name hit treats the spellings of one legal form as equal (`Ltd` and `Limited`, `LLC` and `OOO`) but never different forms (`LLC` and `Ltd`), so a legal form that differs from the counterparty's is a difference to weigh. A hit whose `queryTokenCoverage` shows words matched by sound (`phonetic`) is a transliteration candidate of a possibly different person: common names share sound keys, so confirm it against identifiers and dates before treating the names as the same party. Native-script names in the UK and UN lists are aliases, so a hit on one can show a native-script `matchedName` for a Latin-script query.
+
+Before judging which list is stale, read each list's `lastHarvestedAt` and `publishedAt` from `sanctions_list_sources`, not `sanctionsAsOf` alone. `publishedAt` is the date the publisher put on the document, not when the list's content last changed (the UN file is regenerated daily), and a list with neither has no harvest recorded by this server, which is unknown, not old. A `lastRefresh` of `error` with `failedSources` names the lists still holding earlier data; one of `in_progress` can also mean a killed refresh.
 
 ## Workflows
 
 ### Finish an ownership investigation
 
-Drain continuation pages for the same ownership segment before following its boundary records. Assemble nodes by LEI and edges by child LEI, parent LEI, and relationship type; an edge may refer to a node returned on another page. For each omitted branch, start a new trace at the boundary LEI on its specified walk side. Track already-processed LEI/side pairs to avoid cycles and overlapping work. Segment depth restarts at the new root; retain the original segment's node placement rather than treating the new depth as distance from the original counterparty.
+Drain continuation pages for the same ownership segment before following its boundary records. Every page but the last holds exactly `limit` records, so lower `limit` when screened nodes make pages too large to read. Assemble nodes by LEI and edges by child LEI, parent LEI, and relationship type; an edge may refer to a node returned on another page. For each omitted branch, start a new trace at the boundary LEI on its specified walk side. Track already-processed LEI/side pairs to avoid cycles and overlapping work. Segment depth restarts at the new root; retain the original segment's node placement rather than treating the new depth as distance from the original counterparty.
 
 If a cursor is rejected after the topology changes, restart that segment and reconcile its assembled records. Continuation does not freeze names, registration status, or screening results. A finished segment is not a complete group: follow remaining boundaries, and retain unresolved Level 1 records and parent-reporting exceptions as explicit gaps. Repeated paging cannot reveal an unreported parent or turn accounting-consolidation relationships into beneficial ownership.
 
