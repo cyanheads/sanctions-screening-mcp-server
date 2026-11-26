@@ -1,6 +1,6 @@
 # sanctions-screening-mcp-server - Directory Structure
 
-Generated on: 2026-11-19 17:03:00
+Generated on: 2026-11-26 05:09:40
 
 ```text
 sanctions-screening-mcp-server/
@@ -176,7 +176,8 @@ sanctions-screening-mcp-server/
 │   │   │       ├── screen-identifier.tool.ts
 │   │   │       ├── screen-name.tool.ts
 │   │   │       └── trace-ownership.tool.ts
-│   │   └── normalize-inputs.ts
+│   │   ├── normalize-inputs.ts
+│   │   └── server-instructions.ts
 │   ├── services/
 │   │   └── screening/
 │   │       ├── candidate-pool.ts
@@ -248,8 +249,10 @@ sanctions-screening-mcp-server/
 │   │   ├── text-matching.test.ts
 │   │   └── xml-stream.test.ts
 │   ├── smoke/
+│   │   ├── server-instructions.smoke.test.ts
 │   │   └── surface.smoke.test.ts
 │   └── tools/
+│       ├── _markdown-readback.ts
 │       ├── entity-cross-reference.test.ts
 │       ├── format-parity.test.ts
 │       ├── lei-checksum.test.ts
