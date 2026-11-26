@@ -17,6 +17,7 @@ import type { NormalizedDesignation } from '@/services/screening/types.js';
 import { parseXml } from '@/services/screening/xml.js';
 import {
   emptyGlobalService,
+  holdRebuild,
   type SeededService,
   seededGlobalService,
 } from '../services/_helpers.js';
@@ -394,28 +395,27 @@ describe('sanctions_screen_identifier over a synced mirror', () => {
         '',
       ),
     });
-    await harness.service.designations.runSync({
+    // The mirror's own sync ends with the index rebuild; hold it there.
+    const { held, release } = holdRebuild(harness.service);
+    const run = harness.service.designations.runSync({
       mode: 'refresh',
       signal: new AbortController().signal,
     });
+    await held;
     // Before the rebuild the stale identifier row is still there; the join hides it.
     const handle = await harness.service.designations.raw();
-    const stale = handle
-      .prepare<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM ${IDENTIFIER_TABLE} WHERE designation_id = 'ofac_sdn:4243'`,
-      )
-      .get()?.n;
-    expect(stale).toBe(1);
-    expect((await screen({ value: 'IMO 7406784' })).hits).toEqual([]);
-
-    await harness.service.rebuildSearchIndexes();
-    expect(
+    const stale = () =>
       handle
         .prepare<{ n: number }>(
           `SELECT COUNT(*) AS n FROM ${IDENTIFIER_TABLE} WHERE designation_id = 'ofac_sdn:4243'`,
         )
-        .get()?.n,
-    ).toBe(0);
+        .get()?.n;
+    expect(stale()).toBe(1);
+    expect((await screen({ value: 'IMO 7406784' })).hits).toEqual([]);
+
+    release();
+    await run;
+    expect(stale()).toBe(0);
     expect((await screen({ value: 'L191609', type: 'passport' })).ids).toEqual([
       'ofac_sdn:7203',
       'eu:927',

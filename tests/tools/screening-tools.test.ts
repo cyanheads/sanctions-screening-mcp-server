@@ -23,6 +23,7 @@ import {
   type SeededService,
   seededGlobalService,
 } from '../services/_helpers.js';
+import { readBlocks, readText } from './_markdown-readback.js';
 
 /**
  * A mock context whose typed `ctx.fail` is wired against a tool's error
@@ -1596,6 +1597,159 @@ describe('screening tools (not ready)', () => {
     await expect(
       resolveEntityTool.handler(input, ctxFor(resolveEntityTool.errors)),
     ).rejects.toMatchObject({ data: { reason: 'mirror_not_ready' } });
+  });
+});
+
+describe('GLEIF text with Markdown syntax on both surfaces (issue #96)', () => {
+  /** A synthetic 20-character LEI: the tag, zero-padded to 18 characters, then two digits. */
+  const lei = (tag: string): string => `${tag.padEnd(18, '0')}00`;
+  const ROOT = lei('QVARNROOT');
+  const PARENT = lei('QVARNPARENT');
+  const GROUP = lei('QVARNGROUP');
+  const ROOT_NAME = 'Qvarn *Star* Holdings Ltd';
+  const LISTED_NAME = 'QVARN _STAR_ HOLDINGS LTD';
+  const LEGAL_ADDRESS = '7. Brigade Way\n- Unit 2';
+  const HQ_ADDRESS = '> Harbour <b>Road</b>';
+  const PARENT_NAME = 'Qvarn ~~Parent~~ PLC';
+  const GROUP_NAME = 'Qvarn [Group](https://example.invalid) SE #';
+
+  let seeded: SeededService;
+  beforeEach(async () => {
+    seeded = await seededGlobalService();
+    await seeded.service.ingestLeiEntities([
+      {
+        lei: ROOT,
+        legalName: ROOT_NAME,
+        otherNames: ['Qvarn `Star` Trading'],
+        alternateNames: [{ name: 'Qvarn `Star` Trading', type: 'TRADING_OR_OPERATING_NAME' }],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+        entityStatus: 'ACTIVE',
+        legalAddress: LEGAL_ADDRESS,
+        headquartersAddress: HQ_ADDRESS,
+      },
+      { lei: PARENT, legalName: PARENT_NAME, otherNames: [], jurisdiction: 'GB', status: 'ISSUED' },
+      { lei: GROUP, legalName: GROUP_NAME, otherNames: [], jurisdiction: 'DE', status: 'ISSUED' },
+    ]);
+    await seeded.service.ingestLeiRelationships([
+      {
+        childLei: ROOT,
+        parentLei: PARENT,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+        relationshipStatus: 'ACTIVE',
+      },
+      {
+        childLei: PARENT,
+        parentLei: GROUP,
+        relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+        relationshipStatus: 'ACTIVE',
+      },
+    ]);
+    await seeded.service.ingestDesignations([
+      {
+        id: 'uk:QV-1',
+        source: 'uk',
+        sourceEntryId: 'QV-1',
+        entityType: 'organization',
+        primaryName: LISTED_NAME,
+        payload: {
+          aliases: [],
+          identifiers: [],
+          addresses: [],
+          datesOfBirth: [],
+          nationalities: [],
+        },
+      },
+    ]);
+  });
+  afterEach(async () => {
+    await seeded.cleanup();
+  });
+
+  const contentOf = (result: Awaited<ReturnType<typeof runToolContract>>): string =>
+    result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
+
+  /** Inline marks the templates author: bold labels and LEI / source-code spans, nothing a value introduced. */
+  const marksOf = (markdown: string) => new Set(readBlocks(markdown).flatMap((b) => b.marks));
+
+  it('get_entity carries the record as published and reads it back from content[]', async () => {
+    const result = await runToolContract(getEntityTool, { lei: ROOT });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      legalName: ROOT_NAME,
+      otherNames: ['Qvarn `Star` Trading'],
+      legalAddress: LEGAL_ADDRESS,
+      headquartersAddress: HQ_ADDRESS,
+      sanctionsHits: [
+        { sourceEntryId: 'QV-1', primaryName: LISTED_NAME, matchedName: LISTED_NAME },
+      ],
+    });
+
+    const text = contentOf(result);
+    const lines = readText(text).split('\n');
+    expect(lines[0]).toBe(ROOT_NAME);
+    expect(lines).toContain('Other names: Qvarn `Star` Trading');
+    expect(readText(text)).toContain(`Legal address: ${LEGAL_ADDRESS}\nHQ address: ${HQ_ADDRESS}`);
+    expect(lines.find((line) => line.startsWith(`${LISTED_NAME} — `))).toContain(
+      `(uk, entry QV-1), exact, matched "${LISTED_NAME}" — matched on: legal_name "${ROOT_NAME}"`,
+    );
+    expect(lines).toContain(
+      `Screened: legal_name "${ROOT_NAME}"; lei ${ROOT}; other_name "Qvarn \`Star\` Trading" (TRADING_OR_OPERATING_NAME)`,
+    );
+    expect(marksOf(text)).toEqual(new Set(['strong', 'code_inline']));
+    expect(
+      readBlocks(text)
+        .filter((b) => b.kind === 'heading')
+        .map((b) => b.tag),
+    ).toEqual(['h1', 'h2']);
+  });
+
+  it('resolve_entity carries the candidate as published and reads it back from content[]', async () => {
+    const result = await runToolContract(resolveEntityTool, { name: 'Qvarn Star Holdings' });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      matches: [{ lei: ROOT, legalName: ROOT_NAME, matchedName: ROOT_NAME }],
+    });
+
+    const text = contentOf(result);
+    const lines = readText(text).split('\n');
+    expect(lines).toContain(`Matched on: "${ROOT_NAME}" (LEGAL_NAME)`);
+    expect(lines.some((line) => line.startsWith(`${ROOT_NAME} — `))).toBe(true);
+    expect(marksOf(text)).toEqual(new Set(['strong', 'code_inline']));
+  });
+
+  it('trace_ownership carries every node to depth 2 as published and reads each back from content[]', async () => {
+    const result = await runToolContract(traceOwnershipTool, {
+      lei: ROOT,
+      direction: 'parents',
+      depth: 2,
+      screenNodes: true,
+    });
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      nodes: { depth: number; legalName: string; lei: string }[];
+    };
+    expect(structured.nodes.map(({ lei: id, legalName, depth }) => [id, legalName, depth])).toEqual(
+      [
+        [ROOT, ROOT_NAME, 0],
+        [PARENT, PARENT_NAME, 1],
+        [GROUP, GROUP_NAME, 2],
+      ],
+    );
+
+    const text = contentOf(result);
+    const lines = readText(text).split('\n');
+    expect(lines).toContain(`${ROOT_NAME} ${ROOT} — root, depth 0 (GB, ISSUED)`);
+    expect(
+      lines.some((line) => line.startsWith(`${PARENT_NAME} ${PARENT} — parent, depth 1`)),
+    ).toBe(true);
+    expect(lines.some((line) => line.startsWith(`${GROUP_NAME} ${GROUP} — parent, depth 2`))).toBe(
+      true,
+    );
+    expect(lines.find((line) => line.startsWith(`⚠ ${LISTED_NAME} — `))).toContain(
+      `(uk, entry QV-1): matched "${LISTED_NAME}" — exact — matched on: legal_name "${ROOT_NAME}"`,
+    );
+    expect(marksOf(text)).toEqual(new Set(['strong', 'code_inline']));
   });
 });
 

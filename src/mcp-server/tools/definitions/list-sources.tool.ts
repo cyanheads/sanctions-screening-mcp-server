@@ -11,6 +11,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES } from '@/services/screening/types.js';
 import { buildSourcesPayload } from './_shared.js';
@@ -23,7 +24,7 @@ const LastRefreshSchema = z
         status: z
           .literal('in_progress')
           .describe(
-            'A sanctions refresh is running — or was killed before it finished, which reads the same way.',
+            'A sanctions refresh is running, until its index rebuild commits — or was killed before it finished, which reads the same way.',
           ),
         startedAt: z
           .string()
@@ -42,7 +43,7 @@ const LastRefreshSchema = z
           .array(z.enum(SOURCE_CODES))
           .optional()
           .describe(
-            "The lists whose harvest failed in that refresh, in list order; each keeps its previous lastHarvestedAt and publishedAt. Empty when the run recorded its lists' outcomes and none failed: it stopped for another reason (cancelled or out of time). Absent when no list's outcome is recorded for that run — one an earlier server version made, or one that stopped before any list finished — so which lists failed is unknown.",
+            "The lists whose harvest failed in that refresh, in list order; each keeps its previous lastHarvestedAt and publishedAt. Empty when the run recorded its lists' outcomes and none failed: it stopped for another reason (cancelled or out of time). Absent when no list's outcome is recorded for that run — one an earlier server version made, one that stopped before any list finished, or one whose index rebuild failed — so which lists failed is unknown.",
           ),
       })
       .describe('A sanctions refresh that failed.'),
@@ -245,7 +246,7 @@ export const listSourcesTool = tool('sanctions_list_sources', {
       if (s.reportingExceptionCount !== undefined) {
         lines.push(`**Reporting exceptions:** ${s.reportingExceptionCount}`);
       }
-      lines.push(`**Source:** ${s.url}`);
+      lines.push(`**Source:** ${markdownLink(s.url, s.url)}`);
       lines.push('');
     }
     return [{ type: 'text', text: lines.join('\n') }];

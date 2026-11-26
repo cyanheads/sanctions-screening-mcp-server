@@ -16,7 +16,6 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import type {
   Mirror,
   SqliteHandle,
@@ -41,6 +40,7 @@ import {
   createSanctionsSync,
   type DeferredColumns,
   type DeferredDesignationFields,
+  type HarvestOutcome,
   type SanctionsIngester,
 } from '@/services/screening/sanctions-ingest.js';
 import {
@@ -78,10 +78,14 @@ import {
   deletionSignatures,
   doubleMetaphone,
   fold,
-  foldLegalForms,
   hasOtherScriptLetter,
+  holdsEveryWord,
   jaroWinkler,
+  legalFormReadings,
   lengthRatio,
+  nativeWords,
+  oneToOneCoverage,
+  queryWords,
   scoreTokenPairs,
   scoringQuery,
   soundKeys,
@@ -152,8 +156,8 @@ export interface SourceFreshness {
  * on every state a run wrote. On `error`, `failedSources` names the lists whose
  * harvest failed in the run that started at `startedAt`, in registry order —
  * empty when the run ended for another reason (a caller abort or time bound),
- * and absent when no list's outcome was recorded for that run (one an earlier
- * release made).
+ * and absent when no list's outcome was recorded for that run (its index rebuild
+ * failed, or an earlier release made it).
  */
 export type SanctionsLastRefresh =
   | { status: 'pending' }
@@ -166,11 +170,6 @@ export interface SanctionsFreshness {
   /** One row per {@link SOURCE_CODES} entry, in that order. */
   sources: SourceFreshness[];
 }
-
-/** One list's result in the run under way, held until that run's index rebuild records it. */
-export type HarvestOutcome =
-  | { harvestedAt: string; publishedAt?: string; source: SourceCode; status: 'harvested' }
-  | { source: SourceCode; status: 'failed' };
 
 /**
  * How to read a `totalAvailable`. `exact` is the complete matching set the query
@@ -189,8 +188,10 @@ export type CountBasis = 'exact' | 'lower_bound';
  * regime). Before those names were indexed every such screen completed both
  * lists, so settling them would drop records it returned: the same person under
  * another regime, or the party itself where the strict hit is a namesake. The
- * other lists stay settled; completing them too was measured and added mostly
- * unrelated names (see the Matching decision in `docs/design.md`).
+ * other lists stay settled for the fuzzy pass, whose completion of them was
+ * measured and added mostly unrelated names (see the Matching decision in
+ * `docs/design.md`); a query with a romanization reads them instead for a whole
+ * word of it per native word (see `ScreeningService.runRomanizedRead`).
  */
 const NATIVE_NAME_COMPLETED: ReadonlySet<SourceCode> = new Set<SourceCode>(['uk', 'un']);
 
@@ -200,7 +201,9 @@ export interface ScreenNameOptions {
    * Whether strict mode runs a fuzzy pass over the selected lists it found
    * nothing on (and, for a query holding a letter outside the Latin script, the
    * UK and UN lists either way): a full pass when it found nothing anywhere, otherwise a
-   * full-coverage completion of those lists (see {@link ScreenNameResult.fuzzySources}).
+   * full-coverage completion of those lists — and, for a query with a romanization,
+   * the romanized read of the other lists it found something on (see
+   * {@link ScreenNameResult.fuzzySources}).
    * Defaults to `true` for the user-facing `sanctions_screen_name` tool (an empty
    * strict result there is unhelpful). The internal cross-reference screens in
    * `sanctions_get_entity` / `sanctions_trace_ownership` set this `false`: a
@@ -228,11 +231,14 @@ export interface ScreenNameResult {
   /** True when a strict pass returned nothing on every selected list and fuzzy was attempted. */
   fuzzyFallbackTriggered: boolean;
   /**
-   * The selected lists the fuzzy pass searched, in {@link SOURCE_CODES} order;
-   * absent when none ran. Every selected list in fuzzy mode or after a strict
-   * pass that found nothing; otherwise the lists strict found nothing on, plus
-   * the UK and UN lists for a query holding a letter outside the Latin script,
-   * whose candidates are kept only when they cover every distinctive query word.
+   * The selected lists the fuzzy pass or the romanized read searched, in
+   * {@link SOURCE_CODES} order; absent when neither ran. Every selected list in
+   * fuzzy mode or after a strict pass that found nothing; otherwise the lists
+   * strict found nothing on, plus the UK and UN lists for a query holding a
+   * letter outside the Latin script, whose candidates are kept only when they
+   * give every distinctive query word a word of their own — and, for a query with a romanization,
+   * every other list strict found something on, whose names are kept only when
+   * one of their forms holds a whole romanized word for each native word.
    */
   fuzzySources?: SourceCode[];
   hits: ScreeningHit[];
@@ -250,7 +256,10 @@ export interface ScreenNameResult {
   poolBounded: boolean;
   /** Matching designations before `limit`/`offset` — read with `totalAvailableBasis`. */
   totalAvailable: number;
-  /** `exact` for a strict-only pass, `lower_bound` whenever a fuzzy pass ran. */
+  /**
+   * `exact` when no fuzzy pass ran (strict alone, or with the unbounded romanized
+   * read), `lower_bound` whenever one did.
+   */
   totalAvailableBasis: CountBasis;
 }
 
@@ -357,6 +366,11 @@ interface NameJoinRow {
   source_entry_id: string;
   un_reference_number: string | null;
 }
+
+/** The columns a {@link NameJoinRow} read selects, from the `n` (name) and `d` (designation) aliases. */
+const NAME_JOIN_COLUMNS = `n.designation_id, n.name, n.normalized, n.name_type,
+       d.source, d.source_entry_id, d.entity_type, d.primary_name,
+       d.program, d.designation_date, d.reference_number, d.un_reference_number`;
 
 /** Internal row shape from the `designation_identifier` join used by the identifier lookup. */
 interface IdentifierJoinRow {
@@ -495,13 +509,6 @@ export class ScreeningService {
    * of those commits a new `completedAt` and checkpoint, so the key moves with them.
    */
   private exceptionCountByState: { count: number; state: string } | undefined;
-  /**
-   * Each list's result in the sanctions run under way, in harvest order. The sync
-   * reports a list as it finishes, but its outcome may be recorded only with the
-   * index rebuild that follows the run ({@link syncSanctions}), so a list is
-   * never marked harvested ahead of what screening serves.
-   */
-  private readonly harvestOutcomes: HarvestOutcome[] = [];
 
   constructor(private readonly config: ServerConfig) {
     // The two mirrors use SEPARATE database files. `mirror_sync_state` is a
@@ -521,8 +528,9 @@ export class ScreeningService {
           this.applyDeferredFields(source, fields, kept),
         storedDeferredFields: (ids) => this.storedDeferredFields(ids),
         staleDesignationIds: (source, kept) => this.staleDesignationIds(source, kept),
+        // The run's last write before its final state: indexes and per-list outcomes, in one transaction.
+        onHarvestEnd: (outcomes) => this.rebuildSearchIndexes(outcomes),
         onSourceFailed: (failure) => {
-          this.harvestOutcomes.push({ source: failure.source, status: 'failed' });
           logger.error(
             'Sanctions harvest — source failed; nothing was removed for it, and the run continues with the next source.',
             requestContextService.createRequestContext({
@@ -532,12 +540,6 @@ export class ScreeningService {
           );
         },
         onSourceReport: (report) => {
-          this.harvestOutcomes.push({
-            source: report.source,
-            status: 'harvested',
-            harvestedAt: new Date().toISOString(),
-            ...(report.publishedAt ? { publishedAt: report.publishedAt } : {}),
-          });
           const context = requestContextService.createRequestContext({
             operation: 'mirror.sync.source',
             additionalContext: {
@@ -584,9 +586,12 @@ export class ScreeningService {
    * the name index but never touches the identifier index, so a mirror it wrote —
    * or synced after a rollback — would otherwise answer identifier lookups from
    * missing or stale rows, and for a screening aid an empty answer reads as a
-   * clearance. The index carries its classification version and the sync-state
-   * stamp of the run it followed. During a sync, an index on the current
-   * classification version can serve until the post-sync rebuild.
+   * clearance. The index carries its classification version and the run it was
+   * built for ({@link syncStamp}). During a sync, an index on the current
+   * classification version serves until the rebuild the run ends with, which
+   * stamps both indexes before the run's final state commits: a first open after
+   * a finished run finds them built for it, and one whose stamp names another run
+   * follows a failed rebuild, a rollback, or an earlier release.
    *
    * The name index follows the same rule, under its own stamp, which only this
    * release and later ones write. An earlier release reads `name_fts` alone and
@@ -606,7 +611,7 @@ export class ScreeningService {
         const built = nameIndexStamp(raw);
         if (
           built?.startsWith(NAME_STAMP_VERSION) &&
-          (built === `${NAME_STAMP_VERSION}${stamp}` || state.status === 'in_progress')
+          (builtFor(built, NAME_STAMP_VERSION, state) || state.status === 'in_progress')
         ) {
           return false;
         }
@@ -623,7 +628,7 @@ export class ScreeningService {
       const stale =
         !builtIdentifiers?.startsWith(IDENTIFIER_STAMP_VERSION) ||
         (state.status !== 'in_progress' &&
-          builtIdentifiers !== `${IDENTIFIER_STAMP_VERSION}${stamp}`);
+          !builtFor(builtIdentifiers, IDENTIFIER_STAMP_VERSION, state));
       if (stale || identifierIndexUnbuilt(raw)) {
         raw.transaction(() => rebuildIdentifierIndex(raw, stamp));
         logger.info(
@@ -670,37 +675,23 @@ export class ScreeningService {
   }
 
   /**
-   * Run the sanctions sync, then rebuild the name and identifier indexes from what
-   * the run left in `designation` — whether the sync resolved or rejected. A run
-   * that fails part way (a source that could not be read, a caller abort) has
-   * still committed the pages before the failure and, past a failed source, every
-   * source after it; the indexes must follow those rows, not the ones they
-   * replaced. The one entry point for `mirror:init`, `mirror:refresh`, and the
-   * HTTP refresh cron.
+   * Run the sanctions sync. The run ends by rebuilding the name and identifier
+   * indexes from what it left in `designation` and recording how each list's
+   * harvest ended ({@link rebuildSearchIndexes}), under its lease and before its
+   * final state commits — whether every list harvested, some failed, or the
+   * caller stopped it. A run that fails part way (a source that could not be
+   * read, a caller abort) has still committed the pages before the failure and,
+   * past a failed source, every source after it; the indexes must follow those
+   * rows, not the ones they replaced. A list the run never finished — the one a
+   * caller abort interrupted, and every one after it — keeps what it had. A run
+   * whose lease was taken over records nothing. The one entry point for
+   * `mirror:init`, `mirror:refresh`, and the HTTP refresh cron.
    *
-   * The rebuild also records how each list's harvest ended in this run (see
-   * {@link rebuildSearchIndexes}); a list the run never finished — the one a
-   * caller abort interrupted, and every one after it — keeps what it had.
-   *
-   * @throws The sync's failure, after the rebuild: one error naming every source
-   *   that failed, or the caller's abort.
+   * @throws The sync's failure (one error naming every source that failed, or the
+   *   caller's abort), or the rebuild's own failure, which replaces it.
    */
-  async syncSanctions(mode: SyncMode, signal: AbortSignal): Promise<SyncResult> {
-    let rebuild = true;
-    try {
-      return await this.designationMirror.runSync({ mode, signal });
-    } catch (error) {
-      if (error instanceof McpError) {
-        const reason = error.data?.reason;
-        // The lease holder owns the writes and the ensuing index rebuild.
-        if (reason === 'sync_locked' || reason === 'sync_lease_lost') rebuild = false;
-        // A run that lost its lease records nothing; a locked-out call leaves the running one's outcomes alone.
-        if (reason === 'sync_lease_lost') this.harvestOutcomes.length = 0;
-      }
-      throw error;
-    } finally {
-      if (rebuild) await this.rebuildSearchIndexes(this.harvestOutcomes.splice(0));
-    }
+  syncSanctions(mode: SyncMode, signal: AbortSignal): Promise<SyncResult> {
+    return this.designationMirror.runSync({ mode, signal });
   }
 
   /** True once the sanctions mirror has ever completed a full sync. */
@@ -865,11 +856,11 @@ export class ScreeningService {
   /**
    * Rebuild the per-alias `name` index and the identifier index from the current
    * `designation` table. The MirrorService `sync` path only writes the primary
-   * `designation` rows, so {@link syncSanctions} calls this after every run to
-   * regenerate both — including the Double-Metaphone phonetic keys and the
-   * per-category identifier keys that can't be computed in SQL. Idempotent: clears
-   * and repopulates both tables, which is also what drops the names and
-   * identifiers of a designation the sync removed.
+   * `designation` rows, so every sanctions run ends with this, at the tail of its
+   * sync generator, to regenerate both — including the Double-Metaphone phonetic
+   * keys and the per-category identifier keys that can't be computed in SQL.
+   * Idempotent: clears and repopulates both tables, which is also what drops the
+   * names and identifiers of a designation the sync removed.
    *
    * The designation table is walked in keyset slices ordered by `id` rather than
    * materialized: `SELECT … .all()` over the whole corpus, plus a `JSON.parse`
@@ -878,10 +869,12 @@ export class ScreeningService {
    * half-rebuilt index would silently narrow every screen — and nothing writes
    * `designation` during it, so the keyset cursor sees a stable table.
    *
-   * `outcomes` — each list's result in the run just ended — land in
-   * `source_harvest` in the same transaction, under the run's `startedAt`: a
-   * crash before it commits leaves no list marked harvested whose rows the index
-   * does not serve yet.
+   * `outcomes` — each list's result in the run ending — land in `source_harvest`
+   * in the same transaction, under the run's `startedAt`: a crash before it
+   * commits leaves no list marked harvested whose rows the index does not serve
+   * yet. Within a run this commits while the run still reads `in_progress`, so
+   * `sanctionsReady`, `sanctionsAsOf`, and the run's `complete` or `error` move
+   * only once the indexes serve it.
    */
   async rebuildSearchIndexes(outcomes: readonly HarvestOutcome[] = []): Promise<void> {
     const handle = await this.designationHandle();
@@ -1260,8 +1253,10 @@ export class ScreeningService {
    * or in strict mode when strict found nothing on any of them, and otherwise
    * over just the lists strict found nothing on — and the UK and UN lists either
    * way for a query holding a letter outside the Latin script — keeping only the candidates
-   * that cover every distinctive query word, by spelling or by sound (see
-   * {@link ScreenNameResult.fuzzySources}).
+   * that give every distinctive query word a word of their own, by spelling or by
+   * sound (see {@link ScreenNameResult.fuzzySources}). Beside them, a strict screen of a
+   * query with a romanization reads every other list strict found something on for
+   * the names holding a whole romanized word for each native word ({@link runRomanizedRead}).
    */
   async screenName(opts: ScreenNameOptions, ctx: Context): Promise<ScreenNameResult> {
     const normalizedQuery = fold(opts.query);
@@ -1307,11 +1302,24 @@ export class ScreeningService {
           : opts.autoFallback === false
             ? []
             : selected.filter((code) => !settled.has(code));
-    // A completion beside strict hits keeps only the candidates that cover every
-    // distinctive query word, by spelling or by sound — the fuzzy analogue of
-    // strict's all-tokens rule: the same name, spelled differently, on a list
-    // strict missed.
+    // A completion beside strict hits keeps only the candidates that give every
+    // distinctive query word a word of their own, by spelling or by sound — the
+    // fuzzy analogue of strict's all-tokens rule: the same name, spelled
+    // differently, on a list strict missed.
     const completion = opts.matchMode === 'strict' && strictHits.length > 0;
+
+    // The lists a strict hit settled still hold the records published only in
+    // transliteration, which strict, reading the name in its own script, never
+    // reaches. For a query with a romanization (a Russian-alphabet name), each such
+    // list is also read for the names holding a whole word of it for each native
+    // word it spells (see runRomanizedRead). A query with none, or whose
+    // romanization folds to nothing, reads nothing.
+    const [, romanized] = comparisonForms(opts.query);
+    const romanizedTokens = tokenize(romanized ?? '');
+    const romanizedSources =
+      completion && otherScript && opts.autoFallback !== false && romanizedTokens.length > 0
+        ? selected.filter((code) => settled.has(code))
+        : [];
 
     // Step 3/3b: fuzzy (Jaro-Winkler) + phonetic over the candidate pool.
     const minScore = opts.minScore ?? this.config.fuzzyMinScore;
@@ -1326,18 +1334,38 @@ export class ScreeningService {
             fullCoverage: completion,
           })
         : undefined;
+    const romanizedHits =
+      romanizedSources.length > 0
+        ? this.runRomanizedRead(handle, {
+            rawQuery: opts.query,
+            queryTokens,
+            romanizedTokens,
+            sources: romanizedSources,
+            typeFilter,
+            minScore,
+            strictIds: new Set(strictHits.map((hit) => hit.designationId)),
+          })
+        : undefined;
+    // The two passes search disjoint lists; their approximate hits rank as one set.
+    const approximate = [...(fuzzy?.hits ?? []), ...(romanizedHits ?? [])].sort(
+      (a, b) => compareFuzzyRank(a, b) || compareDesignationIdentity(a, b),
+    );
+    const searched = selected.filter(
+      (code) => fuzzySources.includes(code) || romanizedSources.includes(code),
+    );
 
-    // Strict hits (deterministic, unscored) ahead of fuzzy, one per designation,
-    // and one per OFAC entry. This is the whole ordered match set: it is counted
-    // and paged as one, so every hit it holds is reachable by offset. Counting and
-    // paging never read `sources`, so only the returned page's are completed.
-    const ranked = groupOfacCopies(fuzzy ? this.mergeHits(strictHits, fuzzy.hits) : strictHits);
+    // Strict hits (deterministic, unscored) ahead of approximate ones, one per
+    // designation, and one per OFAC entry. This is the whole ordered match set: it is
+    // counted and paged as one, so every hit it holds is reachable by offset. Counting
+    // and paging never read `sources`, so only the returned page's are completed.
+    const ranked = groupOfacCopies(this.mergeHits(strictHits, approximate));
     ctx.log.debug(fuzzy ? 'Fuzzy screening complete' : 'Strict screening complete', {
       normalizedQuery,
       strictCount: strictHits.length,
       ...(fuzzy
         ? { fuzzyCount: fuzzy.hits.length, fuzzySources, poolBounded: fuzzy.poolBounded, minScore }
         : {}),
+      ...(romanizedHits ? { romanizedCount: romanizedHits.length, romanizedSources } : {}),
     });
     const page = completeOfacSources(handle, ranked.slice(offset, offset + opts.limit), selected);
     return {
@@ -1345,12 +1373,12 @@ export class ScreeningService {
       modeUsed: fuzzy && !completion ? 'fuzzy' : 'strict',
       normalizedQuery,
       fuzzyFallbackTriggered: fuzzy !== undefined && opts.matchMode === 'strict' && !completion,
-      ...(fuzzy ? { fuzzySources } : {}),
+      ...(searched.length > 0 ? { fuzzySources: searched } : {}),
       poolBounded: fuzzy?.poolBounded ?? false,
       totalAvailable: ranked.length,
-      // A strict pass reads every name its tokens reach, so its count is the whole
-      // set. A fuzzy pass scores only the candidates blocking pooled, so no count
-      // it adds to can be a corpus-wide total.
+      // A strict pass, like the romanized read, reads every name its words reach, so
+      // its count is the whole set. A fuzzy pass scores only the candidates blocking
+      // pooled, so no count it adds to can be a corpus-wide total.
       totalAvailableBasis: fuzzy ? 'lower_bound' : 'exact',
     };
   }
@@ -1370,11 +1398,11 @@ export class ScreeningService {
 
   /**
    * Strict pass: every name holding every query token, exact (normalized
-   * equality) or strong, and every name holding every token of the query's
-   * legal-form fold ({@link foldLegalForms}), strong — a legal form present in
-   * any spelling of the same form. Unbounded — the most common token on the
-   * lists reaches 6,940 of 102,467 alias rows — so the set it returns is the
-   * whole strict set.
+   * equality) or strong, and every name one of whose legal-form readings
+   * ({@link legalFormReadings}) holds every token of one of the query's, strong —
+   * a legal form present in any spelling of the same form. Unbounded — the most
+   * common token on the lists reaches 6,940 of 102,467 alias rows — so the set it
+   * returns is the whole strict set.
    */
   private runStrict(
     handle: SqliteHandle,
@@ -1391,9 +1419,7 @@ export class ScreeningService {
 
     // FTS over the name index; join back to name + designation.
     const namesMatching = handle.prepare<NameJoinRow>(
-      `SELECT n.designation_id, n.name, n.normalized, n.name_type,
-              d.source, d.source_entry_id, d.entity_type, d.primary_name,
-              d.program, d.designation_date, d.reference_number, d.un_reference_number
+      `SELECT ${NAME_JOIN_COLUMNS}
        FROM ${NAME_FTS_TABLE} f
        JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
        JOIN designation d ON d.id = n.designation_id
@@ -1413,21 +1439,31 @@ export class ScreeningService {
       }
     }
 
-    // Then the names a legal-form spelling alone keeps out. The widened
-    // expression reaches every spelling of each form in the query, a multi-word
-    // one only as adjacent words; a name it reaches is kept only when its own
-    // fold holds every token of the query's, so a word inside a longer form
-    // (`company` in `joint stock company`) never stands in for the form.
+    // Then the names a legal-form spelling alone keeps out. The query and each
+    // name are read the same way: a public-company spelling of PLC reads as
+    // `plc` in one reading and word by word in the other. The widened
+    // expression reaches every spelling of each form in either query reading, a
+    // multi-word one only as adjacent words; a name it reaches is kept only when
+    // one of its readings holds every token of one query reading, so a word
+    // inside a longer form (`company` in `joint stock company`) never stands in
+    // for the form, and no reading borrows a token from the other. So
+    // `Public Company Limited` meets a `PLC` query and a `Ltd` one, never
+    // `PLC Ltd`, and the query `X Public Company Limited` meets `X PLC` and
+    // `X Public Co Ltd` alike.
     // Designations the query's own tokens already reached keep that hit as is.
-    const queryForms = foldLegalForms(args.normalizedQuery);
-    const widened = buildLegalFormFtsMatch(queryForms);
+    const queryReadings = legalFormReadings(args.normalizedQuery);
+    const widened = queryReadings
+      .flatMap((reading) => buildLegalFormFtsMatch(reading) ?? [])
+      .map((expression) => `(${expression})`)
+      .join(' OR ');
     if (widened) {
       for (const row of namesMatching.all(widened)) {
         if (byDesignation.has(row.designation_id)) continue;
-        const nameForms = new Set(foldLegalForms(row.normalized));
-        if (queryForms.every((token) => nameForms.has(token))) {
-          byDesignation.set(row.designation_id, this.rowToHit(row, 'strong'));
-        }
+        const holdsQueryForms = legalFormReadings(row.normalized).some((reading) => {
+          const nameForms = new Set(reading);
+          return queryReadings.some((query) => query.every((token) => nameForms.has(token)));
+        });
+        if (holdsQueryForms) byDesignation.set(row.designation_id, this.rowToHit(row, 'strong'));
       }
     }
     // Exact hits first, then strong; designation identity breaks same-band ties.
@@ -1453,8 +1489,9 @@ export class ScreeningService {
    * share the budget and push a block that fits on its own list out of the
    * pool. A stoplisted word (`FUZZY_STOPLIST`) keys no block of its own; its
    * prefix only pairs with a block that did not fit. With `fullCoverage`, a
-   * candidate must also cover every distinctive query word, by spelling or by
-   * sound, and every word by spelling when all are stoplisted.
+   * candidate must also give every distinct distinctive query word a name word
+   * of its own, by spelling or by sound ({@link oneToOneCoverage}), and every
+   * word by spelling when all are stoplisted.
    */
   private runFuzzy(
     handle: SqliteHandle,
@@ -1550,10 +1587,7 @@ export class ScreeningService {
     // whatever order the lists were ingested in.
     const rows = handle
       .prepare<NameJoinRow & { rowid: number }>(
-        `SELECT n.rowid AS rowid, n.designation_id, n.name, n.normalized,
-                n.name_type, d.source, d.source_entry_id, d.entity_type,
-                d.primary_name, d.program, d.designation_date, d.reference_number,
-                d.un_reference_number
+        `SELECT n.rowid AS rowid, ${NAME_JOIN_COLUMNS}
          FROM ${NAME_TABLE} n
          JOIN designation d ON d.id = n.designation_id
          WHERE n.rowid IN (SELECT value FROM json_each(?))`,
@@ -1577,16 +1611,29 @@ export class ScreeningService {
     // 0.8095) counts toward the surfaced coverage and the completion's every-word
     // rule, never toward admission, so it only completes a candidate the spelled
     // words admit. Keys are memoized for the pass: thousands of names share tokens.
+    //
+    // The completion's every-word rule is `oneToOneCoverage`: each distinct
+    // distinctive word takes a name word of its own, a stoplisted name word only
+    // when identical or for a one-letter word, and a sound match only at
+    // SOUND_MIN_SIMILARITY or above. A romanized token's word is the native word
+    // it romanizes (`nativeWords`), so `Мэр Мер`, romanized `mer mer`, needs two.
+    // Admission and the surfaced coverage keep the per-word `scoreTokenPairs`.
     const soundKey = soundKeys();
+    const distinctWords = new Set(distinctive).size;
     const queries = queryForms.map((normalized) => {
       const tokens = tokenize(normalized);
       const formDistinctive = splitOnStoplist(tokens).distinctive;
-      const distinctiveCount = Math.max(formDistinctive.length, distinctive.length);
+      const scoring = scoringQuery(tokens, nativeWords(args.queryTokens, tokens));
       return {
         normalized,
-        distinctiveCount,
-        required: requiredCoverage(args.queryTokens.length, distinctiveCount),
-        scoring: scoringQuery(tokens),
+        // A comparison form needs as many words as the query: a romanization that
+        // drops one (`ъ` alone) never completes on fewer.
+        completionWords: Math.max(queryWords(scoring).length, distinctWords),
+        required: requiredCoverage(
+          args.queryTokens.length,
+          Math.max(formDistinctive.length, distinctive.length),
+        ),
+        scoring,
       };
     });
     const scored: ScreeningHit[] = [];
@@ -1598,6 +1645,13 @@ export class ScreeningService {
       }));
       for (const query of queries) {
         for (const name of names) {
+          if (
+            args.fullCoverage &&
+            oneToOneCoverage(query.scoring, name.tokens, args.minScore, soundKey) <
+              query.completionWords
+          ) {
+            continue;
+          }
           // Coverage of every query token is the surfaced ranking key; the token arm
           // counts the distinctive ones covered by spelling only, and they are every
           // token unless the query carries a stoplisted one.
@@ -1608,9 +1662,6 @@ export class ScreeningService {
             phonetic,
           } = scoreTokenPairs(query.scoring, name.tokens, args.minScore, soundKey);
           const wholeScore = jaroWinkler(query.normalized, name.normalized);
-          if (args.fullCoverage && distinctiveCovered + phonetic < query.distinctiveCount) {
-            continue;
-          }
 
           if (
             this.admitFuzzy(
@@ -1623,13 +1674,11 @@ export class ScreeningService {
               args.minScore,
             )
           ) {
-            const hit = this.rowToHit(row, 'approximate');
-            hit.score = Number(Math.max(tokenScore, wholeScore).toFixed(4));
-            hit.queryTokenCoverage = {
-              covered,
-              total: args.queryTokens.length,
-              ...(phonetic > 0 ? { phonetic } : {}),
-            };
+            const hit = this.approximateHit(
+              row,
+              { tokenScore, wholeScore },
+              { covered, phonetic, total: args.queryTokens.length },
+            );
             if (!best || compareFuzzyRank(hit, best) < 0) best = hit;
           }
         }
@@ -1654,6 +1703,95 @@ export class ScreeningService {
       ),
       poolBounded,
     };
+  }
+
+  /**
+   * The romanized read: on each list in `sources`, every name with a comparison
+   * form (the fold, or a Russian-alphabet name's romanization) holding a whole
+   * word for each word of `romanizedTokens` — the query's romanization — legal
+   * forms and function words included. It is strict's all-tokens rule over
+   * romanizations, by exact spelling ({@link holdsEveryWord}): no prefix term, no
+   * similarity, no sound, so `integral` never reaches `international`, `ao` never
+   * stands in for `joint stock company`, and the fuzzy pass's admission routes
+   * never apply. Identical words count once, as strict reads them, and a romanized
+   * word is the native word it spells (`nativeWords`), so `Мэр Мер`, romanized
+   * `mer mer`, reads `Mer Mer`, never `Mer Trading`. One FTS `AND` of the distinct
+   * romanized words over `comparison_normalized`, every form of a name joined,
+   * finds the names; each form is then held to the words on its own.
+   * Unbounded, like strict, so it never makes a count a lower bound.
+   *
+   * A name it returns is `approximate`, scored as the fuzzy pass scores a
+   * candidate: the best of every query comparison form against every comparison
+   * form of the name, by raw score, then coverage (see {@link compareFuzzyRank}),
+   * the first-written name of a designation winning a tie. A designation in
+   * `strictIds` keeps its strict hit, so its names are never scored.
+   */
+  private runRomanizedRead(
+    handle: SqliteHandle,
+    args: {
+      rawQuery: string;
+      minScore: number;
+      queryTokens: string[];
+      romanizedTokens: string[];
+      sources: SourceCode[];
+      strictIds: ReadonlySet<string>;
+      typeFilter: string;
+    },
+  ): ScreeningHit[] {
+    // Each word quoted as an FTS string, a `"` inside one doubled, so no word reads
+    // as an operator; the parentheses hold every word to the one column.
+    const terms = [...new Set(args.romanizedTokens)]
+      .map((word) => `"${word.replaceAll('"', '""')}"`)
+      .join(' AND ');
+    const rows = handle
+      .prepare<NameJoinRow & { rowid: number }>(
+        `SELECT n.rowid AS rowid, ${NAME_JOIN_COLUMNS}
+         FROM ${NAME_SUPPLEMENT_FTS_TABLE} f
+         CROSS JOIN ${NAME_TABLE} n ON n.rowid = f.rowid
+         CROSS JOIN designation d ON d.id = n.designation_id
+         WHERE ${NAME_SUPPLEMENT_FTS_TABLE} MATCH ?${this.sourceFilterClause(args.sources)}${args.typeFilter}`,
+      )
+      .all(`comparison_normalized : (${terms})`)
+      .sort((a, b) => a.rowid - b.rowid);
+
+    const words = scoringQuery(
+      args.romanizedTokens,
+      nativeWords(args.queryTokens, args.romanizedTokens),
+    );
+    const soundKey = soundKeys();
+    const queries = comparisonForms(args.rawQuery).map((normalized) => ({
+      normalized,
+      scoring: scoringQuery(tokenize(normalized)),
+    }));
+    const byDesignation = new Map<string, ScreeningHit>();
+    for (const row of rows) {
+      if (args.strictIds.has(row.designation_id)) continue;
+      const names = comparisonForms(row.name).map((normalized) => ({
+        normalized,
+        tokens: tokenize(normalized),
+      }));
+      if (!names.some((name) => holdsEveryWord(words, name.tokens))) continue;
+      for (const name of names) {
+        for (const query of queries) {
+          const { best, covered, phonetic } = scoreTokenPairs(
+            query.scoring,
+            name.tokens,
+            args.minScore,
+            soundKey,
+          );
+          const hit = this.approximateHit(
+            row,
+            { tokenScore: best, wholeScore: jaroWinkler(query.normalized, name.normalized) },
+            { covered, phonetic, total: args.queryTokens.length },
+          );
+          const existing = byDesignation.get(hit.designationId);
+          if (!existing || compareFuzzyRank(hit, existing) < 0) {
+            byDesignation.set(hit.designationId, hit);
+          }
+        }
+      }
+    }
+    return [...byDesignation.values()];
   }
 
   /**
@@ -1746,6 +1884,26 @@ export class ScreeningService {
       ...(row.un_reference_number ? { unReferenceNumber: row.un_reference_number } : {}),
       sources: [row.source as SourceCode],
     };
+  }
+
+  /**
+   * An `approximate` hit as the fuzzy pass and the romanized read surface it: the
+   * raw score (the better of the token-pair and whole-string measurements) and the
+   * query-token coverage beside it, `phonetic` only when a word matched by sound.
+   */
+  private approximateHit(
+    row: NameJoinRow,
+    measures: { tokenScore: number; wholeScore: number },
+    coverage: { covered: number; phonetic: number; total: number },
+  ): ScreeningHit {
+    const hit = this.rowToHit(row, 'approximate');
+    hit.score = Number(Math.max(measures.tokenScore, measures.wholeScore).toFixed(4));
+    hit.queryTokenCoverage = {
+      covered: coverage.covered,
+      total: coverage.total,
+      ...(coverage.phonetic > 0 ? { phonetic: coverage.phonetic } : {}),
+    };
+    return hit;
   }
 
   // ─── Designation detail ────────────────────────────────────────────────────
@@ -1850,7 +2008,7 @@ export class ScreeningService {
    * hit ({@link groupOfacCopies}) naming every selected list that publishes the
    * entry, whichever records matched ({@link completeOfacSources}). Joined to
    * `designation`, so a designation a sync removed never surfaces, even before
-   * the post-sync rebuild drops its identifier rows.
+   * the rebuild its run ends with drops its identifier rows.
    */
   async screenIdentifier(opts: ScreenIdentifierOptions): Promise<IdentifierHit[]> {
     const probes = identifierProbes(opts.value, opts.type);
@@ -2402,14 +2560,12 @@ export class ScreeningService {
 
   /**
    * Sanctions mirror readiness and as-of, with each list's recorded harvest and
-   * the last refresh from {@link sanctionsFreshness}, read once per call.
+   * the last refresh ({@link sanctionsFreshness}), from one read of the sync
+   * state: the as-of and the status describe the same moment as the rows.
    */
   async sanctionsReadiness(): Promise<MirrorReadiness & SanctionsFreshness> {
-    const [status, freshness] = await Promise.all([
-      this.designationMirror.status(),
-      this.sanctionsFreshness(),
-    ]);
-    return { ...this.toReadiness(status), ...freshness };
+    const status = await this.designationMirror.status();
+    return { ...this.toReadiness(status), ...(await this.freshnessAfter(status)) };
   }
 
   /**
@@ -2419,25 +2575,28 @@ export class ScreeningService {
    * finished it, also while another run is in progress. Read on every call; the
    * rows change only as a run's index rebuild commits, and the run reads
    * `in_progress` until then (see {@link lastRefreshOf}).
-   *
-   * The state is read first, then the name-index stamp and the rows in one
-   * snapshot: that rebuild commits both together, so a reader never pairs a
-   * rebuilt stamp with the rows it replaced.
    */
   async sanctionsFreshness(): Promise<SanctionsFreshness> {
+    return this.freshnessAfter(await this.designationMirror.store.readState());
+  }
+
+  /**
+   * {@link sanctionsFreshness} for `state`, which must have been read first: a
+   * run commits its rows before its final state, so rows read after the state
+   * that reports the run finished are that run's.
+   */
+  private async freshnessAfter(
+    state: Pick<SyncState, 'startedAt' | 'status'>,
+  ): Promise<SanctionsFreshness> {
     const handle = await this.designationHandle();
-    const state = await this.designationMirror.store.readState();
-    const { built, rows } = handle.transaction(() => ({
-      built: nameIndexStamp(handle),
-      rows: handle
-        .prepare<HarvestRow>(
-          `SELECT source, harvested_at, published_at, attempt_started_at, attempt_status FROM ${SOURCE_HARVEST_TABLE}`,
-        )
-        .all(),
-    }));
+    const rows = handle
+      .prepare<HarvestRow>(
+        `SELECT source, harvested_at, published_at, attempt_started_at, attempt_status FROM ${SOURCE_HARVEST_TABLE}`,
+      )
+      .all();
     const bySource = new Map(rows.map((row) => [row.source, row]));
     return {
-      lastRefresh: lastRefreshOf(state, built, bySource),
+      lastRefresh: lastRefreshOf(state, bySource),
       sources: SOURCE_CODES.map((code) => {
         const row = bySource.get(code);
         if (!row?.harvested_at) return { code };
@@ -2953,12 +3112,28 @@ function writeIdentifiers(
 }
 
 /**
- * The stamp of the sync run a mirror's designation data came from: every run
- * records a fresh `startedAt`, and a seeded or completed one a fresh
- * `completedAt`, whichever release wrote it.
+ * The run a mirror's designation data came from, as the index stamps name it:
+ * its `startedAt`, which every run records fresh and keeps through its final
+ * state, so the rebuild a run ends with — taken while the run still reads
+ * `in_progress` — names the run its final state describes. A state no run wrote
+ * (a seeded mirror, {@link ScreeningService.markSanctionsReady}) is named by its
+ * `completedAt`.
  */
 function syncStamp(state: SyncState): string {
-  return `${state.startedAt ?? ''}|${state.completedAt ?? ''}`;
+  return state.startedAt ?? `|${state.completedAt ?? ''}`;
+}
+
+/**
+ * Whether `built`, an index stamp under the `version` build rules, records a
+ * build for the run `state` describes. 0.7.0 stamped a run's indexes after its
+ * final state as `startedAt|completedAt`, so a mirror it wrote names the same run
+ * that way.
+ */
+function builtFor(built: string, version: string, state: SyncState): boolean {
+  return (
+    built === `${version}${syncStamp(state)}` ||
+    built === `${version}${state.startedAt ?? ''}|${state.completedAt ?? ''}`
+  );
 }
 
 /** Stamp prefix for the current identifier classification rules. */
@@ -3022,29 +3197,18 @@ interface HarvestRow {
  * The last refresh from the sync state, with the lists that failed in it when
  * any list's outcome was recorded under its `startedAt`.
  *
- * A sync run writes `complete` or `error` before its index rebuild records the
- * run's outcomes and stamps the name index with that state, in one transaction
- * (see {@link ScreeningService.syncSanctions}). Until that commits, the name
- * index carries another state's stamp and the run reads `in_progress`. A mirror
- * an earlier release wrote reads its own state: the first open rebuilds a name
- * index whose stamp differs, before anything reads it. A state with no
- * `startedAt` was written by no run ({@link ScreeningService.markSanctionsReady}
- * after a direct ingest, which indexes as it writes) and has no rebuild to wait for.
+ * A run's index rebuild records its outcomes before the run writes `complete`
+ * or `error` (see {@link ScreeningService.syncSanctions}), so the state reads as
+ * recorded: `in_progress` until the rebuild has committed, and a final state
+ * only beside that run's rows. An `error` with no row of the run is one whose
+ * rebuild failed, or one an earlier release made, and names no list.
  */
 function lastRefreshOf(
-  state: SyncState,
-  nameStamp: string | undefined,
+  state: Pick<SyncState, 'startedAt' | 'status'>,
   rows: ReadonlyMap<string, HarvestRow>,
 ): SanctionsLastRefresh {
   const { startedAt, status } = state;
   const started = startedAt ? { startedAt } : {};
-  if (
-    (status === 'complete' || status === 'error') &&
-    startedAt !== undefined &&
-    nameStamp !== `${NAME_STAMP_VERSION}${syncStamp(state)}`
-  ) {
-    return { status: 'in_progress', startedAt };
-  }
   switch (status) {
     case 'pending':
       return { status };

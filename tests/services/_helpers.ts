@@ -159,9 +159,10 @@ export async function restartGlobalService(previous: SeededService): Promise<See
 }
 
 /**
- * Hold `service`'s post-sync index rebuild until `release()`. `held` resolves once
- * a run has written its final sync state and reached the rebuild, which then runs
- * unchanged.
+ * Hold the index rebuild `service`'s sanctions runs end with until `release()`.
+ * `held` resolves once a run has harvested its last list and reached the
+ * rebuild, its sync state still `in_progress`; the rebuild then runs unchanged,
+ * and the run's final state commits after it.
  */
 export function holdRebuild(service: ScreeningService): {
   held: Promise<void>;

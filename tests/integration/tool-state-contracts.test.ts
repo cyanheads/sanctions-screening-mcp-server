@@ -623,7 +623,7 @@ describe('per-list harvest and the last refresh in sanctions_list_sources (#88)'
       fail: { url: DEFAULT_SOURCE_URLS.ukSanctions },
     });
     await held;
-    expect((await global.service.designations.store.readState()).status).toBe('error');
+    expect((await global.service.designations.store.readState()).status).toBe('in_progress');
 
     const during = await listSources();
     expect(during.payload.lastRefresh).toStrictEqual({ status: 'in_progress', startedAt: T1 });
@@ -905,7 +905,7 @@ describe('capped result disclosure and retrieval', () => {
     expect(text).toContain('showing 25 of 27 potential match(es) (count basis: exact)');
     // The guidance names every screened name and identifier, not the legal name alone.
     expect(text).toContain(
-      `re-screen "Fictional Trading Company LLC", "Fictional Trading Co" with sanctions_screen_name and look up ${LISTED_ENTITY_LEI}, TEST-REG-1 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches on lists with no strict match, which this count leaves out.`,
+      `re-screen "Fictional Trading Company LLC", "Fictional Trading Co" with sanctions_screen_name and look up ${LISTED_ENTITY_LEI}, TEST-REG-1 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches, which this count leaves out.`,
     );
   });
 

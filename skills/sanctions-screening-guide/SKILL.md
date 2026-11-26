@@ -4,7 +4,7 @@ description: Investigate ambiguous counterparties with sanctions_* tools, recove
 license: Apache-2.0
 metadata:
   author: "cyanheads"
-  version: "1.1"
+  version: "1.2"
 ---
 
 ## Gates
@@ -19,7 +19,7 @@ Before using a designation to identify a person or organization, compare the pub
 
 A UK or EU record's `unReferenceNumber` names the UN listing it implements. Check it against the `un` record by looking it up with `sanctions_get_designation` on source `un`; it is a lead, not proof of identity, because it can differ from the UN list's in case or padding (the lookup ignores both), name no current UN listing, or be carried by two designations (a lookup by it then fails as `reference_ambiguous`, naming both). The UK measures imposed and designation source are features: they describe the designation and are not searchable.
 
-A `strong` name hit treats the spellings of one legal form as equal (`Ltd` and `Limited`, `LLC` and `OOO`) but never different forms (`LLC` and `Ltd`), so a legal form that differs from the counterparty's is a difference to weigh. A hit whose `queryTokenCoverage` shows words matched by sound (`phonetic`) is a transliteration candidate of a possibly different person: common names share sound keys, so confirm it against identifiers and dates before treating the names as the same party. Native-script names in the UK and UN lists are aliases, so a hit on one can show a native-script `matchedName` for a Latin-script query.
+A `strong` name hit treats the spellings of one legal form as equal (`Ltd` and `Limited`, `LLC` and `OOO`) but never different forms (`LLC` and `Ltd`), so a legal form that differs from the counterparty's is a difference to weigh; `PLC` and `Public Company Limited` (or `Public Ltd`) are one form, and a name written that way is also reached by a `Ltd` query. A hit whose `queryTokenCoverage` shows words matched by sound (`phonetic`) is a transliteration candidate of a possibly different person: common names share sound keys, so confirm it against identifiers and dates before treating the names as the same party. Native-script names in the UK and UN lists are aliases, so a hit on one can show a native-script `matchedName` for a Latin-script query. For a name in the Russian alphabet, an `approximate` hit beside a `strong` one on the same list can be the same party published only in transliteration; compare identifiers and dates rather than treating the strong hit as the whole list's answer.
 
 Before judging which list is stale, read each list's `lastHarvestedAt` and `publishedAt` from `sanctions_list_sources`, not `sanctionsAsOf` alone. `publishedAt` is the date the publisher put on the document, not when the list's content last changed (the UN file is regenerated daily), and a list with neither has no harvest recorded by this server, which is unknown, not old. A `lastRefresh` of `error` with `failedSources` names the lists still holding earlier data; one of `in_progress` can also mean a killed refresh.
 

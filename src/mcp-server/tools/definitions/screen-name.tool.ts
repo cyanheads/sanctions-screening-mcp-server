@@ -64,7 +64,7 @@ const HitSchema = z
     matchType: z
       .enum(['exact', 'strong', 'approximate'])
       .describe(
-        'exact = native normalized name equality; strong = all native query tokens present, a legal form counting in any spelling of the same form (Ltd and Limited, LLC and OOO; never LLC and Ltd); approximate = fuzzy/phonetic, optionally comparing Russian-alphabet romanizations while retaining the published matchedName.',
+        'exact = native normalized name equality; strong = all native query tokens present, a legal form counting in any spelling of the same form (Ltd and Limited, LLC and OOO, PLC and Public Company Limited; never LLC and Ltd); approximate = fuzzy/phonetic, optionally comparing Russian-alphabet romanizations, or a whole-word read of the romanization of a Russian-alphabet name, retaining the published matchedName.',
       ),
     score: z
       .number()
@@ -85,7 +85,7 @@ const HitSchema = z
           .int()
           .optional()
           .describe(
-            `Of covered, the query tokens matched by sound alone: no candidate token clears the score floor against them, but one shares their primary Double-Metaphone key, at least three characters long (gaddafi and qadhafi, both KTF), and neither word is one of ${UNCOUNTED_WORDS}. A sound match never admits a candidate or raises its score. Absent when zero.`,
+            `Of covered, the query tokens matched by sound alone: no candidate token clears the score floor against them, but one shares their primary Double-Metaphone key, at least three characters long (gaddafi and qadhafi, both KTF), and neither word is one of ${UNCOUNTED_WORDS}. A sound match never admits a candidate or raises its score, and in a strict screen's completion it also needs a Jaro-Winkler of 0.65 or more against that word. Absent when zero.`,
           ),
         total: z.number().int().describe('Total tokens in the normalized query.'),
       })
@@ -132,7 +132,7 @@ const HitSchema = z
 
 export const screenNameTool = tool('sanctions_screen_name', {
   title: 'sanctions-screening-mcp-server: screen name',
-  description: `Screen a name (person, company, vessel, aircraft) against loaded sanctions and export-control watchlists — OFAC SDN + Consolidated, EU, UK, UN, and the six BIS/State CSL lists — alias- and fuzzy-aware. Check sanctions_list_sources for coverage before interpreting an empty result; zero-record CSL lists are not loaded. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias; an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists. Strict mode (default) matches exact-normalized then all-tokens-present, a legal form matching any spelling of the same form (Ltd and Limited, LLC and OOO), then runs a fuzzy pass over each selected list strict finds nothing on, and over the UK and UN lists either way for a name holding a letter outside the Latin script: a full pass when strict finds nothing on any list, otherwise one that adds only candidates covering every word of the name other than ${UNCOUNTED_WORDS}, by spelling or by sound, ranked after the strict hits. Fuzzy mode runs the fuzzy pass over every selected list. It adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score; fuzzySources names the lists it searched. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."`,
+  description: `Screen a name (person, company, vessel, aircraft) against loaded sanctions and export-control watchlists — OFAC SDN + Consolidated, EU, UK, UN, and the six BIS/State CSL lists — alias- and fuzzy-aware. Check sanctions_list_sources for coverage before interpreting an empty result; zero-record CSL lists are not loaded. Returns scored potential matches with the source list, sanctioning program, designation date, and the matched alias; an OFAC party both OFAC lists publish under one entry ID is one hit, its sources naming both lists. Strict mode (default) matches exact-normalized then all-tokens-present, a legal form matching any spelling of the same form (Ltd and Limited, LLC and OOO), then runs a fuzzy pass over each selected list strict finds nothing on, and over the UK and UN lists either way for a name holding a letter outside the Latin script: a full pass when strict finds nothing on any list, otherwise one that adds only candidates giving every word of the name other than ${UNCOUNTED_WORDS} a word of their own, by spelling or by a close sound, ranked after the strict hits. For a name in the Russian alphabet, each other list strict found something on is also read for names holding every word of the name's romanization as a whole word, labeled approximate. Fuzzy mode runs the fuzzy pass over every selected list. It adds Jaro-Winkler and phonetic matching and labels hits approximate with a raw 0–1 similarity score plus the count of query tokens the candidate covers, which orders candidates that tie on score; fuzzySources names the lists a fuzzy pass or that read searched. Results are paged: totalAvailable and hasMore report matches beyond the returned page, and nextOffset retrieves them. This is a screening AID for a human/compliance review, NOT a compliance determination: a hit means "review this candidate against the official source," and an empty result never means "cleared."`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   input: z.object({
     name: z
@@ -151,7 +151,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
       .enum(['strict', 'fuzzy'])
       .default('strict')
       .describe(
-        `strict (default): exact-normalized, then all-tokens-present with a legal form matching any spelling of the same form (Ltd and Limited, LLC and OOO), then a fuzzy pass over each selected list strict finds nothing on, and over the UK and UN lists either way for a name holding a letter outside the Latin script — a full pass when strict finds nothing on any list, otherwise adding only candidates that cover every word of the name other than ${UNCOUNTED_WORDS}, by spelling or by sound. fuzzy: a scored Jaro-Winkler + phonetic pass over every selected list.`,
+        `strict (default): exact-normalized, then all-tokens-present with a legal form matching any spelling of the same form (Ltd and Limited, LLC and OOO), then a fuzzy pass over each selected list strict finds nothing on, and over the UK and UN lists either way for a name holding a letter outside the Latin script — a full pass when strict finds nothing on any list, otherwise adding only candidates that give every word of the name other than ${UNCOUNTED_WORDS} a word of their own, by spelling or by a close sound; for a name in the Russian alphabet, each other list strict found something on is also read for names holding every word of its romanization as a whole word, labeled approximate. fuzzy: a scored Jaro-Winkler + phonetic pass over every selected list.`,
       ),
     minScore: z
       .number()
@@ -196,13 +196,13 @@ export const screenNameTool = tool('sanctions_screen_name', {
     matchModeUsed: z
       .string()
       .describe(
-        'fuzzy when a full fuzzy pass searched every selected list (fuzzy mode, or a strict screen that found nothing on any list); strict otherwise, including a strict screen completed by a fuzzy pass over its strict-empty lists and, for a name holding a letter outside the Latin script, the UK and UN lists.',
+        'fuzzy when a full fuzzy pass searched every selected list (fuzzy mode, or a strict screen that found nothing on any list); strict otherwise, including a strict screen completed by a fuzzy pass over its strict-empty lists and, for a name holding a letter outside the Latin script, the UK and UN lists, and one that also read the other strict-matched lists for the romanized words of a Russian-alphabet name.',
       ),
     fuzzySources: z
       .array(SOURCE_ENUM)
       .optional()
       .describe(
-        `The selected lists the fuzzy pass searched, in list order; absent when no fuzzy pass ran. Beside strict hits these are the lists strict found nothing on, plus the UK and UN lists for a name holding a letter outside the Latin script, and only their candidates covering every word of the name other than ${UNCOUNTED_WORDS}, by spelling or by sound, were added.`,
+        `The selected lists a fuzzy pass or the romanized read searched, in list order; absent when neither ran. Beside strict hits the fuzzy pass searched the lists strict found nothing on, plus the UK and UN lists for a name holding a letter outside the Latin script, and only its candidates giving every word of the name other than ${UNCOUNTED_WORDS} a word of their own, by spelling or by a close sound, were added. For a Russian-alphabet name the read searched every other list strict found something on, and added only names holding every word of the name's romanization as a whole word.`,
       ),
     totalCount: z.number().describe('Number of potential matches returned in this page.'),
     totalAvailable: z
@@ -213,7 +213,7 @@ export const screenNameTool = tool('sanctions_screen_name', {
     totalAvailableBasis: z
       .enum(['exact', 'lower_bound'])
       .describe(
-        'How to read totalAvailable: exact = the complete strict match set, no fuzzy pass having run (fuzzySources is absent); lower_bound = a fuzzy pass ran (fuzzySources is present), which scores only the candidates blocking pooled, so more matches may exist beyond the result set.',
+        'How to read totalAvailable: exact = no fuzzy pass ran: the strict set plus any romanized-read hits (fuzzySources is absent unless that read ran); lower_bound = a fuzzy pass ran (fuzzySources is present), which scores only the candidates blocking pooled, so more matches may exist beyond the result set.',
       ),
     hasMore: z
       .boolean()
@@ -350,6 +350,9 @@ export const screenNameTool = tool('sanctions_screen_name', {
     };
   },
 
+  // Every string a list publishes passes through escapeMarkdownInline here, never in
+  // the handler, so content[] reads back what structuredContent carries as
+  // published. A joined list is escaped as one string. Source codes stay code spans.
   format: (result) => {
     const lines: string[] = [];
     if (result.hits.length === 0) {
@@ -365,29 +368,31 @@ export const screenNameTool = tool('sanctions_screen_name', {
           ? ` · covers ${cov.covered}/${cov.total} query tokens${cov.phonetic ? ` (${cov.phonetic} by sound)` : ''}`
           : '';
         const also = alsoListedText(h.source, h.sources);
-        lines.push(`### ${h.primaryName} — ${h.matchType}${scoreStr}${coverStr}`);
         lines.push(
-          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${h.sourceEntryId}${h.referenceNumber ? ` | **Reference:** ${h.referenceNumber}` : ''}${h.unReferenceNumber ? ` | **UN reference:** ${escapeMarkdownInline(h.unReferenceNumber)}` : ''} | **Type:** ${h.entityType}`,
+          `### ${escapeMarkdownInline(h.primaryName)} — ${h.matchType}${scoreStr}${coverStr}`,
         );
-        lines.push(`**Matched on:** "${h.matchedName}" (${h.matchedNameType})`);
-        if (h.program) lines.push(`**Program:** ${h.program}`);
+        lines.push(
+          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${escapeMarkdownInline(h.sourceEntryId)}${h.referenceNumber ? ` | **Reference:** ${escapeMarkdownInline(h.referenceNumber)}` : ''}${h.unReferenceNumber ? ` | **UN reference:** ${escapeMarkdownInline(h.unReferenceNumber)}` : ''} | **Type:** ${h.entityType}`,
+        );
+        lines.push(
+          `**Matched on:** "${escapeMarkdownInline(h.matchedName)}" (${h.matchedNameType})`,
+        );
+        if (h.program) lines.push(`**Program:** ${escapeMarkdownInline(h.program)}`);
         if (h.designationDate) {
           lines.push(
             `**Designated:** ${escapeMarkdownInline(h.designationDate)}${also ? ` (the \`${h.source}\` record)` : ''}`,
           );
         }
         if (h.birthDates?.length) {
-          const dates = h.birthDates.map(
-            ({ date, circa }) => `${circa ? 'circa ' : ''}${escapeMarkdownInline(date)}`,
-          );
-          lines.push(`**Birth dates:** ${dates.join(', ')}`);
+          const dates = h.birthDates.map(({ date, circa }) => `${circa ? 'circa ' : ''}${date}`);
+          lines.push(`**Birth dates:** ${escapeMarkdownInline(dates.join(', '))}`);
         }
         if (h.nationalities?.length) {
-          lines.push(`**Nationalities:** ${h.nationalities.map(escapeMarkdownInline).join(', ')}`);
+          lines.push(`**Nationalities:** ${escapeMarkdownInline(h.nationalities.join(', '))}`);
         }
         if (h.addressCountries?.length) {
           lines.push(
-            `**Address countries:** ${h.addressCountries.map(escapeMarkdownInline).join(', ')}`,
+            `**Address countries:** ${escapeMarkdownInline(h.addressCountries.join(', '))}`,
           );
         }
         lines.push('');

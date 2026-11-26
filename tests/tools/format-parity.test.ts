@@ -7,13 +7,15 @@
  *
  * Payloads are round-tripped through the tool's own `output` schema before
  * rendering, so a schema change that invalidates these shapes fails here rather
- * than silently drifting from what the handler can actually produce.
+ * than silently drifting from what the handler can actually produce. The last
+ * block tests the read-back harness itself against a fake tool.
  * @module tests/tools/format-parity.test
  */
 
-import type { AnyToolDefinition } from '@cyanheads/mcp-ts-core';
+import { type AnyToolDefinition, tool, z } from '@cyanheads/mcp-ts-core';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { describe, expect, it } from 'vitest';
-import { SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
+import { crossReferencePointer, SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
 import { getDesignationTool } from '@/mcp-server/tools/definitions/get-designation.tool.js';
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
 import { listSourcesTool } from '@/mcp-server/tools/definitions/list-sources.tool.js';
@@ -21,13 +23,16 @@ import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity
 import { screenIdentifierTool } from '@/mcp-server/tools/definitions/screen-identifier.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownership.tool.js';
-
-/** Parse a payload against the tool's declared output schema, then render it. */
-function render(tool: AnyToolDefinition, payload: unknown): string {
-  const parsed = tool.output.parse(payload);
-  const blocks = tool.format?.(parsed as never) ?? [];
-  return blocks.map((block) => ('text' in block ? (block.text ?? '') : '')).join('\n');
-}
+import { expectLinearTime } from '../services/_linear-time.js';
+import {
+  CONSTRUCT_VALUES,
+  expectByteIdentical,
+  expectReadBack,
+  type Fill,
+  readBlocks,
+  readText,
+  render,
+} from './_markdown-readback.js';
 
 describe('sanctions_screen_name format()', () => {
   it('renders every hit field, including the optional score, program, and date', () => {
@@ -525,7 +530,7 @@ describe('sanctions_get_entity format()', () => {
     );
     expect(text).toContain('showing 3 of 31 potential match(es) (count basis: exact)');
     expect(text).toContain(
-      'more available: true — re-screen "Fictional Trading Company LLC", "Fictional Trading Co", "FTC", "FICTIONAL TRADING" with sanctions_screen_name and look up 5493001KJTIIGC8Y1R12, 4812291 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches on lists with no strict match, which this count leaves out.',
+      'more available: true — re-screen "Fictional Trading Company LLC", "Fictional Trading Co", "FTC", "FICTIONAL TRADING" with sanctions_screen_name and look up 5493001KJTIIGC8Y1R12, 4812291 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches, which this count leaves out.',
     );
     expect(text).toContain(
       'Screened: legal_name "Fictional Trading Company LLC"; lei 5493001KJTIIGC8Y1R12; other_name "Fictional Trading Co" (PREVIOUS_LEGAL_NAME); other_name "FTC" (TRADING_OR_OPERATING_NAME); other_name "FICTIONAL TRADING" (PREFERRED_ASCII_TRANSLITERATED_LEGAL_NAME); registration_number 4812291',
@@ -723,6 +728,45 @@ describe('sanctions_get_entity format()', () => {
     expect(parsed.legalName).toBe('Acme *Star* [Holdings] Ltd');
     expect(parsed.otherNames).toEqual(['Star <Trading> Co']);
   });
+
+  it('escapes the other names as one joined string, so a name ending in an entity name reads back whole (#96)', () => {
+    const otherNames = ['AT&amp', 'Tango &#35', 'B Ltd'];
+    const text = render(getEntityTool, { ...base, otherNames });
+
+    expect(readText(text).split('\n')).toContain('Other names: AT&amp; Tango &#35; B Ltd');
+    expect(getEntityTool.output.parse({ ...base, otherNames }).otherNames).toEqual(otherNames);
+  });
+
+  it('closes the hit list before the screen coverage, so coverage never reads as part of the last hit (#96)', () => {
+    const text = render(getEntityTool, {
+      ...base,
+      sanctionsHits: [
+        {
+          source: 'un',
+          sourceLabel: 'UN Security Council Consolidated List',
+          sourceEntryId: 'UN-7',
+          sources: ['un'],
+          primaryName: 'Harbor Front Co',
+          matchedIdentifiers: [{ type: 'Legal Entity Number', value: base.lei }],
+          matchedOn: [{ input: 'lei', value: base.lei }],
+        },
+      ],
+      sanctionsScreen: {
+        totalAvailable: 1,
+        totalAvailableBasis: 'exact',
+        hasMore: false,
+        screenedInputs: [],
+      },
+    });
+    const blocks = readBlocks(text);
+
+    const hit = blocks.find((block) => block.text.startsWith('Harbor Front Co'));
+    expect(hit?.containers).toEqual(['bullet_list']);
+    expect(hit?.text).not.toContain('Screen coverage');
+    const coverage = blocks.find((block) => block.text.startsWith('Screen coverage:'));
+    expect(coverage?.containers).toEqual([]);
+    expect(coverage?.text).toContain('\nScreened: legal_name');
+  });
 });
 
 describe('sanctions_trace_ownership format()', () => {
@@ -859,7 +903,7 @@ describe('sanctions_trace_ownership format()', () => {
     // Each screened node with matches discloses whether its own hit list was capped,
     // names everything to re-run, and lists what it screened beyond the legal name and LEI.
     expect(text).toContain(
-      `showing 2 of 7 potential match(es) (count basis: exact); more available: true — re-screen "Fictional Trading Company LLC", "FTC" with sanctions_screen_name and look up ${root.lei}, 4812291 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches on lists with no strict match, which this count leaves out.`,
+      `showing 2 of 7 potential match(es) (count basis: exact); more available: true — re-screen "Fictional Trading Company LLC", "FTC" with sanctions_screen_name and look up ${root.lei}, 4812291 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches, which this count leaves out.`,
     );
     expect(nodeLines(text, root.lei).at(-1)).toBe(
       '  - Screened beyond the legal name and LEI: other_name "FTC" (type not recorded); registration_number 4812291',
@@ -1045,7 +1089,7 @@ describe('sanctions_trace_ownership format()', () => {
       10,
     );
     expect(cappedBlock.at(-1)).toBe(
-      '  - Screen coverage: showing 10 of 12 potential match(es) (count basis: exact); more available: true — re-screen "Capped Holdings Ltd" with sanctions_screen_name and look up 5493009CAPPEDNODE056 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches on lists with no strict match, which this count leaves out.',
+      '  - Screen coverage: showing 10 of 12 potential match(es) (count basis: exact); more available: true — re-screen "Capped Holdings Ltd" with sanctions_screen_name and look up 5493009CAPPEDNODE056 with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches, which this count leaves out.',
     );
     expect(nodeLines(text, '5493009LISTEDNODE078').at(-1)).toBe(
       '  - Screen coverage: showing 2 of 2 potential match(es) (count basis: exact); more available: false',
@@ -1230,6 +1274,56 @@ describe('sanctions_trace_ownership format()', () => {
     // A node whose parents were not walked gets no parent-status line.
     expect(text).not.toContain('parent:');
   });
+
+  it('closes each list before the paragraph after it, so no status line reads as part of a list item (#96)', () => {
+    const page = {
+      ...segment,
+      rootLei: root.lei,
+      complete: false,
+      truncated: true,
+      screeningStatus: 'not_requested',
+      nodes: [root],
+      edges: [],
+      screenedNodeCount: 0,
+      flaggedNodeCount: 0,
+      caveat: SCREENING_CAVEAT,
+    };
+    const withBranches = readBlocks(
+      render(traceOwnershipTool, {
+        ...page,
+        boundaries: [
+          { lei: '5493009BRIT0PARENT12', direction: 'parents', reason: 'depth_limit', depth: 3 },
+        ],
+        totalAvailable: 2,
+        truncationReasons: ['depth_limit'],
+        missingEntityCount: 1,
+        missingEntityLeis: ['33333333333333333333'],
+        reportingExceptionsLoaded: false,
+      }),
+    );
+    const absent = withBranches.find((block) => block.text.startsWith('Absent from'));
+    expect(absent?.containers).toEqual(['bullet_list']);
+    expect(absent?.text).not.toContain('Reporting exceptions');
+    const statuses = withBranches.find((block) => block.text.startsWith('Reporting exceptions:'));
+    expect(statuses?.containers).toEqual([]);
+    expect(statuses?.text).toContain('\nNode screening: not requested');
+
+    // A truncation line alone is a list too.
+    const truncatedOnly = readBlocks(
+      render(traceOwnershipTool, {
+        ...page,
+        truncationReasons: ['ultimate_leaf'],
+        missingEntityLeis: [],
+        reportingExceptionsLoaded: true,
+      }),
+    );
+    expect(truncatedOnly.find((block) => block.text.startsWith('Truncated:'))?.text).not.toContain(
+      'Node screening',
+    );
+    expect(
+      truncatedOnly.find((block) => block.text.startsWith('Node screening:'))?.containers,
+    ).toEqual([]);
+  });
 });
 
 describe('sanctions_list_sources format()', () => {
@@ -1273,7 +1367,11 @@ describe('sanctions_list_sources format()', () => {
     expect(text).toContain(
       '**Records:** 3375797 Level 1 entities · 489224 Level 2 relationships | **License:** CC0 1.0 Universal (public domain)',
     );
-    expect(text).toContain('**Source:** https://goldencopy.gleif.org\n');
+    expect(
+      readBlocks(text)
+        .filter((block) => block.text.includes('\nSource: '))
+        .map((b) => b.links),
+    ).toEqual([[source.url], ['https://goldencopy.gleif.org']]);
     expect(text).toContain('**Reporting exceptions:** 6378146');
     expect(text).not.toMatch(/reporting exceptions:\*\* not loaded/i);
     expect(text).toContain('**GLEIF alternate-name index:** built');
@@ -1673,5 +1771,720 @@ describe('sanctions_screen_identifier format()', () => {
     const text = render(screenIdentifierTool, { hits: [], caveat: SCREENING_CAVEAT });
     expect(text).toContain('**No designation publishes a matching identifier.**');
     expect(text).toMatch(/an empty result is not a clearance/i);
+  });
+});
+
+describe('GLEIF tool text in content[] (issue #96)', () => {
+  const LEI = '5493001KJTIIGC8Y1R12';
+  const PARENT_LEI = '5493009BRIT0PARENT12';
+  const GRANDPARENT_LEI = '5493009GRANDPARENT34';
+
+  /**
+   * Values an escaper reading the value alone leaves inert, but the authored text
+   * after them can complete: an entity name or numeric reference closed by a `;`,
+   * and a trailing backslash escaping the next character.
+   */
+  const JOIN_VALUES = [
+    'Sierra &amp',
+    'Tango &#35',
+    'Uniform &#x2A',
+    'Victor &lt',
+    'Whiskey &quot',
+    'Yankee \\',
+  ];
+
+  const VALUE_SETS = [
+    ['every Markdown construct', CONSTRUCT_VALUES],
+    ['a value the authored text after it could complete', JOIN_VALUES],
+  ] as const;
+
+  it.each(VALUE_SETS)(
+    'sanctions_resolve_entity: %s reads back from content[] as published',
+    (_set, values) => {
+      expectReadBack(
+        resolveEntityTool,
+        (fill) => ({
+          matches: [
+            {
+              lei: LEI,
+              legalName: fill('heading'),
+              matchedName: fill(),
+              matchedNameType: fill(),
+              matchType: 'approximate',
+              score: 0.912,
+              queryTokenCoverage: { covered: 2, total: 3 },
+              jurisdiction: fill(),
+              status: fill(),
+            },
+            {
+              lei: PARENT_LEI,
+              legalName: fill('heading'),
+              matchedName: fill(),
+              matchedNameType: fill(),
+              matchType: 'strong',
+              status: fill(),
+            },
+          ],
+        }),
+        values,
+      );
+    },
+  );
+
+  /** A grouped OFAC hit matched by name and two identifiers, on `matchedOn`. */
+  const nameHit = (fill: Fill, matchedOn: unknown[]) => ({
+    source: 'ofac_sdn',
+    sourceLabel: 'OFAC Specially Designated Nationals (SDN) List',
+    sourceEntryId: fill(),
+    sources: ['ofac_sdn', 'ofac_consolidated'],
+    primaryName: fill(),
+    matchedName: fill(),
+    matchType: 'exact',
+    matchedIdentifiers: [
+      { type: fill(), value: fill() },
+      { type: fill(), value: fill(), country: fill() },
+    ],
+    matchedOn,
+  });
+
+  /** A hit only the LEI produced: no matched name. */
+  const leiHit = (fill: Fill, lei: string) => ({
+    source: 'un',
+    sourceLabel: 'UN Security Council Consolidated List',
+    sourceEntryId: fill(),
+    sources: ['un'],
+    primaryName: fill(),
+    matchedIdentifiers: [{ type: fill(), value: lei }],
+    matchedOn: [{ input: 'lei', value: lei }],
+  });
+
+  it.each(VALUE_SETS)(
+    'sanctions_get_entity: %s reads back from content[] as published',
+    (_set, values) => {
+      expectReadBack(
+        getEntityTool,
+        (fill) => {
+          const legalName = fill('heading');
+          const otherNames = [fill(), fill(), fill()];
+          const screenedNames = otherNames.map((value) => ({
+            input: 'other_name',
+            value,
+            nameType: fill(),
+          }));
+          const registrationNumber = fill();
+          return {
+            lei: LEI,
+            legalName,
+            otherNames,
+            alternateNames: screenedNames.map(({ value, nameType }) => ({
+              name: value,
+              type: nameType,
+            })),
+            jurisdiction: fill(),
+            status: fill(),
+            entityStatus: fill(),
+            successors: [
+              { lei: PARENT_LEI, name: fill() },
+              { name: fill() },
+              { lei: GRANDPARENT_LEI },
+            ],
+            entityStatusLoaded: true,
+            legalAddress: fill(),
+            headquartersAddress: fill(),
+            registrationAuthorityId: fill(),
+            registrationAuthorityEntityId: registrationNumber,
+            lastUpdate: fill(),
+            sanctionsHits: [
+              nameHit(fill, [
+                { input: 'legal_name', value: legalName },
+                screenedNames[0],
+                { input: 'registration_number', value: registrationNumber },
+                { input: 'lei', value: LEI },
+              ]),
+              leiHit(fill, LEI),
+            ],
+            sanctionsScreen: {
+              totalAvailable: 9,
+              totalAvailableBasis: 'exact',
+              hasMore: true,
+              screenedInputs: [
+                ...screenedNames,
+                { input: 'registration_number', value: registrationNumber },
+              ],
+            },
+            screeningStatus: 'screened',
+            caveat: SCREENING_CAVEAT,
+          };
+        },
+        values,
+      );
+    },
+  );
+
+  it.each(VALUE_SETS)(
+    'sanctions_trace_ownership: %s on nodes to depth 2, their hits, and edges reads back as published',
+    (_set, values) => {
+      expectReadBack(
+        traceOwnershipTool,
+        (fill) => {
+          /** A screened node's names and registration number, and its screen disclosure. */
+          const screened = (legalName: string, hasMore: boolean) => {
+            const other = { input: 'other_name', value: fill(), nameType: fill() };
+            const registration = { input: 'registration_number', value: fill() };
+            return {
+              matchedOn: [{ input: 'legal_name', value: legalName }, other, registration],
+              sanctionsScreen: {
+                totalAvailable: hasMore ? 12 : 0,
+                totalAvailableBasis: 'exact',
+                hasMore,
+                screenedInputs: [other, registration],
+              },
+            };
+          };
+          const rootName = fill();
+          const root = screened(rootName, true);
+          const parentName = fill();
+          const parent = screened(parentName, false);
+          const grandparentName = fill();
+          const grandparent = screened(grandparentName, true);
+          return {
+            rootLei: LEI,
+            nodes: [
+              {
+                lei: LEI,
+                legalName: rootName,
+                jurisdiction: fill(),
+                status: fill(),
+                depth: 0,
+                role: 'root',
+                parentStatus: {
+                  direct: { status: 'relationship' },
+                  ultimate: { status: 'exception', exceptionReasons: [fill(), fill()] },
+                },
+                sanctionsHits: [nameHit(fill, root.matchedOn)],
+                sanctionsScreen: root.sanctionsScreen,
+              },
+              {
+                lei: PARENT_LEI,
+                legalName: parentName,
+                jurisdiction: fill(),
+                status: fill(),
+                depth: 1,
+                role: 'parent',
+                parentStatus: {
+                  direct: { status: 'exception', exceptionReasons: [fill()] },
+                  ultimate: { status: 'relationship' },
+                },
+                sanctionsHits: [],
+                sanctionsScreen: parent.sanctionsScreen,
+              },
+              {
+                lei: GRANDPARENT_LEI,
+                legalName: grandparentName,
+                jurisdiction: fill(),
+                depth: 2,
+                role: 'parent',
+                sanctionsHits: [
+                  nameHit(fill, grandparent.matchedOn),
+                  leiHit(fill, GRANDPARENT_LEI),
+                ],
+                sanctionsScreen: grandparent.sanctionsScreen,
+              },
+            ],
+            edges: [
+              {
+                childLei: LEI,
+                parentLei: PARENT_LEI,
+                relationshipType: fill(),
+                relationshipStatus: fill(),
+              },
+              {
+                childLei: PARENT_LEI,
+                parentLei: GRANDPARENT_LEI,
+                relationshipType: fill(),
+                relationshipStatus: fill(),
+              },
+              { childLei: LEI, parentLei: GRANDPARENT_LEI, relationshipType: fill() },
+            ],
+            boundaries: [],
+            totalAvailable: 6,
+            totalAvailableBasis: 'exact',
+            hasMore: false,
+            truncationReasons: [],
+            missingEntityCount: 0,
+            complete: true,
+            truncated: false,
+            reportingExceptionsLoaded: true,
+            missingEntityLeis: [],
+            screeningStatus: 'screened',
+            screenedNodeCount: 3,
+            flaggedNodeCount: 2,
+            caveat: SCREENING_CAVEAT,
+          };
+        },
+        values,
+      );
+    },
+  );
+
+  it('renders a value with no Markdown-active character byte-identically in every slot', () => {
+    const lines = (tool: AnyToolDefinition, payload: unknown) => render(tool, payload).split('\n');
+
+    expect(
+      lines(resolveEntityTool, {
+        matches: [
+          {
+            lei: LEI,
+            legalName: 'AT&T C# 12 Holdings',
+            matchedName: 'snake_case Trading',
+            matchedNameType: 'TRADING_OR_OPERATING_NAME',
+            matchType: 'exact',
+            jurisdiction: 'US-DE',
+            status: 'ISSUED',
+          },
+        ],
+      }),
+    ).toEqual(
+      expect.arrayContaining([
+        '### AT&T C# 12 Holdings — exact',
+        '**Matched on:** "snake_case Trading" (TRADING_OR_OPERATING_NAME)',
+        '**Jurisdiction: US-DE | Status: ISSUED**',
+      ]),
+    );
+
+    expect(
+      lines(getEntityTool, {
+        lei: LEI,
+        legalName: 'AT&T C# 12 Holdings',
+        otherNames: ['ACME LTD', 'snake_case'],
+        alternateNames: [
+          { name: 'ACME LTD', type: 'TRADING_OR_OPERATING_NAME' },
+          { name: 'snake_case', type: 'PREVIOUS_LEGAL_NAME' },
+        ],
+        jurisdiction: 'US-DE',
+        status: 'ISSUED',
+        entityStatus: 'ACTIVE',
+        successors: [{ lei: PARENT_LEI, name: 'AT&T Successor' }],
+        entityStatusLoaded: true,
+        legalAddress: '1 Market St #200, Wilmington, DE',
+        headquartersAddress: 'C# 12 Tower, Nassau',
+        registrationAuthorityId: 'RA000602',
+        registrationAuthorityEntityId: 'HRB_14604',
+        lastUpdate: '2026-02-01T00:00:00.000Z',
+        sanctionsHits: [
+          {
+            source: 'ofac_sdn',
+            sourceLabel: 'OFAC Specially Designated Nationals (SDN) List',
+            sourceEntryId: 'FX-2002',
+            sources: ['ofac_sdn', 'ofac_consolidated'],
+            primaryName: 'AT&T C# 12 Holdings',
+            matchedName: 'ACME LTD',
+            matchType: 'exact',
+            matchedOn: [
+              { input: 'other_name', value: 'ACME LTD', nameType: 'TRADING_OR_OPERATING_NAME' },
+            ],
+          },
+        ],
+        screeningStatus: 'screened',
+        caveat: SCREENING_CAVEAT,
+      }),
+    ).toEqual(
+      expect.arrayContaining([
+        '# AT&T C# 12 Holdings',
+        '**Other names:** ACME LTD; snake_case',
+        '**Names by type:** ACME LTD (TRADING_OR_OPERATING_NAME); snake_case (PREVIOUS_LEGAL_NAME)',
+        '**Jurisdiction:** US-DE',
+        '**Registration status:** ISSUED',
+        '**Entity status:** ACTIVE',
+        `**Successor entities:** \`${PARENT_LEI}\` (AT&T Successor) — pass a successor LEI to sanctions_get_entity or sanctions_trace_ownership; successors are not screened here.`,
+        '**Legal address:** 1 Market St #200, Wilmington, DE',
+        '**HQ address:** C# 12 Tower, Nassau',
+        '**Registration authority:** RA000602 (entity HRB_14604)',
+        '**Last update:** 2026-02-01T00:00:00.000Z',
+        '- **AT&T C# 12 Holdings** — OFAC Specially Designated Nationals (SDN) List (`ofac_sdn`, entry FX-2002; also listed on OFAC Consolidated Sanctions List (`ofac_consolidated`)), exact, matched "ACME LTD" — matched on: other_name "ACME LTD" (TRADING_OR_OPERATING_NAME)',
+      ]),
+    );
+
+    expect(
+      lines(traceOwnershipTool, {
+        rootLei: LEI,
+        nodes: [
+          {
+            lei: LEI,
+            legalName: 'AT&T C# 12 Holdings',
+            jurisdiction: 'US-DE',
+            status: 'ISSUED',
+            depth: 0,
+            role: 'root',
+            parentStatus: {
+              direct: { status: 'relationship' },
+              ultimate: {
+                status: 'exception',
+                exceptionReasons: ['NATURAL_PERSONS', 'NON_CONSOLIDATING'],
+              },
+            },
+            sanctionsHits: [
+              {
+                source: 'uk',
+                sourceLabel: 'UK Sanctions List',
+                sourceEntryId: 'FX-2002',
+                sources: ['uk'],
+                primaryName: 'AT&T C# 12 Holdings',
+                matchedName: 'ACME LTD',
+                matchType: 'exact',
+                matchedOn: [
+                  { input: 'other_name', value: 'ACME LTD', nameType: 'TRADING_OR_OPERATING_NAME' },
+                ],
+              },
+            ],
+            sanctionsScreen: {
+              totalAvailable: 1,
+              totalAvailableBasis: 'exact',
+              hasMore: false,
+              screenedInputs: [],
+            },
+          },
+          {
+            lei: PARENT_LEI,
+            legalName: 'snake_case Parent PLC',
+            jurisdiction: 'GB',
+            depth: 1,
+            role: 'parent',
+          },
+        ],
+        edges: [
+          {
+            childLei: LEI,
+            parentLei: PARENT_LEI,
+            relationshipType: 'IS_DIRECTLY_CONSOLIDATED_BY',
+            relationshipStatus: 'ACTIVE',
+          },
+        ],
+        boundaries: [],
+        totalAvailable: 3,
+        totalAvailableBasis: 'exact',
+        hasMore: false,
+        truncationReasons: [],
+        missingEntityCount: 0,
+        complete: true,
+        truncated: false,
+        reportingExceptionsLoaded: true,
+        missingEntityLeis: [],
+        screeningStatus: 'screened',
+        screenedNodeCount: 1,
+        flaggedNodeCount: 1,
+        caveat: SCREENING_CAVEAT,
+      }),
+    ).toEqual(
+      expect.arrayContaining([
+        `- **AT&T C# 12 Holdings** \`${LEI}\` — root, depth 0 (US-DE, ISSUED)`,
+        '  - ultimate parent: reporting exception (NATURAL_PERSONS, NON_CONSOLIDATING)',
+        '  - ⚠ AT&T C# 12 Holdings — UK Sanctions List (`uk`, entry FX-2002): matched "ACME LTD" — exact — matched on: other_name "ACME LTD" (TRADING_OR_OPERATING_NAME)',
+        `- **snake_case Parent PLC** \`${PARENT_LEI}\` — parent, depth 1 (GB)`,
+        `- \`${LEI}\` IS_DIRECTLY_CONSOLIDATED_BY \`${PARENT_LEI}\` (ACTIVE)`,
+      ]),
+    );
+  });
+});
+
+describe('sanctions list text in content[] (issue #96)', () => {
+  /**
+   * Every Markdown construct, plus values the authored text after them could
+   * complete (an entity name closed by a `;`, a trailing backslash before
+   * authored punctuation).
+   */
+  const UPSTREAM_VALUES = [...CONSTRUCT_VALUES, 'Sierra &amp', 'Tango &#35', 'Yankee \\'];
+
+  /** Values with no Markdown-active character, which render byte-identically to the unescaped template. */
+  const PLAIN_VALUES = [
+    'ACME LTD',
+    'snake_case',
+    'AT&T',
+    'C# 12',
+    'a # b',
+    '<=50',
+    'C:\\Users\\x',
+    'ofac_sdn',
+    'TRADING_OR_OPERATING_NAME',
+    'Ivan Wolkow',
+  ];
+
+  const screenName = (fill: Fill) => ({
+    hits: [
+      {
+        source: 'ofac_sdn',
+        sourceLabel: 'OFAC Specially Designated Nationals (SDN) List',
+        sourceEntryId: fill(),
+        sources: ['ofac_sdn', 'ofac_consolidated'],
+        referenceNumber: fill(),
+        unReferenceNumber: fill(),
+        entityType: 'person',
+        primaryName: fill('heading'),
+        matchedName: fill(),
+        matchedNameType: 'aka',
+        matchType: 'approximate',
+        score: 0.912,
+        queryTokenCoverage: { covered: 2, total: 3, phonetic: 1 },
+        program: fill(),
+        designationDate: fill(),
+        birthDates: [{ date: fill(), circa: true }, { date: fill() }],
+        nationalities: [fill(), fill(), fill()],
+        addressCountries: [fill(), fill()],
+      },
+      {
+        source: 'un',
+        sourceLabel: 'UN Security Council Consolidated List',
+        sourceEntryId: fill(),
+        sources: ['un'],
+        entityType: 'organization',
+        primaryName: fill('heading'),
+        matchedName: fill(),
+        matchedNameType: 'primary',
+        matchType: 'exact',
+      },
+    ],
+    caveat: SCREENING_CAVEAT,
+  });
+
+  const screenIdentifier = (fill: Fill) => ({
+    hits: [
+      {
+        source: 'ofac_sdn',
+        sourceLabel: 'OFAC Specially Designated Nationals (SDN) List',
+        sourceEntryId: fill(),
+        sources: ['ofac_sdn', 'ofac_consolidated'],
+        primaryName: fill('heading'),
+        entityType: 'vessel',
+        program: fill(),
+        matchedIdentifiers: [
+          { type: fill(), value: fill() },
+          { type: fill(), value: fill(), country: fill() },
+        ],
+      },
+      {
+        source: 'eu',
+        sourceLabel: 'EU Consolidated Financial Sanctions List',
+        sourceEntryId: fill(),
+        sources: ['eu'],
+        primaryName: fill('heading'),
+        entityType: 'organization',
+        matchedIdentifiers: [{ type: fill(), value: fill() }],
+      },
+    ],
+    caveat: SCREENING_CAVEAT,
+  });
+
+  const designation = (fill: Fill) => ({
+    source: 'uk',
+    sourceLabel: 'UK Sanctions List (FCDO)',
+    sourceEntryId: fill(),
+    referenceNumber: fill(),
+    unReferenceNumber: fill(),
+    entityType: 'person',
+    primaryName: fill('heading'),
+    program: fill(),
+    legalBasis: fill(),
+    designationDate: fill(),
+    aliases: [
+      { name: fill(), nameType: 'aka' },
+      { name: fill(), nameType: 'fka' },
+      { name: fill(), nameType: 'low-quality-aka' },
+    ],
+    identifiers: [
+      { type: fill(), value: fill(), country: fill() },
+      { type: fill(), value: fill() },
+    ],
+    addresses: [{ full: fill(), country: fill() }, { full: fill() }],
+    datesOfBirth: [
+      { date: fill(), place: fill() },
+      { date: fill(), circa: true, place: fill() },
+      { date: fill() },
+      { place: fill() },
+    ],
+    nationalities: [fill(), fill(), fill()],
+    features: [
+      { type: fill(), value: fill() },
+      { type: fill(), value: fill(), circa: true },
+    ],
+    remarks: fill(),
+    caveat: SCREENING_CAVEAT,
+  });
+
+  const TOOLS = [
+    ['sanctions_screen_name', screenNameTool, screenName],
+    ['sanctions_screen_identifier', screenIdentifierTool, screenIdentifier],
+    ['sanctions_get_designation', getDesignationTool, designation],
+  ] as const;
+
+  it('sanctions_list_sources: each configured URL renders as a link to itself', () => {
+    const url = 'https://feeds.example.invalid/a_b*c~d/(list)?q=<1>&r=[2]';
+    const text = render(listSourcesTool, {
+      sanctionsReady: true,
+      sanctionsAsOf: '2026-11-18T04:00:00.000Z',
+      leiReady: false,
+      reportingExceptionsLoaded: false,
+      alternateNamesIndexed: false,
+      entityStatusLoaded: false,
+      sources: [
+        {
+          code: 'ofac_sdn',
+          label: 'OFAC Specially Designated Nationals (SDN) List',
+          recordCount: 17_004,
+          lastHarvestedAt: '2026-11-19T04:01:02.345Z',
+          url,
+          license: 'US Government public domain',
+        },
+      ],
+    });
+    const source = readBlocks(text).find((block) => block.text.includes('\nSource: '));
+
+    expect(source?.text.split('\n').at(-1)).toBe(`Source: ${url}`);
+    expect(source?.links).toEqual([url]);
+    expect(source?.marks.at(-1)).toBe('link');
+  });
+
+  it.each(TOOLS)(
+    '%s: every upstream value reads back from content[] as published',
+    (_name, tool, build) => {
+      expectReadBack(tool, build, UPSTREAM_VALUES);
+    },
+  );
+
+  it.each(TOOLS)(
+    '%s: a value with no Markdown-active character renders byte-identically',
+    (_name, tool, build) => {
+      expectByteIdentical(tool, build, PLAIN_VALUES);
+    },
+  );
+
+  it('sanctions_get_designation: a "7. " alias stays one list item and a "# " remark line stays in the remark', () => {
+    // eu 128875 publishes the alias; un 110334 the remark, verbatim.
+    const remarks =
+      'SSSI is owned or controlled by, or acts on behalf of, DIO. [Old Reference\n# E.29.I.19]';
+    const blocks = readBlocks(
+      render(getDesignationTool, {
+        ...designation(() => 'Kaniyat Militia'),
+        aliases: [{ name: '7. Brigade', nameType: 'aka' }],
+        remarks,
+      }),
+    );
+
+    expect(blocks.find((block) => block.text.startsWith('7. Brigade'))).toMatchObject({
+      kind: 'paragraph',
+      containers: ['bullet_list'],
+      text: '7. Brigade (aka)',
+    });
+    expect(blocks.find((block) => block.text.startsWith('Remarks:'))).toMatchObject({
+      kind: 'paragraph',
+      containers: [],
+      text: `Remarks: ${remarks}`,
+    });
+    // The record's name and the section headings, nothing from the remark.
+    expect(blocks.filter((block) => block.kind === 'heading').map((block) => block.text)).toEqual([
+      'Kaniyat Militia',
+      'Aliases',
+      'Identifiers',
+      'Addresses',
+      'Dates of birth',
+      'Features',
+    ]);
+  });
+
+  it('crossReferencePointer escapes its whole clause as one string', () => {
+    const pointer = crossReferencePointer('7. Brigade', '5493001KJTIIGC8Y1R12', [
+      { input: 'other_name', value: '*Echo* Ltd', nameType: 'TRADING_OR_OPERATING_NAME' },
+      { input: 'registration_number', value: 'Sierra &amp' },
+    ]);
+    const blocks = readBlocks(`Coverage — ${pointer}`);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({ kind: 'paragraph', containers: [], marks: [] });
+    expect(blocks[0]?.text).toBe(
+      'Coverage — re-screen "7. Brigade", "*Echo* Ltd" with sanctions_screen_name and look up 5493001KJTIIGC8Y1R12, Sierra &amp with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches, which this count leaves out.',
+    );
+  });
+
+  it.each([
+    ['one long line ending in a break', (length: number) => `${'§1 x'.repeat(length / 4)}\ny`],
+    ['line breaks throughout', (length: number) => '  \r\n'.repeat(length / 4)],
+  ])(
+    'sanctions_get_designation: a remark of growing length renders in time that stays linear — %s',
+    async (_shape, build) => {
+      const record = getDesignationTool.output.parse(designation(() => 'Kaniyat Militia'));
+      const format = (remarks: string) => getDesignationTool.format?.({ ...record, remarks });
+      await expectLinearTime(format, build, 320_000, 200);
+    },
+    0,
+  );
+});
+
+describe('the content[] read-back harness (_markdown-readback.ts)', () => {
+  /** Where a format prints an upstream string: ending a heading, as a whole list item, and in a table cell. */
+  const SLOTS = {
+    heading: (text: string) => `# Record ${text}`,
+    item: (text: string) => `- ${text}`,
+    cell: (text: string) => `| Field | Value |\n| --- | --- |\n| Remarks | ${text} |`,
+  };
+  type Slot = keyof typeof SLOTS;
+  const SLOT_NAMES = Object.keys(SLOTS) as Slot[];
+
+  /** A format-only tool printing each slot through `escapeMarkdownInline`, except `raw`, printed as it came, and `omit`, left out. */
+  const fakeTool = ({ raw, omit }: { raw?: Slot; omit?: Slot } = {}) =>
+    tool('harness_self_test', {
+      description: 'Prints one upstream string in a heading, a list item, and a table cell.',
+      input: z.object({}),
+      output: z.object({ heading: z.string(), item: z.string(), cell: z.string() }),
+      handler() {
+        throw new Error('The self-test renders format() alone.');
+      },
+      format: (result) => [
+        {
+          type: 'text',
+          text: SLOT_NAMES.filter((slot) => slot !== omit)
+            .map((slot) =>
+              SLOTS[slot](slot === raw ? result[slot] : escapeMarkdownInline(result[slot])),
+            )
+            .join('\n\n'),
+        },
+      ],
+    });
+
+  // A table row ends at a line break, as a heading does, so the cell holds one line too.
+  const build = (fill: Fill) => ({ heading: fill('heading'), item: fill(), cell: fill('heading') });
+
+  /** Whether `expectReadBack` fails `definition` with `value` in every slot; any other error is rethrown. */
+  const fails = (definition: AnyToolDefinition, value: string) => {
+    try {
+      expectReadBack(definition, build, [value]);
+      return false;
+    } catch (error) {
+      if (!(error instanceof Error && error.name === 'AssertionError')) throw error;
+      return true;
+    }
+  };
+
+  it('passes a format that escapes every slot, for every construct value', () => {
+    expectReadBack(fakeTool(), build, CONSTRUCT_VALUES);
+  });
+
+  it('fails a format that prints one slot raw, for every construct value', () => {
+    /**
+     * A construct is syntax only in its own place (`Oscar #` ending a heading,
+     * `Mike | November` in a table cell, `***` alone on a line), so each value
+     * must fail in at least one slot. `<b>Hotel</b>` reads back as the same text
+     * raw or escaped: only the structure comparison tells them apart.
+     */
+    const uncaught = CONSTRUCT_VALUES.filter(
+      (value) => !SLOT_NAMES.some((raw) => fails(fakeTool({ raw }), value)),
+    );
+    expect(uncaught).toEqual([]);
+  });
+
+  it('fails a format that never prints a filled slot', () => {
+    for (const omit of SLOT_NAMES) {
+      expect(() => expectReadBack(fakeTool({ omit }), build, CONSTRUCT_VALUES), omit).toThrow(
+        /never prints/,
+      );
+    }
   });
 });

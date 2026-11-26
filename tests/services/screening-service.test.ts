@@ -321,6 +321,196 @@ describe('screenName — legal-form spellings (issue #90)', () => {
   });
 });
 
+describe('screenName — public-company spellings of PLC (issue #101)', () => {
+  const MEHL = 'a90c8b8a90682c265b5f4fd4da267ace4ad1cb81adc2eb0fdf739c0a';
+  /** Published records holding `PLC` or a public-company spelling of it, under their own list and entry IDs. */
+  const PUBLIC_COMPANY_DESIGNATIONS = [
+    withAliases('ofac_sdn', '58644', 'MERITWISE GROUP PUBLIC LTD', []),
+    withAliases('ofac_sdn', '31517', 'Myanma Economic Holdings Public Company Limited', [
+      'Myanmar Economic Holding Limited',
+      'MEHL',
+    ]),
+    withAliases('ofac_sdn', '35838', 'Asia Green Development Bank Ltd', [
+      'Asia Green Development Bank Public Company Limited',
+      'Asia Green Development Bank Limited',
+      'AGD Bank',
+    ]),
+    withAliases(
+      'ofac_sdn',
+      '50005',
+      'Scientific Research Institute for Optoelectronic Instrument Engineering',
+      [
+        'Public Limited Company Scientific Research Institute For Optoelectronic Instrument Engineering',
+        'AO NII OEP',
+      ],
+    ),
+    withAliases('eu', '129450', 'Myanmar  Economic  Holdings  Public  Company  Ltd', []),
+    withAliases('eu', '179619', 'Evraz PLC', ['Evraz Nyrt.']),
+    withAliases('uk', 'GHR0080', 'Myanmar Economic Holdings Public Company Ltd', [
+      'MEHL',
+      'Myanmar Economic Holdings Limited',
+    ]),
+    withAliases('uk', 'RUS1027', 'Evraz PLC', ['Евраз']),
+    withAliases(
+      'bis_el',
+      MEHL,
+      'Myanmar Economic Holdings Limited',
+      [
+        'MEHL',
+        'Myanma Economic Holdings Limited',
+        'Myanma Economic Holdings Public Company Limited',
+        'Myanmar Business Holdings Public Company Limited',
+        'Myanmar Economic Holdings Public Company Limited',
+        'UMEH',
+        'Union of Myanmar Economic Holdings Company Limited',
+        'Union of Myanmar Economic Holdings Limited.',
+      ],
+      'unknown',
+    ),
+  ];
+
+  beforeEach(async () => {
+    await svc.ingestDesignations(PUBLIC_COMPANY_DESIGNATIONS);
+  });
+
+  const strictOnly = (query: string) =>
+    svc.screenName({ ...screenDefaults, limit: 100, query, autoFallback: false }, ctx);
+  const rows = (
+    hits: readonly { designationId: string; matchType: string; matchedName: string }[],
+  ) => hits.map((hit) => `${hit.designationId} ${hit.matchType} ${hit.matchedName}`);
+
+  it.each([
+    ['Meritwise Group PLC', ['ofac_sdn:58644 strong MERITWISE GROUP PUBLIC LTD']],
+    [
+      'Myanmar Economic Holdings PLC',
+      [
+        'eu:129450 strong Myanmar  Economic  Holdings  Public  Company  Ltd',
+        'uk:GHR0080 strong Myanmar Economic Holdings Public Company Ltd',
+        `bis_el:${MEHL} strong Myanmar Economic Holdings Public Company Limited`,
+      ],
+    ],
+    [
+      'Asia Green Development Bank PLC',
+      ['ofac_sdn:35838 strong Asia Green Development Bank Public Company Limited'],
+    ],
+    ['Evraz Public Ltd', ['eu:179619 strong Evraz PLC', 'uk:RUS1027 strong Evraz PLC']],
+    ['Evraz Public Company Limited', ['eu:179619 strong Evraz PLC', 'uk:RUS1027 strong Evraz PLC']],
+    // The same form spelled two ways inside one longer name.
+    [
+      'Public Ltd Scientific Research Institute For Optoelectronic Instrument Engineering',
+      [
+        'ofac_sdn:50005 strong Public Limited Company Scientific Research Institute For Optoelectronic Instrument Engineering',
+      ],
+    ],
+  ])('matches %j, a PLC spelled another way, as strong', async (query, expected) => {
+    expect(rows((await strictOnly(query)).hits)).toEqual(expected);
+  });
+
+  it.each([
+    [
+      'Myanma Economic Holdings Ltd',
+      [
+        'ofac_sdn:31517 strong Myanma Economic Holdings Public Company Limited',
+        `bis_el:${MEHL} strong Myanma Economic Holdings Limited`,
+      ],
+    ],
+    [
+      'Myanma Economic Holdings Co Ltd',
+      [
+        'ofac_sdn:31517 strong Myanma Economic Holdings Public Company Limited',
+        `bis_el:${MEHL} strong Myanma Economic Holdings Public Company Limited`,
+      ],
+    ],
+    [
+      'Myanmar Economic Holdings Company Limited',
+      [
+        'eu:129450 strong Myanmar  Economic  Holdings  Public  Company  Ltd',
+        'uk:GHR0080 strong Myanmar Economic Holdings Public Company Ltd',
+        `bis_el:${MEHL} strong Myanmar Economic Holdings Public Company Limited`,
+      ],
+    ],
+    ['Meritwise Group Ltd', ['ofac_sdn:58644 strong MERITWISE GROUP PUBLIC LTD']],
+    ['Meritwise Group Limited', ['ofac_sdn:58644 strong MERITWISE GROUP PUBLIC LTD']],
+    [
+      'Asia Green Development Bank Co Ltd',
+      ['ofac_sdn:35838 strong Asia Green Development Bank Public Company Limited'],
+    ],
+  ])(
+    'keeps the strict hits of %j, read word by word in the stored name (characterization)',
+    async (query, expected) => {
+      expect(rows((await strictOnly(query)).hits)).toEqual(expected);
+    },
+  );
+
+  it('never reads Ltd inside Public Limited Company, and keeps that alias exact', async () => {
+    const ltd = await strictOnly(
+      'Scientific Research Institute For Optoelectronic Instrument Engineering Ltd',
+    );
+    expect(rows(ltd.hits)).toEqual([]);
+    const alias = await strictOnly(
+      'Public Limited Company Scientific Research Institute For Optoelectronic Instrument Engineering',
+    );
+    expect(rows(alias.hits)).toEqual([
+      'ofac_sdn:50005 exact Public Limited Company Scientific Research Institute For Optoelectronic Instrument Engineering',
+    ]);
+  });
+
+  it('reads a stored name one way at a time, never as PLC and Ltd at once (characterization)', async () => {
+    expect(rows((await strictOnly('Meritwise Group PLC Ltd')).hits)).toEqual([]);
+  });
+
+  it.each([
+    // The query read word by word holds `ltd` twice; read longest first, `plc` and `ltd`.
+    [
+      'Myanma Economic Holdings Public Company Limited Ltd',
+      [
+        'ofac_sdn:31517 strong Myanma Economic Holdings Public Company Limited',
+        `bis_el:${MEHL} strong Myanma Economic Holdings Public Company Limited`,
+      ],
+    ],
+    // Never ofac_sdn 50005: `Public Limited Company` reads as `plc` alone, which holds no `ltd`.
+    [
+      'Public Company Limited Ltd',
+      [
+        'ofac_sdn:31517 strong Myanma Economic Holdings Public Company Limited',
+        'ofac_sdn:35838 strong Asia Green Development Bank Public Company Limited',
+        'eu:129450 strong Myanmar  Economic  Holdings  Public  Company  Ltd',
+        'uk:GHR0080 strong Myanmar Economic Holdings Public Company Ltd',
+        `bis_el:${MEHL} strong Myanma Economic Holdings Public Company Limited`,
+      ],
+    ],
+  ])(
+    'reads a query holding a public-company spelling word by word too: %j',
+    async (query, expected) => {
+      expect(rows((await strictOnly(query)).hits)).toEqual(expected);
+    },
+  );
+
+  it('matches a stored X Public Co Ltd, which spells no PLC, for the query X Public Company Limited', async () => {
+    await svc.ingestDesignations([
+      withAliases('ofac_sdn', 'NWS-1', 'Northwind Shipping Public Co Ltd', []),
+    ]);
+    expect(rows((await strictOnly('Northwind Shipping Public Company Limited')).hits)).toEqual([
+      'ofac_sdn:NWS-1 strong Northwind Shipping Public Co Ltd',
+    ]);
+    // Read longest first, the query is `plc`, which that name never spells.
+    expect(rows((await strictOnly('Northwind Shipping PLC')).hits)).toEqual([]);
+  });
+
+  it('keeps exact for normalized equality and leaves the normalized query unfolded', async () => {
+    const plc = await strictOnly('Meritwise Group PLC');
+    expect(plc.normalizedQuery).toBe('meritwise group plc');
+    expect(plc).toMatchObject({ totalAvailable: 1, totalAvailableBasis: 'exact' });
+    const spelled = await strictOnly('Myanmar Economic Holdings Public Company Ltd');
+    expect(spelled.normalizedQuery).toBe('myanmar economic holdings public company ltd');
+    expect(rows(spelled.hits)).toEqual([
+      'eu:129450 exact Myanmar  Economic  Holdings  Public  Company  Ltd',
+      'uk:GHR0080 exact Myanmar Economic Holdings Public Company Ltd',
+      `bis_el:${MEHL} strong Myanmar Economic Holdings Public Company Limited`,
+    ]);
+  });
+});
+
 describe('screenName — fuzzy fallback', () => {
   it('keeps original query-token coverage when romanization removes a standalone sign', async () => {
     await svc.ingestDesignations([namedDesignation('SIGN-ROSNEFT', 'Rosneft')]);
@@ -2832,7 +3022,7 @@ describe('per-list completion of a name in another script (issue #87)', () => {
     expect(res.fuzzySources).toEqual([...SOURCE_CODES]);
   });
 
-  it('completes the UN list the same way, and leaves every other list settled by its native-script strict hit', async () => {
+  it('completes the UN list the same way, and reads every other list its native-script strict hit settled for whole romanized words alone', async () => {
     await svc.ingestDesignations([
       aliased('un', 'UN-1', 'Aleksandr Vasilyevich BORTNIKOV', [BORTNIKOV]),
       listed('un', 'UN-2', 'Aleksandr Vasilyevich BORTNIKOV'),
@@ -2840,7 +3030,8 @@ describe('per-list completion of a name in another script (issue #87)', () => {
       listed('eu', 'EU-2', 'Aleksandr Vasilyevich BORTNIKOV'),
     ]);
     const res = await screen(BORTNIKOV);
-    expect(res.fuzzySources).toEqual(SOURCE_CODES.filter((code) => code !== 'eu'));
+    // The EU is searched too, by the romanized read (issue #99).
+    expect(res.fuzzySources).toEqual([...SOURCE_CODES]);
     expect(rows(res.hits).sort()).toEqual([
       'eu:EU-1 exact',
       'uk:CHW0014 approximate 3/3',
@@ -2848,7 +3039,8 @@ describe('per-list completion of a name in another script (issue #87)', () => {
       'un:UN-1 exact',
       'un:UN-2 approximate 3/3',
     ]);
-    // The EU's Latin-only record is a candidate its strict hit leaves unsearched.
+    // The EU's Latin-only record spells `Vasilyevich`, the romanization `vasilevich`:
+    // the romanized read needs the romanization's own words, so only fuzzy mode reaches it.
     const fuzzy = await screen(BORTNIKOV, { matchMode: 'fuzzy' });
     expect(ids(fuzzy.hits)).toContain('eu:EU-2');
   });
@@ -2862,6 +3054,273 @@ describe('per-list completion of a name in another script (issue #87)', () => {
     expect(ids(res?.hits ?? [])).toEqual(['uk:RUS0084']);
     expect(res).toMatchObject({ modeUsed: 'strict', totalAvailableBasis: 'exact' });
     expect(res?.fuzzySources).toBeUndefined();
+  });
+});
+
+describe('the romanized read of the lists a native-script strict hit settled (issue #99)', () => {
+  /** One organization on `source` named `name`, also published under each of `aliases`. */
+  const organization = (
+    id: string,
+    name: string,
+    aliases: string[] = [],
+    entityType: NormalizedDesignation['entityType'] = 'organization',
+  ): NormalizedDesignation => {
+    const [source, entryId] = id.split(':') as [SourceCode, string];
+    const designation = listed(source, entryId, name, entityType);
+    return {
+      ...designation,
+      payload: {
+        ...designation.payload,
+        aliases: aliases.map((alias) => ({ name: alias, nameType: 'aka' as const })),
+      },
+    };
+  };
+  const UNMANNED = 'Беспилотные системы';
+  /** The read's FTS expression for `UNMANNED`: both romanized words, whole, on one column. */
+  const UNMANNED_READ = 'comparison_normalized : ("bespilotnye" AND "sistemy")';
+
+  beforeEach(async () => {
+    await svc.ingestDesignations([
+      // Strict reaches the Cyrillic alias; the Latin one spells `obyedineniye`, not the romanization's `obedinenie`.
+      organization(
+        'ofac_sdn:35337',
+        'IZHEVSK UNMANNED SYSTEMS RESEARCH AND PRODUCTION ASSOCIATED LIMITED LIABILITY COMPANY',
+        ['ООО НАУЧНО-ПРОИЗВОДСТВЕННОЕ ОБЪЕДИНЕНИЕ ИЖЕВСКИЕ БЕСПИЛОТНЫЕ СИСТЕМЫ'],
+      ),
+      // Published only in transliteration: the record the read exists for.
+      organization('ofac_sdn:49352', 'LIMITED LIABILITY COMPANY UNMANNED SYSTEMS', [
+        'Bespilotnye Sistemy',
+      ]),
+      // `sistemyy` opens with `sistemy` but is another word; `Sistemy Trading` lacks a word.
+      organization('ofac_sdn:PRE-1', 'Bespilotnye Sistemyy Group'),
+      organization('ofac_sdn:ONE-1', 'Sistemy Trading'),
+      organization('eu:175107', 'Limited Liability Company Unmanned Systems', [
+        'ООО “Беспилотные Системы”',
+      ]),
+    ]);
+  });
+
+  const screen = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, limit: 100, query, ...extra }, ctx);
+  const ids = (hits: readonly { designationId: string }[]) => hits.map((hit) => hit.designationId);
+  /** Each hit as `id matchType`, with its coverage when it carries one. */
+  const rows = (
+    hits: readonly {
+      designationId: string;
+      matchType: string;
+      queryTokenCoverage?: { covered: number; total: number };
+    }[],
+  ) =>
+    hits.map(({ designationId, matchType, queryTokenCoverage: cov }) =>
+      [designationId, matchType, cov && `${cov.covered}/${cov.total}`].filter(Boolean).join(' '),
+    );
+  /** The romanized reads `run` issued, as the FTS expressions they bound. */
+  const romanizedReads = async <T>(run: () => Promise<T>) => {
+    const trace = await traceNameIndex(await svc.designations.raw(), run);
+    return {
+      result: trace.result,
+      reads: trace.lookups
+        .map(({ expression }) => expression)
+        .filter((expression) => expression.startsWith('comparison_normalized : (')),
+    };
+  };
+
+  it('returns a settled list’s transliterated-only record as approximate, after the strict hits', async () => {
+    const res = await screen(UNMANNED);
+    expect(rows(res.hits)).toEqual([
+      'ofac_sdn:35337 strong',
+      'eu:175107 strong',
+      'ofac_sdn:49352 approximate 2/2',
+    ]);
+    expect(res.hits[2]).toMatchObject({
+      matchedName: 'Bespilotnye Sistemy',
+      matchedNameType: 'aka',
+      score: 1,
+    });
+    // ofac_sdn and eu by the read, every other list by the fuzzy completion.
+    expect(res).toMatchObject({
+      modeUsed: 'strict',
+      fuzzyFallbackTriggered: false,
+      fuzzySources: [...SOURCE_CODES],
+      totalAvailable: 3,
+      totalAvailableBasis: 'lower_bound',
+    });
+  });
+
+  it('reads each settled list once, for every romanized word as a whole word', async () => {
+    const { reads, result } = await romanizedReads(() =>
+      screen(UNMANNED, { sources: ['ofac_sdn'] }),
+    );
+    expect(reads).toEqual([UNMANNED_READ]);
+    expect(ids(result.hits)).toEqual(['ofac_sdn:35337', 'ofac_sdn:49352']);
+    // The read alone ran: no candidate budget, so the count stays the whole set.
+    expect(result).toMatchObject({
+      modeUsed: 'strict',
+      fuzzyFallbackTriggered: false,
+      fuzzySources: ['ofac_sdn'],
+      poolBounded: false,
+      totalAvailable: 2,
+      totalAvailableBasis: 'exact',
+    });
+  });
+
+  it('keeps the type filter on the romanized read, unknown types included', async () => {
+    await svc.ingestDesignations([
+      organization('ofac_sdn:UNK-0', 'Беспилотные системы', [], 'unknown'),
+      organization('ofac_sdn:UNK-1', 'Bespilotnye Sistemy Bureau', [], 'unknown'),
+    ]);
+    const res = await screen(UNMANNED, { sources: ['ofac_sdn'], entityType: 'person' });
+    expect(rows(res.hits)).toEqual(['ofac_sdn:UNK-0 exact', 'ofac_sdn:UNK-1 approximate 2/2']);
+  });
+
+  it('returns a designation strict reached once, as its strict hit, OFAC copies included', async () => {
+    await svc.ingestDesignations([
+      // The Consolidated copy of 35337 publishes only the transliteration.
+      organization(
+        'ofac_consolidated:35337',
+        'IZHEVSK UNMANNED SYSTEMS RESEARCH AND PRODUCTION ASSOCIATED LIMITED LIABILITY COMPANY',
+        ['OOO NAUCHNO-PROIZVODSTVENNOYE OBYEDINENIYE IZHEVSKIYE BESPILOTNYE SISTEMY'],
+      ),
+      organization('ofac_consolidated:CON-1', 'Беспилотные системы'),
+    ]);
+    const { reads, result } = await romanizedReads(() =>
+      screen(UNMANNED, { sources: ['ofac_sdn', 'ofac_consolidated'] }),
+    );
+    expect(reads).toEqual([UNMANNED_READ]);
+    expect(rows(result.hits)).toEqual([
+      'ofac_consolidated:CON-1 exact',
+      'ofac_sdn:35337 strong',
+      'ofac_sdn:49352 approximate 2/2',
+    ]);
+    expect(result.hits[1]?.sources).toEqual(['ofac_sdn', 'ofac_consolidated']);
+    expect(result).toMatchObject({ totalAvailable: 3, totalAvailableBasis: 'exact' });
+  });
+
+  it('pages the romanized hits with the strict ones, limit 1, to past the end', async () => {
+    const walks: [SourceCode[], string[], 'exact' | 'lower_bound'][] = [
+      [['ofac_sdn'], ['ofac_sdn:35337', 'ofac_sdn:49352'], 'exact'],
+      [[...SOURCE_CODES], ['ofac_sdn:35337', 'eu:175107', 'ofac_sdn:49352'], 'lower_bound'],
+    ];
+    for (const [sources, expected, basis] of walks) {
+      const paged: string[] = [];
+      for (let offset = 0; offset <= expected.length; offset++) {
+        const page = await screen(UNMANNED, { sources, limit: 1, offset });
+        expect(page).toMatchObject({ totalAvailable: expected.length, totalAvailableBasis: basis });
+        expect(page.hits).toHaveLength(offset < expected.length ? 1 : 0);
+        paged.push(...ids(page.hits));
+      }
+      expect(paged).toEqual(expected);
+    }
+  });
+
+  it('ranks the read’s hits with the completion’s as one set, by score then identity, and pages across both', async () => {
+    await svc.ingestDesignations([
+      // Two read hits written against identity order: 10 before 9.
+      organization('ofac_sdn:10', 'Bespilotnye Sistemy Holding'),
+      organization('ofac_sdn:9', 'Bespilotnye Sistemy Plant'),
+      // A UK spelling the completion admits below 1: `bespilotnyye` 0.9833, `sistemi` 0.9429.
+      organization('uk:SPL-1', 'Bespilotnyye Sistemi'),
+    ]);
+    const res = await screen(UNMANNED);
+    expect(rows(res.hits)).toEqual([
+      'ofac_sdn:35337 strong',
+      'eu:175107 strong',
+      'ofac_sdn:9 approximate 2/2',
+      'ofac_sdn:10 approximate 2/2',
+      'ofac_sdn:49352 approximate 2/2',
+      'uk:SPL-1 approximate 2/2',
+    ]);
+    expect(res.hits.map((hit) => hit.score)).toEqual([undefined, undefined, 1, 1, 1, 0.9833]);
+    // A page holding the last read hit and the completion's hit.
+    const page = await screen(UNMANNED, { limit: 2, offset: 4 });
+    expect(ids(page.hits)).toEqual(['ofac_sdn:49352', 'uk:SPL-1']);
+    expect(page).toMatchObject({ totalAvailable: 6, totalAvailableBasis: 'lower_bound' });
+  });
+
+  it('never reads the UK or UN lists, which the completion searches instead', async () => {
+    await svc.ingestDesignations([
+      organization('eu:MER-0', 'Мэр Мер'),
+      // Hold the one romanized word `mer` whole, but a single word for the query's two.
+      organization('uk:MER-2', 'Mer Trading'),
+      organization('un:MER-3', 'Mer Trading'),
+    ]);
+    const { reads, result } = await romanizedReads(() => screen('Мэр Мер'));
+    expect(reads).toEqual(['comparison_normalized : ("mer")']);
+    expect(ids(result.hits)).toEqual(['eu:MER-0']);
+    expect(result.fuzzySources).toEqual([...SOURCE_CODES]);
+  });
+
+  it('keeps a name holding a word for each native word the romanization spells: Мэр Мер reads Mer Mer, never Mer Trading', async () => {
+    await svc.ingestDesignations([
+      organization('eu:MER-0', 'Мэр Мер'),
+      // `мэр` and `мер` both romanize to `mer`: two native words, a `mer` for each.
+      organization('eu:MER-1', 'Mer Mer'),
+      // Holds the one romanized word `mer` whole, but a single word for the query's two.
+      organization('eu:MER-2', 'Mer Trading'),
+    ]);
+    const { reads, result } = await romanizedReads(() => screen('Мэр Мер', { sources: ['eu'] }));
+    expect(ids(result.hits)).not.toContain('eu:MER-2');
+    expect(rows(result.hits)).toEqual(['eu:MER-0 exact', 'eu:MER-1 approximate 2/2']);
+    expect(reads).toEqual(['comparison_normalized : ("mer")']);
+  });
+
+  it('holds each comparison form of a name to every native word on its own, never the forms joined', async () => {
+    await svc.ingestDesignations([
+      organization('eu:EL-0', 'Эль Ель Банк'),
+      organization('eu:EL-1', 'El El Bank'),
+      // Its fold `el банк` and romanization `el bank` hold `el` twice between them, each once.
+      organization('eu:EL-2', 'El Банк'),
+    ]);
+    const { reads, result } = await romanizedReads(() =>
+      screen('Эль Ель Банк', { sources: ['eu'] }),
+    );
+    expect(rows(result.hits)).toEqual(['eu:EL-0 exact', 'eu:EL-1 approximate 3/3']);
+    expect(reads).toEqual(['comparison_normalized : ("el" AND "bank")']);
+  });
+
+  it('reads nothing for a Latin-script name (characterization)', async () => {
+    const { reads, result } = await romanizedReads(() =>
+      screen('Bespilotnye Sistemy', { sources: ['ofac_sdn'] }),
+    );
+    expect(reads).toEqual([]);
+    expect(rows(result.hits)).toEqual(['ofac_sdn:49352 exact']);
+    expect(result.fuzzySources).toBeUndefined();
+    expect(result.totalAvailableBasis).toBe('exact');
+  });
+
+  it('reads nothing for a native-script name without a romanization, or one that romanizes to nothing (characterization)', async () => {
+    await svc.ingestDesignations([
+      organization('eu:GRK-1', 'Αφγανική Επιτροπή Στήριξης'),
+      organization('eu:GRK-2', 'Afganiki Epitropi Stiriksis'),
+      // `ъ` romanizes to nothing, so the query has no romanized word to read.
+      organization('eu:HRD-1', 'Ъ'),
+    ]);
+    for (const [query, strictHit] of [
+      ['Αφγανική Επιτροπή Στήριξης', 'eu:GRK-1'],
+      ['Ъ', 'eu:HRD-1'],
+    ] as const) {
+      const { reads, result } = await romanizedReads(() => screen(query, { sources: ['eu'] }));
+      expect(reads, query).toEqual([]);
+      expect(ids(result.hits), query).toEqual([strictHit]);
+      expect(result.fuzzySources, query).toBeUndefined();
+    }
+  });
+
+  it('reads nothing with autoFallback off or in fuzzy mode (characterization)', async () => {
+    const off = await romanizedReads(() => screen(UNMANNED, { autoFallback: false }));
+    expect(off.reads).toEqual([]);
+    expect(ids(off.result.hits)).toEqual(['ofac_sdn:35337', 'eu:175107']);
+    expect(off.result.fuzzySources).toBeUndefined();
+    expect(off.result.totalAvailableBasis).toBe('exact');
+    // Fuzzy mode's pass compares romanizations on every list already (issue #57).
+    const fuzzy = await romanizedReads(() =>
+      screen(UNMANNED, { matchMode: 'fuzzy', sources: ['ofac_sdn'] }),
+    );
+    expect(fuzzy.reads).toEqual([]);
+    expect(fuzzy.result.modeUsed).toBe('fuzzy');
+    expect(ids(fuzzy.result.hits)).toContain('ofac_sdn:49352');
   });
 });
 
@@ -3063,5 +3522,195 @@ describe('words that sound alike (issue #92)', () => {
     ]);
     expect(withSoundAlike[0]).toEqual(without[0]);
     expect(without).toHaveLength(1);
+  });
+});
+
+describe('a completion gives each query word its own word (issue #98)', () => {
+  const screen = (
+    query: string,
+    extra: Partial<Parameters<ScreeningService['screenName']>[0]> = {},
+  ) => svc.screenName({ ...screenDefaults, limit: 100, query, ...extra }, ctx);
+  const ids = (hits: readonly { designationId: string }[]) => hits.map((hit) => hit.designationId);
+  const coverageOf = (
+    hits: readonly {
+      designationId: string;
+      queryTokenCoverage?: { covered: number; phonetic?: number; total: number };
+    }[],
+    id: string,
+  ) => hits.find((hit) => hit.designationId === id)?.queryTokenCoverage;
+
+  beforeEach(async () => {
+    await svc.ingestDesignations([
+      // `PING AN`: the strict hit, then names sharing `ping`'s key PNK at 0.48–0.5.
+      listed('ofac_sdn', 'PNG-1', 'PING AN', 'vessel'),
+      // `an` ~ `a` spells (0.85), so only the sound floor keeps `ping` ~ `banca` out.
+      listed('eu', 'BNC-1', 'Banca Finservice S.A.', 'organization'),
+      // `an` ~ `and` spells (0.9111) against a stoplisted word, and `ping` ~ `bank` sounds.
+      listed('uk', 'BNK-1', 'Bank of Industry and Mine', 'organization'),
+      // `YOUNG YONG`: one word `Yong` covers both query words.
+      listed('ofac_sdn', 'YNG-1', 'YOUNG YONG', 'vessel'),
+      listed('eu', 'RYM-1', 'RYOM Yong'),
+      listed('eu', 'KIM-1', 'Yong Chol KIM'),
+      // Two words: `young` ~ `yung` by spelling, `yong` ~ `wong` by sound (0.8333).
+      listed('bis_el', 'WYF-1', 'Wong Yung Fai'),
+      // `Naim Qasim`: `nasim` covers both `naim` (0.9467) and `qasim` (0.8667).
+      listed('ofac_sdn', 'QSM-1', 'Qasim Naim'),
+      listed('eu', 'NSM-1', 'Al Nasim'),
+      listed('uk', 'NSM-2', 'Nasim al-Sahrawi'),
+      // And a two-word spelling of the same pair: `qasim` ~ `kassem` by sound (0.70).
+      listed('un', 'KSM-1', 'Kassem Naim'),
+    ]);
+  });
+
+  it('keeps fuzzy mode admitting and covering word by word (characterization)', async () => {
+    const ping = await screen('PING AN', { matchMode: 'fuzzy', sources: ['eu', 'uk'] });
+    expect(coverageOf(ping.hits, 'uk:BNK-1')).toEqual({ covered: 2, total: 2, phonetic: 1 });
+    expect(coverageOf(ping.hits, 'eu:BNC-1')).toEqual({ covered: 2, total: 2, phonetic: 1 });
+    const young = await screen('YOUNG YONG', { matchMode: 'fuzzy', sources: ['eu'] });
+    expect(coverageOf(young.hits, 'eu:RYM-1')).toEqual({ covered: 2, total: 2 });
+    const naim = await screen('Naim Qasim', { matchMode: 'fuzzy', sources: ['eu', 'uk'] });
+    expect(ids(naim.hits)).toEqual(expect.arrayContaining(['eu:NSM-1', 'uk:NSM-2']));
+  });
+
+  it('keeps a fuzzy LEI resolution covering word by word (characterization)', async () => {
+    await svc.ingestLeiEntities([
+      {
+        lei: '98000000000000YONG01',
+        legalName: 'Yong Trading Ltd',
+        otherNames: [],
+        jurisdiction: 'KP',
+        status: 'ISSUED',
+      },
+    ]);
+    const { matches } = await svc.resolveEntity(
+      { query: 'Young Yong Trading', matchMode: 'fuzzy', status: 'any', limit: 25 },
+      ctx,
+    );
+    // One word `Yong` covers `young` and `yong`: GLEIF still counts both.
+    expect(
+      matches
+        .filter((match) => match.lei.startsWith('98'))
+        .map((match) => [match.lei, match.queryTokenCoverage]),
+    ).toEqual([['98000000000000YONG01', { covered: 3, total: 3 }]]);
+  });
+
+  it('drops a candidate whose only sound match falls under the 0.65 floor', async () => {
+    const res = await screen('PING AN');
+    expect(ids(res.hits)).toEqual(['ofac_sdn:PNG-1']);
+  });
+
+  it('drops a candidate whose one word would cover two query words', async () => {
+    const young = await screen('YOUNG YONG');
+    expect(ids(young.hits)).toEqual(['ofac_sdn:YNG-1', 'bis_el:WYF-1']);
+    // The surfaced coverage stays per word: `yung` clears the floor against both (0.94, 0.85).
+    expect(coverageOf(young.hits, 'bis_el:WYF-1')).toEqual({ covered: 2, total: 2 });
+    const naim = await screen('Naim Qasim');
+    expect(ids(naim.hits)).toEqual(['ofac_sdn:QSM-1', 'un:KSM-1']);
+    expect(coverageOf(naim.hits, 'un:KSM-1')).toEqual({ covered: 2, total: 2, phonetic: 1 });
+  });
+
+  it('drops a candidate covering a distinctive word only through a stoplisted one', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'ALF-1', 'Альфа-Банк', 'organization'),
+      // `alfa` ~ `al` (0.8667) against a stoplisted word, `bank` ~ `bakr` (0.8667).
+      listed('uk', 'AQD-1', 'Abou Bakr Al Djazairi'),
+      listed('uk', 'LIB-1', 'Al Masraf Al Zirae Agricultural Bank', 'organization'),
+      listed('uk', 'RUS-1', 'Alfa-Bank JSC', 'organization'),
+    ]);
+    const res = await screen('Альфа-Банк');
+    expect(ids(res.hits)).toEqual(['eu:ALF-1', 'uk:RUS-1']);
+  });
+
+  it('drops a sound match of a word no spelling of it reaches: oleksiy ~ alexei (0.6429)', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'OLK-1', 'Oleksiy Petrenko'),
+      listed('uk', 'ALX-1', 'Alexei Petrenko'),
+    ]);
+    expect(ids((await screen('Oleksiy Petrenko')).hits)).toEqual(['eu:OLK-1']);
+    // A full pass still admits it on `petrenko` and counts `oleksiy` by sound.
+    const fuzzy = await screen('Oleksiy Petrenko', { matchMode: 'fuzzy', sources: ['uk'] });
+    expect(coverageOf(fuzzy.hits, 'uk:ALX-1')).toEqual({ covered: 2, total: 2, phonetic: 1 });
+  });
+
+  it('counts an identical query word once, as strict matching does', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'SLH-1', 'Saleh Mosfer Saleh al Shaer'),
+      listed('ofac_sdn', 'SLH-2', 'Al-Shaer Salih Misfer'),
+    ]);
+    const res = await screen('Saleh Mosfer Saleh al Shaer');
+    expect(ids(res.hits)).toEqual(['eu:SLH-1', 'ofac_sdn:SLH-2']);
+    // Coverage stays the per-word count: both `saleh` and the stoplisted `al`.
+    expect(coverageOf(res.hits, 'ofac_sdn:SLH-2')).toEqual({ covered: 5, total: 5 });
+  });
+
+  it('gives a repeated query word one name word, never one per occurrence: Saleh Saleh Mosfer covers 2 of 3', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'SLH-1', 'Saleh Mosfer Saleh al Shaer'),
+      // Each `saleh` of the query finds a `saleh` here, and `shaer` finds nothing.
+      listed('ofac_sdn', 'SLH-3', 'Saleh Saleh Mosfer'),
+    ]);
+    expect(ids((await screen('Saleh Mosfer Saleh al Shaer')).hits)).toEqual(['eu:SLH-1']);
+    // A full pass admits it on the spelled words, so the completion's rule is what drops it.
+    const fuzzy = await screen('Saleh Mosfer Saleh al Shaer', {
+      matchMode: 'fuzzy',
+      sources: ['ofac_sdn'],
+    });
+    expect(coverageOf(fuzzy.hits, 'ofac_sdn:SLH-3')).toEqual({ covered: 3, total: 5 });
+  });
+
+  it('counts two native words a romanization spells alike as two words: Мэр Мер keeps Mer Mer, never Mer Trading', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'MER-0', 'Мэр Мер'),
+      // `мэр` and `мер` both romanize to `mer`: a name word for each.
+      listed('uk', 'MER-1', 'Mer Mer'),
+      // One `mer` for the two.
+      listed('uk', 'MER-2', 'Mer Trading', 'organization'),
+    ]);
+    const res = await screen('Мэр Мер');
+    expect(ids(res.hits)).toEqual(['eu:MER-0', 'uk:MER-1']);
+    expect(res.hits[1]).toMatchObject({
+      matchType: 'approximate',
+      matchedName: 'Mer Mer',
+      score: 1,
+      queryTokenCoverage: { covered: 2, total: 2 },
+    });
+    // A full pass admits both on `mer`, so the completion's rule is what drops the second.
+    const fuzzy = await screen('Мэр Мер', { matchMode: 'fuzzy', sources: ['uk'] });
+    expect(ids(fuzzy.hits)).toEqual(['uk:MER-1', 'uk:MER-2']);
+  });
+
+  it('needs as many words as the query when its romanization drops one: Альфа Ъ never completes on alfa alone', async () => {
+    await svc.ingestDesignations([
+      listed('eu', 'ALF-0', 'Альфа Ъ', 'organization'),
+      // `ъ` romanizes to nothing, so the romanization `alfa` is one word of the query's two.
+      listed('uk', 'ALF-2', 'Alfa Trading', 'organization'),
+    ]);
+    expect(ids((await screen('Альфа Ъ')).hits)).toEqual(['eu:ALF-0']);
+    const fuzzy = await screen('Альфа Ъ', { matchMode: 'fuzzy', sources: ['uk'] });
+    expect(ids(fuzzy.hits)).toEqual(['uk:ALF-2']);
+  });
+
+  it('pairs a lone letter with the stoplisted word its spelling reaches: the a of A-Emmeh takes al', async () => {
+    // The published records, under their own list and entry IDs.
+    await svc.ingestDesignations([
+      withAliases('uk', 'INU0222', 'CRUISE MISSILE INDUSTRY GROUP', [
+        'Samen Al A-Emmeh Industries Group',
+        "Samen Al-A'Emmeh Industries Group",
+        '8th Imam Industries Group',
+      ]),
+      withAliases('ofac_sdn', '11314', 'NAVAL DEFENCE MISSILE INDUSTRY GROUP', [
+        "SAMEN AL-A'EMMEH INDUSTRIES GROUP",
+        '8TH IMAM INDUSTRIES GROUP',
+      ]),
+      withAliases('eu', '3812', 'Groupe de l’industrie des missiles de la défense navale', [
+        'Samen al-Aemeh Industries Group',
+        'Naval Defense Missile Industry Group',
+      ]),
+    ]);
+    const res = await screen('Samen Al A-Emmeh Industries Group');
+    // `a` ~ `al` (0.85) is the only word the eu record gives `a`; `emmeh` ~ `aemeh` (0.8667).
+    expect(ids(res.hits)).toEqual(['ofac_sdn:11314', 'uk:INU0222', 'eu:3812']);
+    expect(res.hits.map((hit) => hit.matchType)).toEqual(['exact', 'exact', 'approximate']);
+    expect(coverageOf(res.hits, 'eu:3812')).toEqual({ covered: 6, total: 6 });
   });
 });

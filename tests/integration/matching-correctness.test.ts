@@ -9,6 +9,7 @@ import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testi
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SCREENING_CAVEAT } from '@/mcp-server/tools/definitions/_shared.js';
 import { getEntityTool } from '@/mcp-server/tools/definitions/get-entity.tool.js';
+import { resolveEntityTool } from '@/mcp-server/tools/definitions/resolve-entity.tool.js';
 import { screenNameTool } from '@/mcp-server/tools/definitions/screen-name.tool.js';
 import { parseUk, parseUn } from '@/services/screening/sanctions-ingest.js';
 import type { ScreeningService } from '@/services/screening/screening-service.js';
@@ -686,6 +687,406 @@ describe('sound-alike surnames on both tool surfaces (issue #92)', () => {
   });
 });
 
+describe('strict completion gives each query word a word of its own (issue #98)', () => {
+  let harness: SeededService;
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  /** A published record: its primary name, then aliases, as the lists carry them. */
+  const record = (
+    id: string,
+    entityType: NormalizedDesignation['entityType'],
+    primaryName: string,
+    aliases: string[] = [],
+  ): NormalizedDesignation => {
+    const [source, sourceEntryId] = id.split(':') as [SourceCode, string];
+    return {
+      id,
+      source,
+      sourceEntryId,
+      entityType,
+      primaryName,
+      payload: {
+        aliases: aliases.map((name) => ({ name, nameType: 'aka' as const })),
+        identifiers: [],
+        addresses: [],
+        datesOfBirth: [],
+        nationalities: [],
+      },
+    };
+  };
+  const WONG_YUNG_FAI = 'bis_el:17d40f9e1dad307fb1e50519fe8bef47d1b8172a65c4efc62ea2a0bb';
+  const RECORDS = [
+    record('ofac_sdn:52347', 'vessel', 'PING AN'),
+    record('eu:178426', 'organization', 'Bank of Industry and Mine'),
+    record('ofac_consolidated:18283', 'organization', 'SME BANK', [
+      'JSC RUSSIAN BANK FOR SMALL AND MEDIUM ENTERPRISES SUPPORT',
+    ]),
+    record('eu:183321', 'organization', 'Banca Finservice S.A.', ['JSC “Bank Finservice”']),
+    record('uk:INU0342', 'organization', 'BANCO INTERNACIONAL DE DESARROLLO CA', [
+      'Banco Internacional De Desarrollo, C.A.',
+    ]),
+    record('ofac_sdn:39693', 'vessel', 'SAINT LIGHT', ['STELLAR ORACLE', 'YOUNG YONG']),
+    record('eu:5597', 'person', 'RYOM Yong'),
+    record('eu:6847', 'person', 'Yong Chol KIM', ['Young-chul KIM', 'Yong-Chol KIM']),
+    record(WONG_YUNG_FAI, 'person', 'Wong Yung Fai'),
+    record('ofac_sdn:24514', 'person', 'Qasim Naim', ['Qassem Naim', 'Kassem Naim']),
+    record('eu:3361', 'person', 'Musa Hilal Abdalla ALNSIEM', ['Al Nasim', 'AlNasim']),
+    record('uk:AQD0276', 'person', 'NESSIM BEN ROMDHANE SAHRAOUI', ['Nasim al-Sahrawi']),
+    record('ofac_sdn:12627', 'person', 'GADDAFI Hannibal', ['QADHAFI Hannibal Muammar']),
+    record('eu:6093', 'person', 'Hannibal Muammar QADHAFI'),
+    record('uk:LIB0051', 'person', 'HANNIBAL MUAMMAR QADHAFI'),
+    record('un:690771', 'person', 'HANNIBAL MUAMMAR QADHAFI'),
+    record('ofac_sdn:12608', 'person', 'QADHAFI Saif al-Islam', ['GADDAFI Saif al-Islam']),
+    record('eu:6097', 'person', 'Saif al-Islam QADHAFI'),
+    record('uk:LIB0064', 'person', 'SAIF AL-ISLAM QADHAFI'),
+    record('un:690778', 'person', 'SAIF AL-ISLAM QADHAFI'),
+    record('eu:128875', 'organization', 'Kaniyat Militia', ['Brygada Kani', 'Brigade Kani']),
+    record('ofac_sdn:29368', 'organization', 'Kaniyat militia', ['Kani Brigade']),
+    record('uk:LIB0074', 'organization', 'al-Kaniyat', ['Kani Brigade']),
+    record('eu:131805', 'person', 'Saleh Mesfer Saleh Al Shaer', ['Saleh Mosfer Saleh al Shaer']),
+    record('uk:YEM0009', 'person', 'Saleh Mesfer Saleh Al Shaer', ['Saleh Mosfer Saleh al Shaer']),
+    record('un:6908863', 'person', 'SALEH MESFER SALEH AL SHAER', ['Saleh Mosfer Saleh al Shaer']),
+    record('ofac_sdn:31192', 'person', 'Alshaer Saleh Mesfer', ['Al-Shaer Salih Misfer']),
+    record('eu:150199', 'organization', 'Alfa-Bank JSC', ['Альфа-Банк']),
+    record('ofac_sdn:34682', 'organization', 'JOINT STOCK COMPANY ALFA-BANK', [
+      'АКЦИОНЕРНОЕ ОБЩЕСТВО АЛЬФА-БАНК',
+    ]),
+    record('uk:BEL0166', 'organization', 'CJSC Alfa Bank Belarus', ['ЗАО Альфа-Банк']),
+    record('uk:RUS1074', 'organization', 'Alfa-Bank JSC', ['Альфа-Банка']),
+    record('uk:AQD0158', 'person', 'BOUBEKEUR BOULGHITI', ['Abou Bakr Al Djazairi']),
+    record('uk:LIB0006', 'organization', 'Libyan Agricultural Bank', [
+      'Al Masraf Al Zirae Agricultural Bank',
+    ]),
+  ];
+
+  beforeEach(async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations(RECORDS);
+  });
+
+  /** One screen through the tool: each hit as `list:id matchType covered/total phonetic`, and the text. */
+  const screen = async (name: string, matchMode: 'strict' | 'fuzzy' = 'strict') => {
+    const result = await runToolContract(screenNameTool, { name, matchMode, limit: 100 });
+    expect(result.isError).toBeFalsy();
+    const { hits } = result.structuredContent as {
+      hits: {
+        source: SourceCode;
+        sourceEntryId: string;
+        matchType: string;
+        queryTokenCoverage?: { covered: number; phonetic?: number; total: number };
+      }[];
+    };
+    return {
+      rows: hits.map(({ source, sourceEntryId, matchType, queryTokenCoverage: cov }) =>
+        [
+          `${source}:${sourceEntryId}`,
+          matchType,
+          cov && `${cov.covered}/${cov.total}`,
+          cov?.phonetic,
+        ]
+          .filter((part) => part !== undefined)
+          .join(' '),
+      ),
+      ids: hits.map((hit) => `${hit.source}:${hit.sourceEntryId}`),
+      text: result.content.map((block) => ('text' in block ? block.text : '')).join('\n'),
+    };
+  };
+
+  it('PING AN returns ofac_sdn 52347 alone', async () => {
+    const { rows, text } = await screen('PING AN');
+    expect(rows).toEqual(['ofac_sdn:52347 exact']);
+    expect(text).not.toContain('Bank of Industry and Mine');
+  });
+
+  it('YOUNG YONG returns no record with one word covering both query words', async () => {
+    const { rows, text } = await screen('YOUNG YONG');
+    expect(rows).toEqual(['ofac_sdn:39693 exact', `${WONG_YUNG_FAI} approximate 2/2`]);
+    expect(text).not.toContain('RYOM Yong');
+    expect(text).not.toContain('Yong Chol KIM');
+  });
+
+  it('Naim Qasim returns no Al Nasim or Nasim al-Sahrawi', async () => {
+    const { ids } = await screen('Naim Qasim');
+    expect(ids).toEqual(['ofac_sdn:24514']);
+  });
+
+  it('Hannibal Gaddafi returns eu 6093, uk LIB0051, un 690771 at 2/2 with one word by sound', async () => {
+    const { rows, text } = await screen('Hannibal Gaddafi');
+    expect(rows).toEqual([
+      'ofac_sdn:12627 strong',
+      'eu:6093 approximate 2/2 1',
+      'uk:LIB0051 approximate 2/2 1',
+      'un:690771 approximate 2/2 1',
+    ]);
+    expect(text).toContain(
+      '### Hannibal Muammar QADHAFI — approximate · score 1 · covers 2/2 query tokens (1 by sound)\n',
+    );
+  });
+
+  it('Saif al-Islam Gaddafi returns eu 6097, uk LIB0064, un 690778 at 4/4 with one word by sound', async () => {
+    const { rows } = await screen('Saif al-Islam Gaddafi');
+    expect(rows).toEqual([
+      'ofac_sdn:12608 strong',
+      'eu:6097 approximate 4/4 1',
+      'uk:LIB0064 approximate 4/4 1',
+      'un:690778 approximate 4/4 1',
+    ]);
+  });
+
+  it('Brygada Kani returns Kani Brigade on ofac_sdn 29368 and uk LIB0074 (0.8476 by sound)', async () => {
+    const { rows } = await screen('Brygada Kani');
+    expect(rows).toEqual([
+      'eu:128875 exact',
+      'ofac_sdn:29368 approximate 2/2 1',
+      'uk:LIB0074 approximate 2/2 1',
+    ]);
+  });
+
+  it('Saleh Mosfer Saleh al Shaer still returns ofac_sdn 31192', async () => {
+    const { rows } = await screen('Saleh Mosfer Saleh al Shaer');
+    expect(rows).toEqual([
+      'eu:131805 exact',
+      'uk:YEM0009 exact',
+      'un:6908863 exact',
+      'ofac_sdn:31192 approximate 5/5',
+    ]);
+  });
+
+  it('Saleh Mosfer Saleh al Shaer gives its repeated saleh one name word: no Saleh Saleh Mosfer', async () => {
+    // Synthetic: `saleh` twice and `mosfer`, but no `shaer`.
+    await harness.service.ingestDesignations([
+      record('ofac_sdn:SYN-98', 'person', 'Saleh Saleh Mosfer'),
+    ]);
+    const { rows, text } = await screen('Saleh Mosfer Saleh al Shaer');
+    expect(rows).toEqual([
+      'eu:131805 exact',
+      'uk:YEM0009 exact',
+      'un:6908863 exact',
+      'ofac_sdn:31192 approximate 5/5',
+    ]);
+    expect(text).not.toContain('Saleh Saleh Mosfer');
+  });
+
+  it('Альфа-Банк returns no uk AQD0158 or LIB0006, and still uk RUS1074 and BEL0166', async () => {
+    const { ids, text } = await screen('Альфа-Банк');
+    expect(ids).toEqual(['eu:150199', 'ofac_sdn:34682', 'uk:BEL0166', 'uk:RUS1074']);
+    expect(text).not.toContain('Abou Bakr Al Djazairi');
+    expect(text).not.toContain('Al Masraf Al Zirae Agricultural Bank');
+  });
+
+  it('PING AN in fuzzy mode returns the bank names it returned before (characterization)', async () => {
+    const { rows } = await screen('PING AN', 'fuzzy');
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        'ofac_sdn:52347 exact',
+        'eu:178426 approximate 2/2 1',
+        'eu:183321 approximate 2/2 1',
+        'uk:INU0342 approximate 2/2 1',
+        'ofac_consolidated:18283 approximate 2/2 1',
+      ]),
+    );
+  });
+});
+
+describe('public-company spellings of PLC on both tool surfaces (issue #101)', () => {
+  let harness: SeededService;
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  /** A published organization record: its primary name, then aliases, as the lists carry them. */
+  const record = (
+    id: string,
+    primaryName: string,
+    aliases: string[] = [],
+  ): NormalizedDesignation => {
+    const [source, sourceEntryId] = id.split(':') as [SourceCode, string];
+    return {
+      id,
+      source,
+      sourceEntryId,
+      entityType: 'organization',
+      primaryName,
+      payload: {
+        aliases: aliases.map((name) => ({ name, nameType: 'aka' as const })),
+        identifiers: [],
+        addresses: [],
+        datesOfBirth: [],
+        nationalities: [],
+      },
+    };
+  };
+  const MEHL = 'a90c8b8a90682c265b5f4fd4da267ace4ad1cb81adc2eb0fdf739c0a';
+  const RECORDS = [
+    record('ofac_sdn:58644', 'MERITWISE GROUP PUBLIC LTD'),
+    record('ofac_sdn:31517', 'Myanma Economic Holdings Public Company Limited', [
+      'Myanmar Economic Holding Limited',
+      'MEHL',
+    ]),
+    record(
+      'ofac_sdn:50005',
+      'Scientific Research Institute for Optoelectronic Instrument Engineering',
+      [
+        'Public Limited Company Scientific Research Institute For Optoelectronic Instrument Engineering',
+        'AO NII OEP',
+      ],
+    ),
+    record('eu:129450', 'Myanmar  Economic  Holdings  Public  Company  Ltd'),
+    record('eu:179619', 'Evraz PLC', ['Evraz Nyrt.']),
+    record('uk:GHR0080', 'Myanmar Economic Holdings Public Company Ltd', [
+      'MEHL',
+      'Myanmar Economic Holdings Limited',
+    ]),
+    record('uk:RUS1027', 'Evraz PLC', ['Евраз']),
+    record(`bis_el:${MEHL}`, 'Myanmar Economic Holdings Limited', [
+      'MEHL',
+      'Myanma Economic Holdings Limited',
+      'Myanma Economic Holdings Public Company Limited',
+      'Myanmar Business Holdings Public Company Limited',
+      'Myanmar Economic Holdings Public Company Limited',
+      'UMEH',
+      'Union of Myanmar Economic Holdings Company Limited',
+      'Union of Myanmar Economic Holdings Limited.',
+    ]),
+  ];
+
+  beforeEach(async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations(RECORDS);
+  });
+
+  /** One screen through the tool: its strict hits as `list:id matchType "matched name"`, and the text. */
+  const screen = async (name: string) => {
+    const result = await runToolContract(screenNameTool, { name, limit: 100 });
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      hits: { source: SourceCode; sourceEntryId: string; matchType: string; matchedName: string }[];
+      matchModeUsed: string;
+      normalizedQuery: string;
+    };
+    return {
+      ...structured,
+      strict: structured.hits
+        .filter((hit) => hit.matchType !== 'approximate')
+        .map((hit) => `${hit.source}:${hit.sourceEntryId} ${hit.matchType} "${hit.matchedName}"`),
+      text: result.content.map((block) => ('text' in block ? block.text : '')).join('\n'),
+    };
+  };
+
+  it('Meritwise Group PLC returns ofac_sdn 58644 as strong', async () => {
+    const { strict, matchModeUsed, text } = await screen('Meritwise Group PLC');
+    expect(strict).toEqual(['ofac_sdn:58644 strong "MERITWISE GROUP PUBLIC LTD"']);
+    expect(matchModeUsed).toBe('strict');
+    expect(text).toContain('### MERITWISE GROUP PUBLIC LTD — strong\n');
+  });
+
+  it('Myanmar Economic Holdings PLC returns eu 129450, uk GHR0080 and bis_el MEHL as strong', async () => {
+    const { strict, text } = await screen('Myanmar Economic Holdings PLC');
+    expect(strict).toEqual([
+      'eu:129450 strong "Myanmar  Economic  Holdings  Public  Company  Ltd"',
+      'uk:GHR0080 strong "Myanmar Economic Holdings Public Company Ltd"',
+      `bis_el:${MEHL} strong "Myanmar Economic Holdings Public Company Limited"`,
+    ]);
+    expect(text).toContain('### Myanmar Economic Holdings Public Company Ltd — strong\n');
+    expect(text).toContain(
+      '**Matched on:** "Myanmar Economic Holdings Public Company Limited" (aka)',
+    );
+  });
+
+  it('Evraz Public Ltd returns eu 179619 and uk RUS1027 as strong', async () => {
+    const { strict, text } = await screen('Evraz Public Ltd');
+    expect(strict).toEqual(['eu:179619 strong "Evraz PLC"', 'uk:RUS1027 strong "Evraz PLC"']);
+    expect(text).toContain('### Evraz PLC — strong\n');
+  });
+
+  it('Myanma Economic Holdings Ltd still returns ofac_sdn 31517 as strong', async () => {
+    const { strict, text } = await screen('Myanma Economic Holdings Ltd');
+    expect(strict).toEqual([
+      'ofac_sdn:31517 strong "Myanma Economic Holdings Public Company Limited"',
+      `bis_el:${MEHL} strong "Myanma Economic Holdings Limited"`,
+    ]);
+    expect(text).toContain('### Myanma Economic Holdings Public Company Limited — strong\n');
+  });
+
+  it('Myanmar Economic Holdings Company Limited still returns eu 129450 and uk GHR0080 as strong', async () => {
+    const { strict } = await screen('Myanmar Economic Holdings Company Limited');
+    expect(strict).toEqual([
+      'eu:129450 strong "Myanmar  Economic  Holdings  Public  Company  Ltd"',
+      'uk:GHR0080 strong "Myanmar Economic Holdings Public Company Ltd"',
+      `bis_el:${MEHL} strong "Myanmar Economic Holdings Public Company Limited"`,
+    ]);
+  });
+
+  it('Myanma Economic Holdings Public Company Limited Ltd still returns ofac_sdn 31517 as strong', async () => {
+    const { strict, matchModeUsed, text } = await screen(
+      'Myanma Economic Holdings Public Company Limited Ltd',
+    );
+    expect(strict).toEqual([
+      'ofac_sdn:31517 strong "Myanma Economic Holdings Public Company Limited"',
+      `bis_el:${MEHL} strong "Myanma Economic Holdings Public Company Limited"`,
+    ]);
+    expect(matchModeUsed).toBe('strict');
+    expect(text).toContain('### Myanma Economic Holdings Public Company Limited — strong\n');
+    expect(text).toContain('### Myanmar Economic Holdings Limited — strong\n');
+  });
+
+  it('Meritwise Group Ltd still returns ofac_sdn 58644 as strong', async () => {
+    const { strict } = await screen('Meritwise Group Ltd');
+    expect(strict).toEqual(['ofac_sdn:58644 strong "MERITWISE GROUP PUBLIC LTD"']);
+  });
+
+  it('Scientific Research Institute … Ltd does not return ofac_sdn 50005 as strong, and that alias still screens exact', async () => {
+    const ltd = await screen(
+      'Scientific Research Institute For Optoelectronic Instrument Engineering Ltd',
+    );
+    expect(ltd.strict).toEqual([]);
+    expect(ltd.text).not.toContain('— strong');
+    const alias = await screen(
+      'Public Limited Company Scientific Research Institute For Optoelectronic Instrument Engineering',
+    );
+    expect(alias.strict).toEqual([
+      'ofac_sdn:50005 exact "Public Limited Company Scientific Research Institute For Optoelectronic Instrument Engineering"',
+    ]);
+    expect(alias.text).toContain(
+      '### Scientific Research Institute for Optoelectronic Instrument Engineering — exact\n',
+    );
+  });
+
+  it('leaves normalizedQuery and exact as they were', async () => {
+    const plc = await screen('Meritwise Group PLC');
+    expect(plc.normalizedQuery).toBe('meritwise group plc');
+    expect(plc.text).toContain('meritwise group plc');
+    const own = await screen('MERITWISE GROUP PUBLIC LTD');
+    expect(own.normalizedQuery).toBe('meritwise group public ltd');
+    expect(own.strict).toEqual(['ofac_sdn:58644 exact "MERITWISE GROUP PUBLIC LTD"']);
+  });
+
+  it('leaves GLEIF resolution as it was: a PLC query never resolves a public-company name strictly', async () => {
+    const lei = '2549001MERITWISE0001';
+    await harness.service.ingestLeiEntities([
+      {
+        lei,
+        legalName: 'MERITWISE GROUP PUBLIC LTD',
+        otherNames: [],
+        jurisdiction: 'GB',
+        status: 'ISSUED',
+      },
+    ]);
+    const result = await runToolContract(resolveEntityTool, { name: 'Meritwise Group PLC' });
+    expect(result.isError).toBeFalsy();
+    const { matches, matchModeUsed } = result.structuredContent as {
+      matches: { lei: string; matchType: string }[];
+      matchModeUsed: string;
+    };
+    expect(matchModeUsed).toBe('fuzzy');
+    expect(matches.filter((match) => match.lei === lei).map((match) => match.matchType)).toEqual([
+      'approximate',
+    ]);
+  });
+});
+
 describe('designation merge and deduplication', () => {
   let standalone: SeededService;
 
@@ -1001,5 +1402,202 @@ describe('UK and UN native-script names (issue #87)', () => {
     const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
     expect(text).toContain('"ლევან მურუსიძე" (aka)');
     expect(text).toContain('**Entry ID:** GAC0076');
+  });
+});
+
+// ─── Transliterated-only records on a list a native-script name settled (issue #99) ──
+//
+// Published OFAC, EU, and UK records, names as the lists carry them (aliases trimmed),
+// except ofac_sdn INT-1, which holds `ao` and `international`.
+
+describe('transliterated-only records on a list a native-script strict hit settled (issue #99)', () => {
+  let harness: SeededService;
+  afterEach(async () => {
+    await harness.cleanup();
+  });
+
+  const record = (
+    id: string,
+    primaryName: string,
+    aliases: string[] = [],
+  ): NormalizedDesignation => {
+    const [source, sourceEntryId] = id.split(':') as [SourceCode, string];
+    return {
+      id,
+      source,
+      sourceEntryId,
+      entityType: 'organization',
+      primaryName,
+      payload: {
+        aliases: aliases.map((name) => ({ name, nameType: 'aka' as const })),
+        identifiers: [],
+        addresses: [],
+        datesOfBirth: [],
+        nationalities: [],
+      },
+    };
+  };
+  const RECORDS = [
+    record(
+      'ofac_sdn:35337',
+      'IZHEVSK UNMANNED SYSTEMS RESEARCH AND PRODUCTION ASSOCIATED LIMITED LIABILITY COMPANY',
+      [
+        'OOO NAUCHNO-PROIZVODSTVENNOYE OBYEDINENIYE IZHEVSKIYE BESPILOTNYE SISTEMY',
+        'ООО НАУЧНО-ПРОИЗВОДСТВЕННОЕ ОБЪЕДИНЕНИЕ ИЖЕВСКИЕ БЕСПИЛОТНЫЕ СИСТЕМЫ',
+      ],
+    ),
+    record('ofac_sdn:49352', 'LIMITED LIABILITY COMPANY UNMANNED SYSTEMS', ['Bespilotnye Sistemy']),
+    record('eu:160491', 'SuperCam Unmanned  Systems Group', ['Беспилотные системы', 'SuperCam']),
+    record('eu:175107', 'Limited Liability Company Unmanned Systems', [
+      'ООО “Беспилотные Системы”',
+    ]),
+    record(
+      'ofac_sdn:38097',
+      'JOINT STOCK COMPANY PROMISING INDUSTRIAL AND INFRASTRUCTURE TECHNOLOGIES',
+      ['Акционерное Общество Перспективные Промышленные и Инфраструктурные Технологии'],
+    ),
+    record('ofac_sdn:46688', 'Aktsionernoe Obshchestvo Promyshlennye Tekhnologii', ['AO Promtekh']),
+    record('eu:172742', 'Promtech Joint Stock Company', [
+      'Акционерное общество “Промышленные Технологии”',
+      'АО “Промтех”',
+    ]),
+    record('ofac_sdn:48483', 'JOINT STOCK COMPANY INTEGRAL ZAPAD', [
+      'Aktsionernoe Obshchestvo Integral Zapad',
+    ]),
+    record('ofac_sdn:INT-1', 'AO International Trading'),
+    record('ofac_sdn:49417', 'JOINT STOCK COMPANY RUSSKIE ELEKTRICHESKIE DVIGATELI', [
+      'Red AO',
+      'Рэд АО',
+    ]),
+    record('ofac_sdn:48492', 'RED DOLPHIN JOINT STOCK COMPANY', ['AO Krasnyi Delfin']),
+    record('eu:150199', 'Alfa-Bank JSC', ['Альфа-Банк']),
+    record('ofac_sdn:34682', 'JOINT STOCK COMPANY ALFA-BANK', [
+      'АКЦИОНЕРНОЕ ОБЩЕСТВО АЛЬФА-БАНК',
+      'AO ALFA-BANK',
+    ]),
+    record('uk:BEL0166', 'CJSC Alfa Bank Belarus', ['ЗАО Альфа-Банк']),
+    record('uk:RUS1074', 'Alfa-Bank JSC', ['Альфа-Банка']),
+  ];
+
+  beforeEach(async () => {
+    harness = await seededGlobalService();
+    await harness.service.ingestDesignations(RECORDS);
+  });
+
+  /** One screen through the tool: each hit as `list:id matchType [score] [covered/total]`, the enrichment, and the text. */
+  const screen = async (name: string, sources: SourceCode[] = [...SOURCE_CODES]) => {
+    const result = await runToolContract(screenNameTool, { name, sources, limit: 100 });
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      hits: {
+        source: SourceCode;
+        sourceEntryId: string;
+        matchType: string;
+        matchedName: string;
+        score?: number;
+        queryTokenCoverage?: { covered: number; total: number };
+      }[];
+      fuzzySources?: SourceCode[];
+      matchModeUsed: string;
+      totalAvailable: number;
+      totalAvailableBasis: string;
+    };
+    return {
+      structured,
+      rows: structured.hits.map(
+        ({ source, sourceEntryId, matchType, score, queryTokenCoverage: cov }) =>
+          [`${source}:${sourceEntryId}`, matchType, score, cov && `${cov.covered}/${cov.total}`]
+            .filter((part) => part !== undefined)
+            .join(' '),
+      ),
+      text: result.content.map((block) => ('text' in block ? block.text : '')).join('\n'),
+    };
+  };
+
+  it('Беспилотные системы returns ofac_sdn 49352 as approximate beside 35337 as strong, fuzzySources naming ofac_sdn', async () => {
+    const { structured, rows, text } = await screen('Беспилотные системы');
+    expect(rows).toEqual([
+      'eu:160491 exact',
+      'ofac_sdn:35337 strong',
+      'eu:175107 strong',
+      'ofac_sdn:49352 approximate 1 2/2',
+    ]);
+    expect(structured.hits[3]?.matchedName).toBe('Bespilotnye Sistemy');
+    expect(structured).toMatchObject({
+      matchModeUsed: 'strict',
+      fuzzySources: [...SOURCE_CODES],
+      totalAvailable: 4,
+      totalAvailableBasis: 'lower_bound',
+    });
+    expect(text).toContain(
+      '### LIMITED LIABILITY COMPANY UNMANNED SYSTEMS — approximate · score 1 · covers 2/2 query tokens\n',
+    );
+    expect(text).toContain('**Matched on:** "Bespilotnye Sistemy" (aka)');
+    expect(text).toContain(`**fuzzySources:** ${SOURCE_CODES.join(', ')}`);
+    expect(text.indexOf('**Entry ID:** 35337')).toBeLessThan(text.indexOf('**Entry ID:** 49352'));
+    expect(text).toContain(SCREENING_CAVEAT);
+
+    // On OFAC alone the read is the only pass: no candidate budget, so the count is exact.
+    const alone = await screen('Беспилотные системы', ['ofac_sdn']);
+    expect(alone.rows).toEqual(['ofac_sdn:35337 strong', 'ofac_sdn:49352 approximate 1 2/2']);
+    expect(alone.structured).toMatchObject({
+      fuzzySources: ['ofac_sdn'],
+      totalAvailable: 2,
+      totalAvailableBasis: 'exact',
+    });
+    expect(alone.text).toContain('**fuzzySources:** ofac_sdn');
+  });
+
+  it('Акционерное общество “Промышленные Технологии” returns ofac_sdn 46688 beside the 38097 strict hit', async () => {
+    const { rows, text } = await screen('Акционерное общество “Промышленные Технологии”');
+    expect(rows).toEqual([
+      'eu:172742 exact',
+      'ofac_sdn:38097 strong',
+      'ofac_sdn:46688 approximate 1 4/4',
+    ]);
+    expect(text).toContain(
+      '### Aktsionernoe Obshchestvo Promyshlennye Tekhnologii — approximate · score 1 · covers 4/4 query tokens\n',
+    );
+  });
+
+  it('ао integral gains no hit matching only International, and Рэд АО no … Red … Joint Stock Company', async () => {
+    // Each screen searched OFAC with the read, and found no name holding every word.
+    const integral = await screen('ао integral', ['ofac_sdn']);
+    expect(integral.rows).toEqual(['ofac_sdn:48483 strong']);
+    expect(integral.structured.fuzzySources).toEqual(['ofac_sdn']);
+    expect(integral.text).not.toContain('AO International Trading');
+    const red = await screen('Рэд АО', ['ofac_sdn']);
+    expect(red.rows).toEqual(['ofac_sdn:49417 exact']);
+    expect(red.structured.fuzzySources).toEqual(['ofac_sdn']);
+    expect(red.text).not.toContain('RED DOLPHIN JOINT STOCK COMPANY');
+  });
+
+  it('a Latin-script screen returns the same hits, match types, scores and totalAvailableBasis (characterization)', async () => {
+    const { structured, rows } = await screen('Bespilotnye Sistemy');
+    // 35337's own transliteration holds both words: strict. The EU publishes these
+    // two only in Cyrillic, which the fuzzy completion compares by romanization (#57).
+    expect(rows).toEqual([
+      'ofac_sdn:49352 exact',
+      'ofac_sdn:35337 strong',
+      'eu:160491 approximate 1 2/2',
+      'eu:175107 approximate 1 2/2',
+    ]);
+    expect(structured).toMatchObject({
+      fuzzySources: SOURCE_CODES.filter((code) => code !== 'ofac_sdn'),
+      totalAvailable: 4,
+      totalAvailableBasis: 'lower_bound',
+    });
+  });
+
+  it('Альфа-Банк still returns uk RUS1074 beside BEL0166', async () => {
+    const { rows, text } = await screen('Альфа-Банк');
+    expect(rows).toEqual([
+      'eu:150199 exact',
+      'ofac_sdn:34682 strong',
+      'uk:BEL0166 strong',
+      'uk:RUS1074 approximate 1 2/2',
+    ]);
+    expect(text).toContain('**Entry ID:** BEL0166');
+    expect(text).toContain('**Entry ID:** RUS1074');
   });
 });

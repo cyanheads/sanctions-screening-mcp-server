@@ -21,6 +21,7 @@ import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
 import {
   alsoListedText,
   crossReferencePointer,
+  entryRefText,
   gleifNameTypeText,
   HitSourcesSchema,
   MatchedIdentifierSchema,
@@ -300,19 +301,26 @@ export const getEntityTool = tool('sanctions_get_entity', {
     };
   },
 
+  /**
+   * GLEIF and list text is escaped with escapeMarkdownInline at this boundary, never
+   * in the handler, so content[] reads back what structuredContent carries as
+   * published (crossReferencePointer returns its clause already escaped). A joined
+   * list is escaped as one string: an authored `; ` after a value ending `&amp`
+   * would otherwise complete an entity reference. LEIs stay code spans.
+   */
   format: (r) => {
     const lines = [`# ${escapeMarkdownInline(r.legalName)}`, '', `**LEI:** \`${r.lei}\``];
     if (r.otherNames.length > 0) {
-      lines.push(`**Other names:** ${r.otherNames.map(escapeMarkdownInline).join('; ')}`);
+      lines.push(`**Other names:** ${escapeMarkdownInline(r.otherNames.join('; '))}`);
     }
     if (r.alternateNames.length > 0) {
       lines.push(
-        `**Names by type:** ${r.alternateNames.map((n) => `${escapeMarkdownInline(n.name)} (${gleifNameTypeText(n.type)})`).join('; ')}`,
+        `**Names by type:** ${escapeMarkdownInline(r.alternateNames.map((n) => `${n.name} (${gleifNameTypeText(n.type)})`).join('; '))}`,
       );
     }
-    if (r.jurisdiction) lines.push(`**Jurisdiction:** ${r.jurisdiction}`);
-    if (r.status) lines.push(`**Registration status:** ${r.status}`);
-    if (r.entityStatus) lines.push(`**Entity status:** ${r.entityStatus}`);
+    if (r.jurisdiction) lines.push(`**Jurisdiction:** ${escapeMarkdownInline(r.jurisdiction)}`);
+    if (r.status) lines.push(`**Registration status:** ${escapeMarkdownInline(r.status)}`);
+    if (r.entityStatus) lines.push(`**Entity status:** ${escapeMarkdownInline(r.entityStatus)}`);
     if (!r.entityStatusLoaded) {
       lines.push(
         '**Entity status and successors:** not loaded for this record — it was stored before they were read, so this does not mean no successor. A GLEIF refresh that updates the record, or mirror:init, loads them.',
@@ -330,14 +338,16 @@ export const getEntityTool = tool('sanctions_get_entity', {
     } else {
       lines.push('**Successor entities:** none published');
     }
-    if (r.legalAddress) lines.push(`**Legal address:** ${r.legalAddress}`);
-    if (r.headquartersAddress) lines.push(`**HQ address:** ${r.headquartersAddress}`);
+    if (r.legalAddress) lines.push(`**Legal address:** ${escapeMarkdownInline(r.legalAddress)}`);
+    if (r.headquartersAddress) {
+      lines.push(`**HQ address:** ${escapeMarkdownInline(r.headquartersAddress)}`);
+    }
     if (r.registrationAuthorityId) {
       lines.push(
-        `**Registration authority:** ${r.registrationAuthorityId}${r.registrationAuthorityEntityId ? ` (entity ${r.registrationAuthorityEntityId})` : ''}`,
+        `**Registration authority:** ${escapeMarkdownInline(r.registrationAuthorityId)}${r.registrationAuthorityEntityId ? ` (entity ${escapeMarkdownInline(r.registrationAuthorityEntityId)})` : ''}`,
       );
     }
-    if (r.lastUpdate) lines.push(`**Last update:** ${r.lastUpdate}`);
+    if (r.lastUpdate) lines.push(`**Last update:** ${escapeMarkdownInline(r.lastUpdate)}`);
 
     lines.push('\n## Sanctions screening cross-reference');
     if (r.screeningStatus === 'not_ready') {
@@ -356,12 +366,15 @@ export const getEntityTool = tool('sanctions_get_entity', {
             ? [`${h.matchType}${scoreStr}, matched "${h.matchedName}"`]
             : []),
           ...(h.matchedIdentifiers ?? []).map(matchedIdentifierText),
-        ];
-        const also = alsoListedText(h.source, h.sources);
+        ].join('; ');
+        const matchedOn = h.matchedOn.map(screenedInputText).join('; ');
+        const entry = entryRefText(h.sourceEntryId, alsoListedText(h.source, h.sources));
         lines.push(
-          `- **${h.primaryName}** — ${h.sourceLabel} (\`${h.source}\`, entry ${h.sourceEntryId}${also ? `; also listed on ${also}` : ''}), ${matched.join('; ')} — matched on: ${h.matchedOn.map(screenedInputText).join('; ')}`,
+          `- **${escapeMarkdownInline(h.primaryName)}** — ${h.sourceLabel} (\`${h.source}\`, ${entry}), ${escapeMarkdownInline(matched)} — matched on: ${escapeMarkdownInline(matchedOn)}`,
         );
       }
+      // A blank line ends the list; the coverage lines would otherwise continue the last hit.
+      lines.push('');
     }
     if (r.sanctionsScreen) {
       const s = r.sanctionsScreen;
@@ -370,13 +383,12 @@ export const getEntityTool = tool('sanctions_get_entity', {
           s.hasMore ? ` — ${crossReferencePointer(r.legalName, r.lei, s.screenedInputs)}` : ''
         }`,
       );
-      lines.push(
-        `Screened: ${[
-          screenedInputText({ input: 'legal_name', value: r.legalName }),
-          screenedInputText({ input: 'lei', value: r.lei }),
-          ...s.screenedInputs.map(screenedInputText),
-        ].join('; ')}`,
-      );
+      const screened = [
+        screenedInputText({ input: 'legal_name', value: r.legalName }),
+        screenedInputText({ input: 'lei', value: r.lei }),
+        ...s.screenedInputs.map(screenedInputText),
+      ].join('; ');
+      lines.push(`Screened: ${escapeMarkdownInline(screened)}`);
     }
     lines.push(`\n> ${r.caveat}`);
     return [{ type: 'text', text: lines.join('\n') }];

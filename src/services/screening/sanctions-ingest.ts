@@ -38,7 +38,7 @@
  * @module services/screening/sanctions-ingest
  */
 
-import { serviceUnavailable, timeout } from '@cyanheads/mcp-ts-core/errors';
+import { McpError, serviceUnavailable, timeout } from '@cyanheads/mcp-ts-core/errors';
 import { requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { createCslPreparation } from '@/services/screening/csl-ingest.js';
@@ -2234,6 +2234,11 @@ export interface SourceSyncFailure {
   source: SourceCode;
 }
 
+/** How one list's harvest ended in a run: what that run's index rebuild records for it. */
+export type HarvestOutcome =
+  | { harvestedAt: string; publishedAt?: string; source: SourceCode; status: 'harvested' }
+  | { source: SourceCode; status: 'failed' };
+
 /**
  * The largest share of a source's stored designations one run may remove. The
  * completeness check proves a document arrived whole, not that it is the whole
@@ -2263,6 +2268,15 @@ export interface SanctionsSyncOptions {
   ): Promise<void>;
   /** Ingesters to harvest. Defaults to {@link buildSanctionsIngesters}. */
   ingesters?: SanctionsIngester[];
+  /**
+   * The run's closing work, given each list's outcome in harvest order: called
+   * once per run, after the last source or on the caller's abort, and never for a
+   * run the runner stopped because another process took its lease over (the
+   * run's first abort reason is `sync_lease_lost`). It runs inside the
+   * generator, so it commits under the lease before the runner records the run
+   * `complete` or `error`; a throw from it fails the run.
+   */
+  onHarvestEnd?(outcomes: readonly HarvestOutcome[]): Promise<void>;
   /** Called once per failed source, after the failure and before the next source starts. */
   onSourceFailed?(failure: SourceSyncFailure): void;
   /** Called once per source, after its records, deferred columns, and removals are applied. */
@@ -2316,10 +2330,14 @@ export interface SanctionsSyncOptions {
  * harvest as any error (the fetch wraps it), so the signal is what decides.
  *
  * The mirror upserts the `designation` rows and deletes the tombstoned ones; the
- * per-alias `name` index is rebuilt from `designation` afterwards by the
- * service's `syncSanctions()`, whether the run completed or not. Until then a
- * removed designation's `name` rows join to no `designation` row, so no screen
- * can surface it.
+ * name and identifier indexes are rebuilt from `designation` by the
+ * `onHarvestEnd` hook the run ends with, whether its lists all harvested, some
+ * failed, or the caller stopped it. Until then a removed designation's index
+ * rows join to no `designation` row, so no screen can surface it. The hook runs
+ * in this generator's `finally`, which the runner awaits before it commits the
+ * run's final state, so a run reads `in_progress` until its indexes and per-list
+ * outcomes are committed; a run whose lease was taken over skips it, leaving
+ * both to the run that took the lease.
  */
 export function createSanctionsSync(options: SanctionsSyncOptions) {
   const pageSize = options.pageSize ?? SYNC_PAGE_SIZE;
@@ -2352,6 +2370,7 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
     const ingesters = options.ingesters ?? owned;
     const stamp = new Date().toISOString();
     const failures: SourceSyncFailure[] = [];
+    const outcomes: HarvestOutcome[] = [];
 
     try {
       for (const ingester of ingesters) {
@@ -2384,8 +2403,15 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
           for (let at = 0; at < pruned.length; at += pageSize) {
             yield { records: [], tombstones: pruned.slice(at, at + pageSize), checkpoint: stamp };
           }
+          const report = ingester.report();
+          outcomes.push({
+            source: ingester.source,
+            status: 'harvested',
+            harvestedAt: new Date().toISOString(),
+            ...(report.publishedAt ? { publishedAt: report.publishedAt } : {}),
+          });
           options.onSourceReport?.({
-            ...ingester.report(),
+            ...report,
             pruned: pruned.length,
             withheld: stale.length - pruned.length,
           });
@@ -2397,6 +2423,7 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
             error: err instanceof Error ? err.message : String(err),
           };
           failures.push(failure);
+          outcomes.push({ source: ingester.source, status: 'failed' });
           options.onSourceFailed?.(failure);
         }
       }
@@ -2410,8 +2437,18 @@ export function createSanctionsSync(options: SanctionsSyncOptions) {
       }
     } finally {
       owned.dispose();
+      if (!leaseLost(ctx.signal)) await options.onHarvestEnd?.(outcomes);
     }
   };
+}
+
+/**
+ * True once the runner has aborted the run because another process took its
+ * lease over: that run writes nothing more.
+ */
+function leaseLost(signal: AbortSignal): boolean {
+  const reason: unknown = signal.reason;
+  return signal.aborted && reason instanceof McpError && reason.data?.reason === 'sync_lease_lost';
 }
 
 /**

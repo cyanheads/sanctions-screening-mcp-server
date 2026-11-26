@@ -33,8 +33,7 @@ export const SCREENING_CAVEAT =
  * The most characters and words `sanctions_screen_name` and
  * `sanctions_resolve_entity` match on. A fuzzy pass makes index lookups per
  * distinct word and scores every pooled candidate against every word, so its
- * work grows with the name (while a blocking lookup was a table scan, 2,000
- * distinct three-letter words took 79 s against the sanctions mirror alone). The longest
+ * work grows with the name. The longest
  * published sanctions name is 245 characters and 34 words. Checked in the
  * handlers rather than as a schema `.max()`, which would change the input schema
  * clients already validate against.
@@ -230,21 +229,44 @@ export function alsoListedText(
     : undefined;
 }
 
+/**
+ * A cross-reference hit's entry as `format()` shows it: `entry 123 also listed on
+ * <lists>`, escaped as Markdown. The `;` after the entry ID is escaped with it, as
+ * a joined list is: one ending `&amp` would otherwise complete an entity reference.
+ */
+export function entryRefText(sourceEntryId: string, also: string | undefined): string {
+  const entry = escapeMarkdownInline(also ? `${sourceEntryId};` : sourceEntryId);
+  return `entry ${entry}${also ? ` also listed on ${also}` : ''}`;
+}
+
 /** A screened input as the tools' output carries it. */
 type ScreenedInputOutput = z.infer<typeof ScreenedInputSchema>;
 
-/** GLEIF's name type as `format()` shows it: a name stored without one reads "type not recorded". */
+/**
+ * GLEIF's name type as `format()` shows it: a name stored without one reads "type
+ * not recorded". Plain text, not Markdown: the caller escapes the line it goes into.
+ */
 export function gleifNameTypeText(type: string): string {
   return type === UNKNOWN_NAME_TYPE ? 'type not recorded' : type;
 }
 
-/** One screened input as `format()` shows it: `other_name "Rosneft" (TRADING_OR_OPERATING_NAME)`, `lei 2534…`. */
+/**
+ * One screened input as `format()` shows it: `other_name "Rosneft"
+ * (TRADING_OR_OPERATING_NAME)`, `lei 2534…`. Plain text, not Markdown: it is a
+ * list item, and a joined list is escaped as one string —
+ * `escapeMarkdownInline(inputs.map(screenedInputText).join('; '))` — since the
+ * authored `; ` after a value ending `&amp` would complete an entity reference.
+ */
 export function screenedInputText({ input, value, nameType }: ScreenedInputOutput): string {
   if (input === 'lei' || input === 'registration_number') return `${input} ${value}`;
   return `${input} "${value}"${nameType ? ` (${gleifNameTypeText(nameType)})` : ''}`;
 }
 
-/** One matched identifier as `format()` shows it: `identifier Registration ID: 1027700043502 (Russia)`. */
+/**
+ * One matched identifier as `format()` shows it: `identifier Registration ID:
+ * 1027700043502 (Russia)`. Plain text, a list item like {@link screenedInputText}:
+ * the caller escapes the joined list as one string.
+ */
 export function matchedIdentifierText({
   type,
   value,
@@ -256,11 +278,13 @@ export function matchedIdentifierText({
 /**
  * The guidance for a capped cross-reference: every name it screened, to re-run
  * with `sanctions_screen_name`, and every identifier it looked up, for
- * `sanctions_screen_identifier`. A strict `sanctions_screen_name` also completes
- * each list it found nothing on with approximate matches, which the strict
- * cross-reference never counts, so the guidance says the re-screen can return
- * more. `legalName` is undefined for an ownership node with no Level 1 record,
- * which had no name screened: the guidance is its LEI lookup alone.
+ * `sanctions_screen_identifier`. A strict `sanctions_screen_name` can also add
+ * approximate matches (its fuzzy completion and its romanized read), which the
+ * strict cross-reference never counts, so the guidance says the re-screen can
+ * return more. `legalName` is undefined for an ownership node with no Level 1 record,
+ * which had no name screened: the guidance is its LEI lookup alone. Returned as
+ * Markdown, the whole clause escaped as one string, its quoted names and joined
+ * identifiers included; interpolate it as is.
  */
 export function crossReferencePointer(
   legalName: string | undefined,
@@ -273,7 +297,9 @@ export function crossReferencePointer(
     ...new Set([...(legalName === undefined ? [] : [legalName]), ...valuesOf('other_name')]),
   ];
   const lookUp = `look up ${[lei, ...valuesOf('registration_number')].join(', ')} with sanctions_screen_identifier to see the rest`;
-  return names.length > 0
-    ? `re-screen ${names.map((name) => `"${name}"`).join(', ')} with sanctions_screen_name and ${lookUp}; the name re-screen can add approximate matches on lists with no strict match, which this count leaves out.`
-    : `${lookUp}.`;
+  return escapeMarkdownInline(
+    names.length > 0
+      ? `re-screen ${names.map((name) => `"${name}"`).join(', ')} with sanctions_screen_name and ${lookUp}; the name re-screen can add approximate matches, which this count leaves out.`
+      : `${lookUp}.`,
+  );
 }

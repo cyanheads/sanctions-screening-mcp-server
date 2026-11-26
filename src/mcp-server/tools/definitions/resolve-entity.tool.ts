@@ -9,6 +9,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { clampPageLimit, pageLimitSchema } from '@/mcp-server/normalize-inputs.js';
 import {
   getScreeningService,
@@ -291,6 +292,11 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
     };
   },
 
+  /**
+   * GLEIF text is escaped with escapeMarkdownInline at this boundary, never in the
+   * handler, so content[] reads back what structuredContent carries as published.
+   * LEIs stay code spans.
+   */
   format: (r) => {
     if (r.matches.length === 0) return [{ type: 'text', text: '**No LEI candidates found.**' }];
     const lines = [`**${r.matches.length} LEI candidate(s)** — confirm before relying on:\n`];
@@ -298,12 +304,14 @@ export const resolveEntityTool = tool('sanctions_resolve_entity', {
       const scoreStr = m.score !== undefined ? ` · score ${m.score}` : '';
       const cov = m.queryTokenCoverage;
       const coverStr = cov ? ` · covers ${cov.covered}/${cov.total} query tokens` : '';
-      lines.push(`### ${m.legalName} — ${m.matchType}${scoreStr}${coverStr}`);
+      lines.push(`### ${escapeMarkdownInline(m.legalName)} — ${m.matchType}${scoreStr}${coverStr}`);
       lines.push(`**LEI:** \`${m.lei}\``);
-      lines.push(`**Matched on:** "${m.matchedName}" (${gleifNameTypeText(m.matchedNameType)})`);
+      lines.push(
+        `**Matched on:** "${escapeMarkdownInline(m.matchedName)}" (${escapeMarkdownInline(gleifNameTypeText(m.matchedNameType))})`,
+      );
       const meta = [
-        m.jurisdiction ? `Jurisdiction: ${m.jurisdiction}` : null,
-        m.status ? `Status: ${m.status}` : null,
+        m.jurisdiction ? `Jurisdiction: ${escapeMarkdownInline(m.jurisdiction)}` : null,
+        m.status ? `Status: ${escapeMarkdownInline(m.status)}` : null,
       ]
         .filter(Boolean)
         .join(' | ');

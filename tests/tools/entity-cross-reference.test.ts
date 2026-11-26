@@ -402,7 +402,7 @@ describe('sanctions_get_entity cross-reference (issues #37, #56)', () => {
       'showing 25 of 34 potential match(es) (count basis: exact); more available: true',
     );
     expect(text).toContain(
-      `re-screen "${zorvan.legalName}", "Zorvan", "Zorvan Oil Company", "ПАО "НК "Зорван"" with sanctions_screen_name and look up ${ZORVAN}, ${ZORVAN_REG} with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches on lists with no strict match, which this count leaves out.`,
+      `re-screen "${zorvan.legalName}", "Zorvan", "Zorvan Oil Company", "ПАО "НК "Зорван"" with sanctions_screen_name and look up ${ZORVAN}, ${ZORVAN_REG} with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches, which this count leaves out.`,
     );
   });
 
@@ -547,7 +547,7 @@ describe('sanctions_trace_ownership per-node cross-reference (issues #37, #56)',
       '  - ⚠ Zorvan Oil Company — OFAC Specially Designated Nationals (SDN) List (`ofac_sdn`, entry XR-1): matched "Zorvan" — exact; identifier Registration ID: 1027700099999 (Russia) — matched on: other_name "Zorvan" (TRADING_OR_OPERATING_NAME); other_name "Zorvan Oil Company" (ALTERNATIVE_LANGUAGE_LEGAL_NAME); registration_number 1027700099999',
     );
     expect(text).toContain(
-      `re-screen "Qqzx Child Holdings", "Qorlan Shipping" with sanctions_screen_name and look up ${CHILD} with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches on lists with no strict match, which this count leaves out.`,
+      `re-screen "Qqzx Child Holdings", "Qorlan Shipping" with sanctions_screen_name and look up ${CHILD} with sanctions_screen_identifier to see the rest; the name re-screen can add approximate matches, which this count leaves out.`,
     );
     // A no-match node keeps its one line, naming what was screened beyond the legal name and LEI.
     const parentLine = text

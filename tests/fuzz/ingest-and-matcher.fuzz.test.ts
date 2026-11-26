@@ -30,6 +30,12 @@ import {
   fold,
   jaro,
   jaroWinkler,
+  nativeWords,
+  oneToOneCoverage,
+  scoringQuery,
+  soundKeys,
+  splitOnStoplist,
+  tokenize,
 } from '@/services/screening/text-matching.js';
 import type {
   AddressRecord,
@@ -82,6 +88,74 @@ describe('text matcher fuzz invariants', () => {
       const match = buildFtsMatch(value);
       if (match)
         expect(match.split(' AND ').every((token) => /^"[\p{L}\p{N}]+"$/u.test(token))).toBe(true);
+    }
+  });
+
+  it('bounds the one-to-one coverage by the distinct query words, whatever order either side is in', () => {
+    const random = mulberry32(0x0098_c0de);
+    // One-letter edits of sound-alike words, so query and name words compete for pairs.
+    const words = ['Qasim', 'Kassem', 'Naim', 'Nasim', 'Young', 'Yong', 'Wong'].flatMap((word) => [
+      word,
+      ...oneEditVariants(word),
+    ]);
+    const names = [
+      ...adversarialStrings,
+      ...Array.from({ length: 200 }, () => randomUnicode(random, 40)),
+      ...Array.from({ length: 400 }, () =>
+        Array.from(
+          { length: 1 + Math.floor(random() * 6) },
+          () => words[Math.floor(random() * words.length)],
+        ).join(' '),
+      ),
+    ];
+    const soundKey = soundKeys();
+    const count = (query: string[], candidate: string[]) =>
+      oneToOneCoverage(scoringQuery(query), candidate, 0.85, soundKey);
+    for (const [i, value] of names.entries()) {
+      const query = tokenize(fold(value));
+      const candidate = tokenize(fold(names[(i * 7 + 3) % names.length] ?? ''));
+      const distinct = new Set(splitOnStoplist(query).distinctive).size;
+      const covered = count(query, candidate);
+      expect(Number.isInteger(covered), value).toBe(true);
+      expect(covered, value).toBeGreaterThanOrEqual(0);
+      expect(covered, value).toBeLessThanOrEqual(Math.min(distinct, candidate.length));
+      expect(count([...query].reverse(), [...candidate].reverse()), value).toBe(covered);
+      // Every word pairs with itself, so a name of the query's own words covers all of them.
+      expect(count(query, query), value).toBe(distinct);
+    }
+  });
+
+  it('pairs each romanized token with the native word it spells, word by word', () => {
+    const random = mulberry32(0x0098_a119);
+    // Raw words that each fold to one token; the signs alone romanize to nothing, and
+    // `ꚜ` `ꚝ` `𞁥` fold to a sign but romanize as themselves.
+    const VOCABULARY = [
+      ...['Мэр', 'Мер', 'Семён', 'Семен', 'Андрей', 'Андреи', 'Объект', 'АО', 'Мир', 'й', 'Ё'],
+      ...['Ъ', 'ь', 'Ъь', 'ъ́', 'Almaz', 'x', '7', 'ее́', 'ꚜ', 'ꚝ', '\u{1E065}'],
+    ];
+    const SEPARATORS = [' ', '-', ' — ', '.', '\n', '«', '  '];
+    /** Whether `word`'s romanization keeps a token: read beside a word that always does. */
+    const romanizes = (word: string) =>
+      tokenize(comparisonForms(`${word} я`).at(-1) ?? '').length === 2;
+    for (let i = 0; i < 3_000; i++) {
+      const rawWords = Array.from(
+        { length: 1 + Math.floor(random() * 6) },
+        () => VOCABULARY[Math.floor(random() * VOCABULARY.length)] ?? '',
+      );
+      const raw = rawWords
+        .map((word, k) =>
+          k === 0 ? word : `${SEPARATORS[Math.floor(random() * SEPARATORS.length)]}${word}`,
+        )
+        .join('');
+      const forms = comparisonForms(raw).map(tokenize);
+      const native = forms[0] ?? [];
+      expect(nativeWords(native, native), raw).toEqual(native);
+      const romanized = forms[1];
+      if (!romanized) continue;
+      const words = nativeWords(native, romanized);
+      expect(words, raw).toHaveLength(romanized.length);
+      if (/[ꚜꚝ\u{1E065}]/u.test(raw)) continue;
+      expect(words, raw).toEqual(rawWords.filter(romanizes).map(fold));
     }
   });
 });

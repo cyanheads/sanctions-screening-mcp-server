@@ -19,6 +19,7 @@ import {
   type SourceSyncReport,
 } from '@/services/screening/sanctions-ingest.js';
 import { type NormalizedDesignation, SOURCE_LABELS } from '@/services/screening/types.js';
+import { readText } from '../tools/_markdown-readback.js';
 import { CSL_RECORDS, cslDocument } from './_csl-fixture.js';
 import { emptyGlobalService } from './_helpers.js';
 import { serveLookupCorpus } from './_lookup-corpus.js';
@@ -735,9 +736,9 @@ describe('CSL preparation and normalization', () => {
         const detail = getDesignationTool.output.parse(designation.structuredContent);
         expect(uri).toMatchObject({ source, features: detail.features });
         expect(detail.features).toHaveLength(7);
-        const rendered = designation.content
-          .map((block) => ('text' in block ? block.text : ''))
-          .join('\n');
+        const rendered = readText(
+          designation.content.map((block) => ('text' in block ? block.text : '')).join('\n'),
+        );
         for (const feature of records.find((record) => record.source === source)!.payload.features!)
           expect(rendered).toContain(feature.value);
       }

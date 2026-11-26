@@ -233,24 +233,31 @@ export const getDesignationTool = tool('sanctions_get_designation', {
     };
   },
 
+  // Every string the list publishes passes through escapeMarkdownInline here, never
+  // in the handler, so content[] reads back what structuredContent carries as
+  // published: an alias opening "7. " stays one list item, a remark line opening
+  // "# " stays in the remark. A joined list is escaped as one string.
   format: (r) => {
-    const lines = [`# ${r.primaryName}`, ''];
+    const esc = escapeMarkdownInline;
+    const lines = [`# ${esc(r.primaryName)}`, ''];
     lines.push(
-      `**List:** ${r.sourceLabel} (\`${r.source}\`) | **Entry ID:** ${r.sourceEntryId}${r.referenceNumber ? ` | **Reference:** ${r.referenceNumber}` : ''}${r.unReferenceNumber ? ` | **UN reference:** ${escapeMarkdownInline(r.unReferenceNumber)}` : ''}`,
+      `**List:** ${r.sourceLabel} (\`${r.source}\`) | **Entry ID:** ${esc(r.sourceEntryId)}${r.referenceNumber ? ` | **Reference:** ${esc(r.referenceNumber)}` : ''}${r.unReferenceNumber ? ` | **UN reference:** ${esc(r.unReferenceNumber)}` : ''}`,
     );
     lines.push(`**Type:** ${r.entityType}`);
-    if (r.program) lines.push(`**Program:** ${r.program}`);
-    if (r.legalBasis) lines.push(`**Legal basis:** ${r.legalBasis}`);
-    if (r.designationDate) lines.push(`**Designated:** ${escapeMarkdownInline(r.designationDate)}`);
+    if (r.program) lines.push(`**Program:** ${esc(r.program)}`);
+    if (r.legalBasis) lines.push(`**Legal basis:** ${esc(r.legalBasis)}`);
+    if (r.designationDate) lines.push(`**Designated:** ${esc(r.designationDate)}`);
 
     if (r.aliases.length > 0) {
       lines.push('\n## Aliases');
-      for (const a of r.aliases) lines.push(`- ${a.name} (${a.nameType})`);
+      for (const a of r.aliases) lines.push(`- ${esc(a.name)} (${a.nameType})`);
     }
     if (r.identifiers.length > 0) {
       lines.push('\n## Identifiers');
       for (const i of r.identifiers) {
-        lines.push(`- **${i.type}:** ${i.value}${i.country ? ` (${i.country})` : ''}`);
+        lines.push(
+          `- **${esc(i.type)}:** ${esc(i.value)}${i.country ? ` (${esc(i.country)})` : ''}`,
+        );
       }
     }
     if (r.addresses.length > 0) {
@@ -259,7 +266,7 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       // country separately only when it is not that component.
       for (const a of r.addresses) {
         const inFull = a.full === a.country || a.full.endsWith(`, ${a.country}`);
-        lines.push(`- ${a.full}${a.country && !inFull ? ` — ${a.country}` : ''}`);
+        lines.push(`- ${esc(a.full)}${a.country && !inFull ? ` — ${esc(a.country)}` : ''}`);
       }
     }
     if (r.datesOfBirth.length > 0) {
@@ -268,21 +275,23 @@ export const getDesignationTool = tool('sanctions_get_designation', {
       // separately yields date-only and place-only entries.
       for (const d of r.datesOfBirth) {
         if (d.date) {
-          lines.push(`- ${d.circa ? 'circa ' : ''}${d.date}${d.place ? ` at ${d.place}` : ''}`);
-        } else if (d.place) lines.push(`- Born in ${d.place}`);
+          lines.push(
+            `- ${d.circa ? 'circa ' : ''}${esc(d.date)}${d.place ? ` at ${esc(d.place)}` : ''}`,
+          );
+        } else if (d.place) lines.push(`- Born in ${esc(d.place)}`);
       }
     }
     if (r.nationalities.length > 0)
-      lines.push(`\n**Nationalities:** ${r.nationalities.join(', ')}`);
+      lines.push(`\n**Nationalities:** ${esc(r.nationalities.join(', '))}`);
     if (r.features.length > 0) {
       lines.push('\n## Features');
       // An OFAC label can carry its own closing punctuation (`Secondary sanctions risk:`).
       for (const f of r.features) {
         const label = /[:-]$/.test(f.type) ? f.type : `${f.type}:`;
-        lines.push(`- **${label}** ${f.circa ? 'circa ' : ''}${f.value}`);
+        lines.push(`- **${esc(label)}** ${f.circa ? 'circa ' : ''}${esc(f.value)}`);
       }
     }
-    if (r.remarks) lines.push(`\n**Remarks:** ${r.remarks}`);
+    if (r.remarks) lines.push(`\n**Remarks:** ${esc(r.remarks)}`);
     lines.push(`\n> ${r.caveat}`);
     return [{ type: 'text', text: lines.join('\n') }];
   },

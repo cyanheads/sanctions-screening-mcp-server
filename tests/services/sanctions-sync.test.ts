@@ -13,13 +13,16 @@
  * @module tests/services/sanctions-sync.test
  */
 
+import { conflict } from '@cyanheads/mcp-ts-core/errors';
 import type { SqliteHandle } from '@cyanheads/mcp-ts-core/mirror';
+import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SOURCE_URLS, resetServerConfig } from '@/config/server-config.js';
 import { CSL_SOURCE_CODES } from '@/services/screening/csl-ingest.js';
 import {
   buildSanctionsIngesters,
   createSanctionsSync,
+  type HarvestOutcome,
   type SourceSyncFailure,
   type SourceSyncReport,
   toDesignationRow,
@@ -697,6 +700,83 @@ describe('createSanctionsSync — a failing source does not stop the others', ()
     ]);
     // A source with no deferred block writes its own programme, untouched.
     expect(rows.find((r) => r.id === 'eu:EU-1')).toMatchObject({ program: 'EUPROG' });
+  });
+});
+
+describe('createSanctionsSync — the run’s tail', () => {
+  /** Drain a sync wired with `onHarvestEnd`, logging the tail and the run's end in the order they happen. */
+  async function drainLogged(signal = new AbortController().signal) {
+    const events: string[] = [];
+    let outcomes: readonly HarvestOutcome[] | undefined;
+    const sync = createSanctionsSync({
+      ...NO_MIRROR,
+      onHarvestEnd: async (recorded) => {
+        events.push('tail');
+        outcomes = recorded;
+      },
+    });
+    const error = await drainSync(sync, signal).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    events.push(error ? 'threw' : 'returned');
+    return { error, events, outcomes };
+  }
+
+  it('hands the tail every list’s outcome in harvest order, before the run’s failure is thrown', async () => {
+    const bodies = new Map(SOURCE_BODIES);
+    bodies.delete(DEFAULT_SOURCE_URLS.ukSanctions);
+    stubSourceFetch(bodies);
+    const { error, events, outcomes } = await drainLogged();
+
+    expect(error?.message).toMatch(/Sanctions harvest failed for uk \(1 of 11 sources\)/);
+    expect(events).toEqual(['tail', 'threw']);
+    expect(outcomes?.map(({ source, status }) => [source, status])).toEqual(
+      SOURCE_CODES.map((code) => [code, code === 'uk' ? 'failed' : 'harvested']),
+    );
+    for (const outcome of outcomes ?? []) {
+      if (outcome.status === 'harvested') {
+        expect(outcome.harvestedAt, outcome.source).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+      }
+    }
+  });
+
+  it('runs the tail once after a run in which every list harvests', async () => {
+    stubSourceFetch();
+    const { error, events, outcomes } = await drainLogged();
+    expect(error).toBeUndefined();
+    expect(events).toEqual(['tail', 'returned']);
+    expect(outcomes?.map((outcome) => outcome.status)).toEqual(SOURCE_CODES.map(() => 'harvested'));
+  });
+
+  it('runs the tail on a caller abort with the lists that finished, and never after a lost lease', async () => {
+    const stopped = await drainLogged(
+      stubFetchAbortedOn(SOURCE_BODIES, DEFAULT_SOURCE_URLS.euFsf).signal,
+    );
+    expect(stopped.error).toBeDefined();
+    expect(stopped.events).toEqual(['tail', 'threw']);
+    expect(stopped.outcomes?.map(({ source, status }) => [source, status])).toEqual([
+      ['ofac_sdn', 'harvested'],
+      ['ofac_consolidated', 'harvested'],
+    ]);
+
+    // The runner aborts the generator with the takeover as the EU document is requested.
+    const lost = new AbortController();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url === DEFAULT_SOURCE_URLS.euFsf) {
+          lost.abort(conflict('Mirror sync lost its lease.', { reason: 'sync_lease_lost' }));
+          init?.signal?.throwIfAborted();
+        }
+        return new Response(SOURCE_BODIES.get(url) as string, { status: 200 });
+      }),
+    );
+    const taken = await drainLogged(lost.signal);
+    expect(taken.error).toBeDefined();
+    expect(taken.events).toEqual(['threw']);
   });
 });
 
@@ -1493,9 +1573,9 @@ describe('sanctionsFreshness — per-list harvest outcomes', () => {
         const { held, release } = holdRebuild(harness.service);
         const refresh = syncError(harness.service, 'refresh');
         await held;
-        // The sync has written its final state; the outcomes are not recorded yet.
+        // Every list has finished; neither the outcomes nor the final state are recorded yet.
         const state = await harness.service.designations.store.readState();
-        expect(state.status).toBe(missing ? 'error' : 'complete');
+        expect(state.status).toBe('in_progress');
         const startedAt = state.startedAt as string;
         for (const view of [harness.service, reader]) {
           expect(await view.sanctionsFreshness()).toEqual({
@@ -1680,18 +1760,198 @@ describe('sanctionsFreshness — per-list harvest outcomes', () => {
     }
   });
 
-  it('marks no list harvested when the index rebuild that follows the run fails', async () => {
+  it('marks no list harvested, and reads the run failed with no list named, when its index rebuild fails', async () => {
     harness = await freshService();
     stubSourceFetch(datedBodies());
     await syncError(harness.service, 'init');
     const before = await harness.service.sanctionsFreshness();
+    const asOf = (await harness.service.sanctionsReadiness()).completedAt;
 
     // Break the rebuild's first statement: its transaction then rolls back whole.
     const handle = (await harness.service.designations.raw()) as SqliteHandle;
     handle.exec(`DROP TRIGGER ${NAME_TABLE}_supplement_ai`);
     stubSourceFetch(datedBodies('2026-11-20T09:00:00.000+01:00'));
     expect((await syncError(harness.service, 'refresh'))?.message).toMatch(/no such trigger/);
+    const startedAt = await runStartedAt(harness.service);
 
-    expect((await harness.service.sanctionsFreshness()).sources).toEqual(before.sources);
+    expect(await harness.service.sanctionsFreshness()).toEqual({
+      lastRefresh: { status: 'error', startedAt },
+      sources: before.sources,
+    });
+    expect((await harness.service.sanctionsReadiness()).completedAt).toBe(asOf);
+  });
+});
+
+// ─── The run's own index rebuild, under its lease (issue #100) ─────────────────
+
+describe('the index rebuild a run ends with', () => {
+  let harness: SeededService | undefined;
+  afterEach(async () => {
+    await harness?.cleanup();
+    harness = undefined;
+  });
+
+  /** A refreshed mirror: init, then a refresh with `missing` answered 404. */
+  async function refreshed(missing?: string): Promise<SeededService> {
+    const state = await freshService();
+    stubSourceFetch(datedBodies());
+    expect(await syncError(state.service, 'init')).toBeUndefined();
+    const bodies = datedBodies('2026-11-20T09:00:00.000+01:00');
+    if (missing) bodies.delete(missing);
+    stubSourceFetch(bodies);
+    await syncError(state.service, 'refresh');
+    return state;
+  }
+
+  /** Leave marks only an index rebuild erases: the EU designation's names gone, one identifier row added. */
+  function markIndexes(handle: SqliteHandle): void {
+    handle.prepare(`DELETE FROM ${NAME_TABLE} WHERE designation_id = 'eu:EU-1'`).run();
+    handle
+      .prepare(
+        `INSERT INTO ${IDENTIFIER_TABLE} (designation_id, category, key, type, value) VALUES ('un:UN-1', 'passport', 'MARK100', 'Passport', 'MARK 100')`,
+      )
+      .run();
+  }
+
+  /** The marks {@link markIndexes} left, as `handle` reads them. */
+  function marks(handle: SqliteHandle): { euNames: number | undefined; mark: number | undefined } {
+    return {
+      euNames: handle
+        .prepare<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM ${NAME_TABLE} WHERE designation_id = 'eu:EU-1'`,
+        )
+        .get()?.n,
+      mark: handle
+        .prepare<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM ${IDENTIFIER_TABLE} WHERE key = 'MARK100'`,
+        )
+        .get()?.n,
+    };
+  }
+
+  it.each([
+    ['every list harvests', undefined],
+    ['the UK document is gone', DEFAULT_SOURCE_URLS.ukSanctions],
+  ] as const)(
+    'rebuilds neither index on a first open after a finished run, when %s',
+    async (_case, missing) => {
+      harness = await refreshed(missing);
+      expect((await harness.service.designations.store.readState()).status).toBe(
+        missing ? 'error' : 'complete',
+      );
+      markIndexes((await harness.service.designations.raw()) as SqliteHandle);
+
+      // A process starting on the mirror the run left.
+      const reader = buildScreeningService();
+      try {
+        await reader.sourceCounts();
+        expect(marks((await reader.designations.raw()) as SqliteHandle)).toEqual({
+          euNames: 0,
+          mark: 1,
+        });
+      } finally {
+        await reader.close();
+      }
+    },
+  );
+
+  it.each([
+    ['every list harvests', undefined, undefined],
+    ['the UK document is gone', DEFAULT_SOURCE_URLS.ukSanctions, ['uk']],
+  ] as const)(
+    'reads in_progress in a process whose first open lands after the last list and before the rebuild commits, and in the refreshing one, when %s',
+    async (_case, missing, failedSources) => {
+      harness = await freshService();
+      stubSourceFetch(datedBodies());
+      await syncError(harness.service, 'init');
+      const before = await harness.service.sanctionsFreshness();
+      const asOf = (await harness.service.sanctionsReadiness()).completedAt;
+
+      const bodies = datedBodies('2026-11-20T09:00:00.000+01:00');
+      if (missing) bodies.delete(missing);
+      stubSourceFetch(bodies);
+      const { held, release } = holdRebuild(harness.service);
+      const refresh = syncError(harness.service, 'refresh');
+      await held;
+      const startedAt = await runStartedAt(harness.service);
+
+      // A process starting on the mirror now (a server, `mirror:verify`).
+      const reader = buildScreeningService();
+      try {
+        for (const view of [reader, harness.service]) {
+          expect(await view.sanctionsFreshness()).toEqual({
+            lastRefresh: { status: 'in_progress', startedAt },
+            sources: before.sources,
+          });
+          expect((await view.sanctionsReadiness()).completedAt).toBe(asOf);
+        }
+        // Every list has finished; a run killed here leaves the mirror reading as running.
+        expect((await harness.service.designations.store.readState()).status).toBe('in_progress');
+
+        release();
+        const error = await refresh;
+        if (missing) expect(error?.message).toMatch(/Sanctions harvest failed for uk \(1 of 11/);
+        else expect(error).toBeUndefined();
+        for (const view of [reader, harness.service]) {
+          const after = await view.sanctionsFreshness();
+          expect(after.lastRefresh).toEqual(
+            failedSources
+              ? { status: 'error', startedAt, failedSources }
+              : { status: 'complete', startedAt },
+          );
+          for (const code of SOURCE_CODES) {
+            if (code === 'uk' && failedSources) expect(row(after, code)).toEqual(row(before, code));
+            else expect(row(after, code)!.lastHarvestedAt! >= startedAt, code).toBe(true);
+          }
+          // The as-of moves with a run in which every list harvested, once its indexes serve it.
+          const { completedAt } = await view.sanctionsReadiness();
+          if (missing) expect(completedAt).toBe(asOf);
+          else expect(completedAt! > asOf!).toBe(true);
+        }
+      } finally {
+        await reader.close();
+      }
+    },
+  );
+
+  it('keeps a first init from reading ready before its index rebuild commits', async () => {
+    harness = await freshService();
+    stubSourceFetch(datedBodies());
+    const { held, release } = holdRebuild(harness.service);
+    const init = syncError(harness.service, 'init');
+    await held;
+
+    const handle = (await harness.service.designations.raw()) as SqliteHandle;
+    const indexed = (id: string) =>
+      handle
+        .prepare<{ n: number }>(`SELECT COUNT(*) AS n FROM ${NAME_TABLE} WHERE designation_id = ?`)
+        .get(id)?.n;
+    // Every list is stored, but the name index serves none of it yet.
+    expect(await harness.service.designations.store.count()).toBeGreaterThan(0);
+    expect(indexed('eu:EU-1')).toBe(0);
+    const reader = buildScreeningService();
+    try {
+      for (const view of [harness.service, reader]) {
+        expect(await view.sanctionsReady()).toBe(false);
+        expect((await view.sanctionsReadiness()).ready).toBe(false);
+      }
+
+      release();
+      expect(await init).toBeUndefined();
+      expect(await reader.sanctionsReady()).toBe(true);
+      const screened = await reader.screenName(
+        {
+          query: 'Offline EU Person',
+          entityType: 'any',
+          matchMode: 'strict',
+          sources: [...SOURCE_CODES],
+          limit: 25,
+        },
+        createMockContext(),
+      );
+      expect(screened.hits.map((hit) => `${hit.source}:${hit.sourceEntryId}`)).toContain('eu:EU-1');
+    } finally {
+      await reader.close();
+    }
   });
 });

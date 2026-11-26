@@ -11,6 +11,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { identifierProbes } from '@/services/screening/identifier-matching.js';
 import { getScreeningService } from '@/services/screening/screening-service.js';
 import { SOURCE_CODES, SOURCE_LABELS } from '@/services/screening/types.js';
@@ -158,6 +159,9 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
     };
   },
 
+  // Every string a list publishes passes through escapeMarkdownInline here, never in
+  // the handler, so content[] reads back what structuredContent carries as
+  // published. Source codes stay code spans.
   format: (result) => {
     const lines: string[] = [];
     if (result.hits.length === 0) {
@@ -168,14 +172,16 @@ export const screenIdentifierTool = tool('sanctions_screen_identifier', {
       );
       for (const h of result.hits) {
         const also = alsoListedText(h.source, h.sources);
-        lines.push(`### ${h.primaryName}`);
+        lines.push(`### ${escapeMarkdownInline(h.primaryName)}`);
         lines.push(
-          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${h.sourceEntryId} | **Type:** ${h.entityType}`,
+          `**List:** ${h.sourceLabel} (\`${h.source}\`)${also ? ` | **Also listed on:** ${also}` : ''} | **Entry ID:** ${escapeMarkdownInline(h.sourceEntryId)} | **Type:** ${h.entityType}`,
         );
-        if (h.program) lines.push(`**Program:** ${h.program}`);
+        if (h.program) lines.push(`**Program:** ${escapeMarkdownInline(h.program)}`);
         lines.push('**Matched identifiers:**');
         for (const i of h.matchedIdentifiers) {
-          lines.push(`- **${i.type}:** ${i.value}${i.country ? ` (${i.country})` : ''}`);
+          lines.push(
+            `- **${escapeMarkdownInline(i.type)}:** ${escapeMarkdownInline(i.value)}${i.country ? ` (${escapeMarkdownInline(i.country)})` : ''}`,
+          );
         }
         lines.push('');
       }

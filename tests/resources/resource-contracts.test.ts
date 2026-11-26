@@ -163,8 +163,9 @@ async function rewrittenRefreshService(status: 'in_progress' | 'error'): Promise
 }
 
 /**
- * A refreshed mirror whose next refresh, in which every list harvests, has written
- * its final sync state and is held before its index rebuild. Cleanup lets it finish.
+ * A refreshed mirror whose next refresh, in which every list harvests, has
+ * harvested its last list and is held before its index rebuild, its sync state
+ * still running. Cleanup lets it finish.
  */
 async function finishingRefreshService(): Promise<SeededService> {
   const state = await refreshedService();
@@ -172,7 +173,7 @@ async function finishingRefreshService(): Promise<SeededService> {
   const { held, release } = holdRebuild(state.service);
   const run = state.service.syncSanctions('refresh', new AbortController().signal);
   await held;
-  expect((await state.service.designations.store.readState()).status).toBe('complete');
+  expect((await state.service.designations.store.readState()).status).toBe('in_progress');
   return {
     service: state.service,
     cleanup: async () => {

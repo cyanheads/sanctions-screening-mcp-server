@@ -200,7 +200,8 @@ export const leiStoreSpec: Omit<SqliteMirrorStoreSpec, 'path'> = {
  * from; and the per-identifier `designation_identifier` index (one row per
  * published identifier, keyed by its category's normalized form, with the label
  * and value as published) with its own stamp; and `source_harvest`, one row per
- * sanctions list, written by the post-sync index rebuild: when its last
+ * sanctions list, written by the rebuild a sanctions run ends with, before its
+ * final state: when its last
  * successful harvest completed (`harvested_at`, UTC) and the publisher's date on
  * that document (`published_at`), plus how its last attempt ended
  * (`attempt_status`, `harvested` or `failed`) and the sync-state `startedAt` of

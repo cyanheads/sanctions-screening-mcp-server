@@ -11,6 +11,7 @@
 import { createApp } from '@cyanheads/mcp-ts-core';
 import { config } from '@cyanheads/mcp-ts-core/config';
 import { allPromptDefinitions } from './mcp-server/prompts/definitions/index.js';
+import { SERVER_INSTRUCTIONS } from './mcp-server/server-instructions.js';
 import {
   scheduleSanctionsRefresh,
   stopSanctionsRefresh,
@@ -35,8 +36,7 @@ await createApp({
   resources,
   prompts: allPromptDefinitions,
   skills: 'skills',
-  instructions:
-    'Screen names and identifiers against eleven OFAC, EU, UK, UN, BIS, and State sanctions and export-control lists offline over a keyless mirror. Use sanctions_screen_name or sanctions_screen_identifier; sanctions_resolve_entity → sanctions_get_entity → sanctions_trace_ownership resolves GLEIF identity and accounting-consolidation relationships. Drain trace pages before same-side boundary recovery. The sanctions-screening-guide skill covers identity confirmation, continuation and uncertainty. Results are a screening aid, never a compliance determination or clearance. Check sanctions_list_sources for configured lists, stored counts, the last harvest and document date of each list, and a refresh that is running or failed; a document date does not say when the list content last changed. Verify candidates against official agency lists and Federal Register publications.',
+  instructions: SERVER_INSTRUCTIONS,
   // The tool, resource, and prompt surface is fixed at startup — nothing
   // registers or retires a definition at runtime — so a 2026-07-28 client may
   // hold the listings for an hour. Shared caches may too: the same listings are

@@ -16,13 +16,17 @@ import {
   doubleMetaphone,
   FUZZY_STOPLIST,
   fold,
-  foldLegalForms,
   hasOtherScriptLetter,
+  holdsEveryWord,
   isStoplistToken,
   jaro,
   jaroWinkler,
   LEGAL_FORM_SPELLINGS,
+  legalFormReadings,
   lengthRatio,
+  nativeWords,
+  oneToOneCoverage,
+  SOUND_MIN_SIMILARITY,
   scoreTokenPairs,
   scoringQuery,
   soundKeys,
@@ -31,6 +35,9 @@ import {
   tokenize,
 } from '@/services/screening/text-matching.js';
 import { expectLinearTime } from './_linear-time.js';
+
+/** The first {@link legalFormReadings} reading of a normalized name: its legal-form fold. */
+const legalFormFold = (normalized: string): string[] => legalFormReadings(normalized)[0] ?? [];
 
 /**
  * Asserts `run`'s thread CPU time (µs per call) over `make(size)` stays under
@@ -76,6 +83,57 @@ describe('fuzzy comparison forms and deletion signatures', () => {
     expect(comparisonForms('Rosneft')).toEqual(['rosneft']);
     expect(comparisonForms('ъь')).toEqual(['ъь']);
   });
+
+  it.each([
+    // Two native words, one romanized spelling.
+    [
+      'Мэр Мер',
+      [
+        ['мэр', 'мер'],
+        ['мэр', 'мер'],
+      ],
+    ],
+    // One native word twice (`ё` folds to `е`), two romanized spellings.
+    [
+      'Семён Семен',
+      [
+        ['семен', 'семен'],
+        ['семен', 'семен'],
+      ],
+    ],
+    // A word of `ъ` and `ь` alone romanizes to nothing; a word holding one keeps its place.
+    ['Альфа Ъ', [['альфа', 'ъ'], ['альфа']]],
+    [
+      'Объект Ъь — Мир',
+      [
+        ['объект', 'ъь', 'мир'],
+        ['объект', 'мир'],
+      ],
+    ],
+    [
+      'АО Almaz',
+      [
+        ['ао', 'almaz'],
+        ['ао', 'almaz'],
+      ],
+    ],
+    ['Rosneft', [['rosneft']]],
+    // `ꚜ` folds to `ъ` but romanizes as itself, so the forms do not align: each keeps its own.
+    [
+      'Мир ꚜ',
+      [
+        ['мир', 'ъ'],
+        ['mir', 'ъ'],
+      ],
+    ],
+  ])(
+    'pairs each token of a comparison form with the native word it spells: %s',
+    (raw, expected) => {
+      const forms = comparisonForms(raw).map(tokenize);
+      const native = forms[0] ?? [];
+      expect(forms.map((tokens) => nativeWords(native, tokens))).toEqual(expected);
+    },
+  );
 
   it('keeps useful two-point signatures and whole supplementary-plane letters', () => {
     expect(deletionSignatures(['a', 'ab', 'abc', 'abc'])).toEqual(['ab', 'abc', 'bc', 'ac']);
@@ -562,6 +620,336 @@ describe('scoreTokenPairs — words that sound alike (issue #92)', () => {
   );
 });
 
+describe('oneToOneCoverage — each query word takes a name word of its own (issue #98)', () => {
+  const count = (query: string[], candidate: string[], threshold = 0.85) =>
+    oneToOneCoverage(scoringQuery(query), candidate, threshold, soundKeys());
+
+  it('holds the sound floor at 0.65', () => {
+    expect(SOUND_MIN_SIMILARITY).toBe(0.65);
+  });
+
+  it.each([
+    // One name word for two query words: `yong` (0.9467, 1), `nasim` (0.9467, 0.8667).
+    ['one name word for two query words', ['young', 'yong'], ['ryom', 'yong'], 1],
+    ['one name word for two spelled query words', ['naim', 'qasim'], ['al', 'nasim'], 1],
+    // `young` reaches `wong` (sound) and `yung`; `yong` reaches both too.
+    ['two query words on two name words', ['young', 'yong'], ['wong', 'yung', 'fai'], 2],
+    [
+      'an identical query word once',
+      ['saleh', 'mosfer', 'saleh', 'al', 'shaer'],
+      ['al', 'shaer', 'salih', 'misfer'],
+      3,
+    ],
+    // Each `saleh` of the query reaches a `saleh` here; counted once, it takes one.
+    [
+      'an identical query word once, against a name repeating it',
+      ['saleh', 'mosfer', 'saleh', 'al', 'shaer'],
+      ['saleh', 'saleh', 'mosfer'],
+      2,
+    ],
+    // Each occurrence of a name word is a word of its own.
+    ['a repeated name word, once per occurrence', ['hassan', 'hasan'], ['hasan', 'hasan'], 2],
+    ['no stoplisted query word', ['rosneft', 'oil', 'company'], ['rosneft', 'oil'], 2],
+    // `qasim` first takes `kassem`, then gives it up for `nasim`, which `naim` gives up for `naim`.
+    ['seats past two holders', ['qasim', 'naim', 'kassem'], ['kassem', 'nasim', 'naim'], 3],
+    ['an empty query', [], ['hannibal'], 0],
+    ['an empty name', ['hannibal'], [], 0],
+  ])('counts %s', (_label, query, candidate, expected) => {
+    expect(count(query, candidate)).toBe(expected);
+  });
+
+  it.each([
+    ['gaddafi ~ qadhafi (0.8095)', ['hannibal', 'gaddafi'], ['hannibal', 'muammar', 'qadhafi'], 2],
+    ['brygada ~ brigade (0.8476)', ['brygada', 'kani'], ['kani', 'brigade'], 2],
+    ['qasim ~ kassem (0.70)', ['qasim', 'naim'], ['kassem', 'naim'], 2],
+    ['husayn ~ hossein (0.6786)', ['husayn'], ['hossein'], 1],
+    ['never ping ~ bank (0.5)', ['ping'], ['bank'], 0],
+    ['never ping ~ banca (0.4833)', ['ping', 'an'], ['banca', 'finservice', 's', 'a'], 1],
+    ['never oleksiy ~ alexei (0.6429)', ['oleksiy', 'petrenko'], ['alexei', 'petrenko'], 1],
+  ])(
+    'pairs words that sound alike at the floor or above: %s',
+    (_label, query, candidate, expected) => {
+      expect(count(query, candidate)).toBe(expected);
+    },
+  );
+
+  it.each([
+    // `мэр` and `мер` both romanize to `mer`: two words, each taking a `mer` of its own.
+    [
+      'two native words spelled alike, on two name words',
+      ['mer', 'mer'],
+      ['мэр', 'мер'],
+      ['mer', 'mer'],
+      2,
+    ],
+    [
+      'two native words spelled alike, on one name word',
+      ['mer', 'mer'],
+      ['мэр', 'мер'],
+      ['mer', 'trading'],
+      1,
+    ],
+    // `Семён Семен` folds to `семен` twice and romanizes two ways: one word, as strict reads it.
+    [
+      'one native word spelled two ways',
+      ['semyon', 'semen'],
+      ['семен', 'семен'],
+      ['semyon', 'semenov'],
+      1,
+    ],
+  ])(
+    'counts the word each token spells, never its romanized text: %s',
+    (_label, tokens, words, candidate, expected) => {
+      expect(oneToOneCoverage(scoringQuery(tokens, words), candidate, 0.85, soundKeys())).toBe(
+        expected,
+      );
+    },
+  );
+
+  it('holds the floor to sound alone: a pair the threshold reaches pairs by spelling', () => {
+    expect(jaroWinkler('ping', 'bank')).toBe(0.5);
+    expect(count(['ping'], ['bank'], 0.5)).toBe(1);
+    expect(count(['ping'], ['bank'], 0.51)).toBe(0);
+  });
+
+  it.each([
+    // `alfa` ~ `al` 0.8667, `an` ~ `and` 0.9111, `de` ~ `del` 0.9111.
+    ['al for alfa', ['alfa', 'bank'], ['abou', 'bakr', 'al', 'djazairi'], 1],
+    ['and for an', ['an'], ['and'], 0],
+    ['and, by sound, for anita', ['anita', 'rahimi'], ['rahimi', 'and', 'sons'], 1],
+    ['del for de in a query of stoplisted words', ['de', 'la'], ['del', 'la'], 1],
+  ])(
+    'never pairs a stoplisted name word with a different query word of two letters or more: %s',
+    (_label, query, candidate, expected) => {
+      expect(count(query, candidate)).toBe(expected);
+    },
+  );
+
+  it.each([
+    // The fold makes `A-Emmeh` a lone `a`, which spells only `al` (0.85).
+    [
+      'al for the a of A-Emmeh',
+      ['samen', 'al', 'a', 'emmeh', 'industries', 'group'],
+      ['samen', 'al', 'aemeh', 'industries', 'group'],
+      5,
+    ],
+    // `70.º` folds to `70 o`, and `o` spells only `of` (0.85).
+    [
+      'of for the o of 70.º',
+      [
+        'planta',
+        'de',
+        'nizhny',
+        'novgorod',
+        'del',
+        '70',
+        'o',
+        'aniversario',
+        'de',
+        'la',
+        'victoria',
+      ],
+      [
+        'joint',
+        'stock',
+        'company',
+        'nizhny',
+        'novgorod',
+        'plant',
+        'of',
+        'the',
+        '70th',
+        'anniversary',
+        'of',
+        'victory',
+      ],
+      7,
+    ],
+    // Still one to one: `b` reaches no word, `a` takes `al`.
+    ['al for a, one word for one', ['a', 'b'], ['al'], 1],
+  ])(
+    'pairs a one-letter query word with a stoplisted name word its spelling reaches: %s',
+    (_label, query, candidate, expected) => {
+      expect(count(query, candidate)).toBe(expected);
+    },
+  );
+
+  it.each([
+    ['and', ['and'], ['and'], 1],
+    [
+      'limited liability company',
+      ['limited', 'liability', 'company'],
+      ['limitid', 'liability', 'compani'],
+      3,
+    ],
+  ])(
+    'pairs a stoplisted name word with the same word: %s',
+    (_label, query, candidate, expected) => {
+      expect(count(query, candidate)).toBe(expected);
+    },
+  );
+
+  it('equals a search of every one-to-one assignment over 20,000 random token lists, in any order', () => {
+    const random = seeded(98);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    // Families of spelling neighbours and sound-alikes on both sides of the floor,
+    // with stoplisted and astral words. Drawing most of a case from one family
+    // makes words compete for the same name words.
+    const FAMILIES = [
+      ['qasim', 'kassem', 'kasim', 'naim', 'nasim', 'nassim'],
+      ['young', 'yong', 'yung', 'wong', 'jong'],
+      ['hassan', 'hasan', 'hussein', 'husayn', 'hossein', 'husein'],
+      ['gaddafi', 'qadhafi', 'hannibal', 'oleksiy', 'alexei', 'oleksii'],
+      ['ping', 'an', 'bank', 'banca', 'and', 'a'],
+      ['alfa', 'al', 'af', 'bank', 'bakr'],
+      ['ltd', 'company', 'de', 'la', 'del', '𠀀𠀁𠀂', '𠀀𠀁𠀃'],
+    ];
+    const VOCABULARY = FAMILIES.flat();
+    let family: readonly string[] = VOCABULARY;
+    const tokens = (min: number, max: number): string[] =>
+      Array.from({ length: min + Math.floor(random() * (max - min + 1)) }, () =>
+        pick(random() < 0.85 ? family : VOCABULARY),
+      );
+    /** The pairing rule, restated over the primitives: spelling, then sound at the floor. */
+    const pairs = (q: string, c: string, threshold: number): boolean => {
+      const score = jaroWinkler(q, c);
+      if (score >= threshold) return q === c || !isStoplistToken(c) || [...q].length === 1;
+      const key = doubleMetaphone(q);
+      return (
+        !isStoplistToken(q) &&
+        !isStoplistToken(c) &&
+        key.length >= 3 &&
+        doubleMetaphone(c) === key &&
+        score >= 0.65
+      );
+    };
+    /** The largest assignment, by trying every name word, or none, for each query word in turn. */
+    const largest = (words: string[], candidate: string[], threshold: number): number => {
+      const taken = new Set<number>();
+      const search = (i: number): number => {
+        const word = words[i];
+        if (word === undefined) return 0;
+        let most = search(i + 1);
+        for (const [j, c] of candidate.entries()) {
+          if (taken.has(j) || !pairs(word, c, threshold)) continue;
+          taken.add(j);
+          most = Math.max(most, 1 + search(i + 1));
+          taken.delete(j);
+        }
+        return most;
+      };
+      return search(0);
+    };
+    const mismatches: unknown[] = [];
+    const exercised = {
+      greedyShort: 0,
+      oneForTwo: 0,
+      belowFloor: 0,
+      stoplistRefused: 0,
+      letterOnStoplisted: 0,
+    };
+    for (let i = 0; i < 20_000; i++) {
+      family = pick(FAMILIES);
+      const queryTokens = tokens(0, 5);
+      const candidateTokens = tokens(0, 5);
+      const threshold = pick([0.7, 0.85, 0.85, 0.9, 1]);
+      const words = [...new Set(splitOnStoplist(queryTokens).distinctive)];
+      const expected = largest(words, candidateTokens, threshold);
+      const actual = count(queryTokens, candidateTokens, threshold);
+      const reordered = count(
+        [...queryTokens].reverse(),
+        [...candidateTokens].reverse(),
+        threshold,
+      );
+      if (actual !== expected || reordered !== expected) {
+        mismatches.push({ queryTokens, candidateTokens, threshold, expected, actual, reordered });
+      }
+      // Each first free name word in order, never moving one already seated.
+      const seated = new Set<number>();
+      for (const word of words) {
+        const j = candidateTokens.findIndex((c, k) => !seated.has(k) && pairs(word, c, threshold));
+        if (j !== -1) seated.add(j);
+      }
+      if (seated.size < expected) exercised.greedyShort++;
+      const perWord = words.filter((word) =>
+        candidateTokens.some((c) => pairs(word, c, threshold)),
+      );
+      if (perWord.length > expected) exercised.oneForTwo++;
+      for (const q of words) {
+        for (const c of candidateTokens) {
+          const score = jaroWinkler(q, c);
+          if (score < threshold && score < 0.65 && doubleMetaphone(q) === doubleMetaphone(c)) {
+            if (doubleMetaphone(q).length >= 3 && !isStoplistToken(q) && !isStoplistToken(c)) {
+              exercised.belowFloor++;
+            }
+          }
+          if (score >= threshold && q !== c && isStoplistToken(c)) {
+            if ([...q].length === 1) exercised.letterOnStoplisted++;
+            else exercised.stoplistRefused++;
+          }
+        }
+      }
+    }
+    expect(mismatches.slice(0, 5)).toEqual([]);
+    for (const [shape, n] of Object.entries(exercised)) expect(n, shape).toBeGreaterThan(0);
+  });
+});
+
+describe('holdsEveryWord — a name word for each query word, by exact spelling (issue #99)', () => {
+  it.each([
+    // Two native words, one romanized spelling: a `mer` for each.
+    ['mer mer', ['мэр', 'мер'], 'mer mer', true],
+    ['mer mer', ['мэр', 'мер'], 'mer trading', false],
+    // An identical query word is one word.
+    ['saleh mosfer saleh', undefined, 'saleh mosfer', true],
+    // Stoplisted words count: `el` twice.
+    ['el el bank', ['эль', 'ель', 'банк'], 'el bank', false],
+    ['el el bank', ['эль', 'ель', 'банк'], 'el el bank', true],
+    // Spelling only, no similarity.
+    ['bespilotnye sistemy', undefined, 'bespilotnyye sistemy', false],
+    ['', undefined, 'mer', true],
+    ['mer', undefined, '', false],
+  ])('%s (words %j) in %s: %s', (query, words, name, expected) => {
+    const tokens = tokenize(query);
+    expect(holdsEveryWord(scoringQuery(tokens, words), tokenize(name))).toBe(expected);
+  });
+
+  it('equals a search of every exact-spelling assignment over 5,000 random token lists', () => {
+    const random = seeded(99);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    const list = <T>(items: readonly T[]): T[] =>
+      Array.from({ length: Math.floor(random() * 6) }, () => pick(items));
+    const mismatches: unknown[] = [];
+    for (let i = 0; i < 5_000; i++) {
+      // Few texts and words, so words share a spelling and a word takes two spellings.
+      const tokens = list(['mer', 'el', 'bank', 'ao', 'semyon']);
+      const query = scoringQuery(
+        tokens,
+        tokens.map(() => pick(['мэр', 'мер', 'эль', 'банк', 'ао'])),
+      );
+      const name = list(['mer', 'el', 'bank', 'ao', 'semyon']);
+      const seen = new Set<string>();
+      const words = query.filter((q) => !seen.has(q.word) && Boolean(seen.add(q.word)));
+      const taken = new Set<number>();
+      /** Seats words `i` onward, each on a name word of its own spelled as its first token. */
+      const seatsAll = (i: number): boolean => {
+        const q = words[i];
+        if (q === undefined) return true;
+        return name.some((c, j) => {
+          if (taken.has(j) || c !== q.text) return false;
+          taken.add(j);
+          const rest = seatsAll(i + 1);
+          taken.delete(j);
+          return rest;
+        });
+      };
+      const expected = seatsAll(0);
+      if (holdsEveryWord(query, name) !== expected) mismatches.push({ tokens, query, name });
+    }
+    expect(mismatches.slice(0, 5)).toEqual([]);
+  });
+});
+
 describe('lengthRatio', () => {
   it('is 1 for equal-length strings and for two empty strings', () => {
     expect(lengthRatio('volkov', 'moros!')).toBe(1); // both 6 chars
@@ -690,7 +1078,7 @@ describe('legal-form spellings (issue #90)', () => {
     ['Limited Liability Partnership', 'llp'],
     ['Aktiengesellschaft', 'ag'],
   ])('folds %j to its form %j', (raw, canonical) => {
-    expect(foldLegalForms(fold(raw))).toEqual([canonical]);
+    expect(legalFormFold(fold(raw))).toEqual([canonical]);
   });
 
   it('keeps different forms apart: JSC, PJSC, OJSC, CJSC; LLC and Ltd; Company and Corporation', () => {
@@ -711,7 +1099,7 @@ describe('legal-form spellings (issue #90)', () => {
       'Company',
       'Corp',
       'Corporation',
-    ].map((raw) => foldLegalForms(fold(raw)).join(' '));
+    ].map((raw) => legalFormFold(fold(raw)).join(' '));
     expect(forms).toEqual([
       ...['jsc', 'jsc', 'pjsc', 'pjsc', 'ojsc', 'ojsc', 'cjsc', 'cjsc'],
       ...['llc', 'llc', 'ltd', 'ltd', 'co', 'co', 'corp', 'corp'],
@@ -733,7 +1121,7 @@ describe('legal-form spellings (issue #90)', () => {
     ['Ltd', 'Limited Partnership', 'ltd', 'lp'],
     ['Ltd', 'Public Limited Company', 'ltd', 'plc'],
   ])('folds %j and %j to %j and %j, never a word of one form left loose', (a, b, foldA, foldB) => {
-    const form = (raw: string) => foldLegalForms(fold(raw)).join(' ');
+    const form = (raw: string) => legalFormFold(fold(raw)).join(' ');
     expect([form(a), form(b)]).toEqual([foldA, foldB]);
   });
 
@@ -771,7 +1159,7 @@ describe('legal-form spellings (issue #90)', () => {
       ['beijing', 'qiji', 'chuangtan', 'phase', 'i', 'venture', 'capital', 'center', 'lp'],
     ],
   ])('folds the published name %j to one form, not a word of another', (raw, expected) => {
-    expect(foldLegalForms(fold(raw))).toEqual(expected);
+    expect(legalFormFold(fold(raw))).toEqual(expected);
   });
 
   it.each([
@@ -800,7 +1188,7 @@ describe('legal-form spellings (issue #90)', () => {
     ['общество с ограниченнои ответственностью гелиос', ['llc', 'гелиос']],
     ['', []],
   ])('folds %j longest spelling first, left to right', (normalized, expected) => {
-    expect(foldLegalForms(normalized)).toEqual(expected);
+    expect(legalFormFold(normalized)).toEqual(expected);
   });
 
   it('widens each legal form of a fold to every spelling, quoted like the literal match', () => {
@@ -863,10 +1251,138 @@ describe('legal-form spellings (issue #90)', () => {
     'bounds the legal-form fold and its match CPU across increasing input sizes: $label',
     ({ make, largest }) => {
       expectBoundedCpuGrowth(
-        (input) => buildLegalFormFtsMatch(foldLegalForms(input)),
+        (input) => buildLegalFormFtsMatch(legalFormFold(input)),
         make,
         largest,
       );
+    },
+    0,
+  );
+});
+
+describe('public-company spellings of PLC (issue #101)', () => {
+  it.each([
+    ['Public Company Limited'],
+    ['Public Company Ltd'],
+    ['Public Ltd'],
+    ['PUBLIC  COMPANY  LTD.'],
+  ])('folds %j to plc', (raw) => {
+    expect(legalFormFold(fold(raw))).toEqual(['plc']);
+  });
+
+  it.each([
+    ['Public Limited Company', ['plc']],
+    ['Public Joint Stock Company', ['pjsc']],
+    ['Non-Public Joint Stock Company', ['jsc']],
+    // A longer form opening at `public` wins over a public-company spelling.
+    ['Public Joint Stock Company Limited', ['pjsc', 'ltd']],
+    // ofac_sdn 36063 as published: a bare `public company` is none of the three.
+    ['Amur Shipbuilding Plant Public Company', ['amur', 'shipbuilding', 'plant', 'public', 'co']],
+    ['Public Limited', ['public', 'ltd']],
+  ])('keeps %j folded as %j (characterization)', (raw, expected) => {
+    expect(legalFormFold(fold(raw))).toEqual(expected);
+  });
+
+  it.each([
+    ['MERITWISE GROUP PUBLIC LTD', ['meritwise', 'group', 'plc']],
+    [
+      'Myanmar  Economic  Holdings  Public  Company  Ltd',
+      ['myanmar', 'economic', 'holdings', 'plc'],
+    ],
+    ['Myanma Economic Holdings Public Company Limited', ['myanma', 'economic', 'holdings', 'plc']],
+    // Read longest first, the spelling takes `limited` away from `limited liability company`.
+    ['Public Company Limited Liability Company', ['plc', 'liability', 'co']],
+  ])('folds the name %j longest spelling first to %j', (raw, expected) => {
+    expect(legalFormFold(fold(raw))).toEqual(expected);
+  });
+
+  it.each([
+    // No public-company spelling: one reading, the fold.
+    ['evraz plc', [['evraz', 'plc']]],
+    // `Ltd` never reads inside `Public Limited Company`.
+    [
+      'public limited company scientific research institute',
+      [['plc', 'scientific', 'research', 'institute']],
+    ],
+    ['myanmar economic holdings limited', [['myanmar', 'economic', 'holdings', 'ltd']]],
+    ['public joint stock company limited', [['pjsc', 'ltd']]],
+    ['', [[]]],
+    // One spelling: `plc`, then word by word.
+    [
+      'meritwise group public ltd',
+      [
+        ['meritwise', 'group', 'plc'],
+        ['meritwise', 'group', 'public', 'ltd'],
+      ],
+    ],
+    [
+      'myanma economic holdings public company limited',
+      [
+        ['myanma', 'economic', 'holdings', 'plc'],
+        ['myanma', 'economic', 'holdings', 'public', 'co', 'ltd'],
+      ],
+    ],
+    // Two spellings in one name: each reading reads both the same way.
+    [
+      'public ltd holdings public company limited',
+      [
+        ['plc', 'holdings', 'plc'],
+        ['public', 'ltd', 'holdings', 'public', 'co', 'ltd'],
+      ],
+    ],
+    // Word by word, the words regroup into a longer form of their own.
+    [
+      'public company limited liability company',
+      [
+        ['plc', 'liability', 'co'],
+        ['public', 'co', 'llc'],
+      ],
+    ],
+    // A longer form beside a public-company spelling keeps its reading in both.
+    [
+      'public joint stock company public ltd',
+      [
+        ['pjsc', 'plc'],
+        ['pjsc', 'public', 'ltd'],
+      ],
+    ],
+  ])('reads the stored name %j as %j', (normalized, expected) => {
+    expect(legalFormReadings(normalized)).toEqual(expected);
+  });
+
+  it('widens plc to every spelling of it, the public-company ones among them', () => {
+    expect(buildLegalFormFtsMatch(legalFormFold('evraz public ltd'))).toBe(
+      '"evraz" AND ("plc" OR "public limited company" OR "public company limited" OR "public company ltd" OR "public ltd")',
+    );
+  });
+
+  it.each([
+    { label: 'a long digit run', make: (n: number) => '1'.repeat(n), largest: 320_000 },
+    {
+      label: 'one long line ending in a break',
+      make: (n: number) => `${'§1 x'.repeat(n / 4)}\ny`,
+      largest: 80_000,
+    },
+    { label: 'breaks throughout', make: (n: number) => '  \r\n'.repeat(n / 4), largest: 80_000 },
+    {
+      label: 'a public-company opener with no closer',
+      make: (n: number) => 'public company '.repeat(n / 15),
+      largest: 80_000,
+    },
+    {
+      label: 'public-company spellings throughout',
+      make: (n: number) => 'public ltd '.repeat(n / 11),
+      largest: 80_000,
+    },
+    {
+      label: 'spellings that regroup word by word',
+      make: (n: number) => 'public company limited liability '.repeat(n / 33),
+      largest: 80_000,
+    },
+  ])(
+    'reading a name’s legal forms stays linear in its length: $label',
+    async ({ make, largest }) => {
+      await expectLinearTime((text) => legalFormReadings(fold(text)), make, largest, 250);
     },
     0,
   );

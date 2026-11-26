@@ -17,6 +17,7 @@
 import { createHash } from 'node:crypto';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { canonicalLei, LeiInputSchema } from '@/mcp-server/normalize-inputs.js';
 import {
   type CrossReferenceResult,
@@ -33,6 +34,7 @@ import {
 import {
   alsoListedText,
   crossReferencePointer,
+  entryRefText,
   HitSourcesSchema,
   MatchedIdentifierSchema,
   matchedIdentifierText,
@@ -384,7 +386,9 @@ function parentLevelText(
   edgeShown: boolean,
   pagedSegment = false,
 ): string {
-  const reasons = level.exceptionReasons?.length ? ` (${level.exceptionReasons.join(', ')})` : '';
+  const reasons = level.exceptionReasons?.length
+    ? ` (${escapeMarkdownInline(level.exceptionReasons.join(', '))})`
+    : '';
   const where =
     level.status !== 'relationship'
       ? ''
@@ -885,6 +889,13 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     };
   },
 
+  /**
+   * GLEIF and list text is escaped with escapeMarkdownInline at this boundary, never
+   * in the handler, so content[] reads back what structuredContent carries as
+   * published (crossReferencePointer returns its clause already escaped). A joined
+   * list is escaped as one string: an authored `; ` after a value ending `&amp`
+   * would otherwise complete an entity reference. LEIs stay code spans.
+   */
   format: (r) => {
     const lines = [`# Ownership graph for \`${r.rootLei}\``, ''];
     lines.push(`**${r.nodes.length} node(s), ${r.edges.length} edge(s).**`);
@@ -929,6 +940,8 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       );
     }
 
+    // A blank line ends any truncation or branch list above, which these lines would otherwise continue.
+    lines.push('');
     if (!r.reportingExceptionsLoaded) {
       lines.push(
         '**Reporting exceptions:** not loaded — a parent level with no published relationship reads unknown, never "no parent". mirror:refresh loads them, or mirror:init on a mirror loaded before they existed.',
@@ -948,11 +961,13 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
     const recordless = new Set(r.missingEntityLeis);
     lines.push('\n## Entities');
     for (const node of r.nodes) {
-      const meta = [node.jurisdiction, node.status].filter(Boolean).join(', ');
+      const meta = escapeMarkdownInline(
+        [node.jurisdiction, node.status].filter(Boolean).join(', '),
+      );
       const via = node.reachedVia
         ? ', reached only via an ultimate-parent edge (leaf, not walked)'
         : '';
-      const entity = `- **${node.legalName}** \`${node.lei}\` — ${node.role}, depth ${node.depth}${meta ? ` (${meta})` : ''}${via}`;
+      const entity = `- **${escapeMarkdownInline(node.legalName)}** \`${node.lei}\` — ${node.role}, depth ${node.depth}${meta ? ` (${meta})` : ''}${via}`;
       const levelText = (name: ParentLevel, form: 'block' | 'line'): string =>
         node.parentStatus
           ? parentLevelText(
@@ -970,7 +985,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       const screenedNote = !hasRecord
         ? ': the LEI lookup only (no Level 1 record, so no name was screened)'
         : screenedInputs.length > 0
-          ? ` beyond the legal name and LEI: ${screenedInputs.map(screenedInputText).join('; ')}`
+          ? ` beyond the legal name and LEI: ${escapeMarkdownInline(screenedInputs.map(screenedInputText).join('; '))}`
           : undefined;
 
       // A node with no potential matches — screened or not — is one line carrying
@@ -1004,10 +1019,11 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
             ? [`matched "${h.matchedName}" — ${h.matchType}${scoreStr}`]
             : []),
           ...(h.matchedIdentifiers ?? []).map(matchedIdentifierText),
-        ];
-        const also = alsoListedText(h.source, h.sources);
+        ].join('; ');
+        const matchedOn = h.matchedOn.map(screenedInputText).join('; ');
+        const entry = entryRefText(h.sourceEntryId, alsoListedText(h.source, h.sources));
         lines.push(
-          `  - ⚠ ${h.primaryName} — ${h.sourceLabel} (\`${h.source}\`, entry ${h.sourceEntryId}${also ? `; also listed on ${also}` : ''}): ${matched.join('; ')} — matched on: ${h.matchedOn.map(screenedInputText).join('; ')}`,
+          `  - ⚠ ${escapeMarkdownInline(h.primaryName)} — ${h.sourceLabel} (\`${h.source}\`, ${entry}): ${escapeMarkdownInline(matched)} — matched on: ${escapeMarkdownInline(matchedOn)}`,
         );
       }
       if (node.sanctionsScreen) {
@@ -1026,7 +1042,7 @@ export const traceOwnershipTool = tool('sanctions_trace_ownership', {
       lines.push('\n## Ownership edges');
       for (const e of r.edges) {
         lines.push(
-          `- \`${e.childLei}\` ${e.relationshipType} \`${e.parentLei}\`${e.relationshipStatus ? ` (${e.relationshipStatus})` : ''}`,
+          `- \`${e.childLei}\` ${escapeMarkdownInline(e.relationshipType)} \`${e.parentLei}\`${e.relationshipStatus ? ` (${escapeMarkdownInline(e.relationshipStatus)})` : ''}`,
         );
       }
     }

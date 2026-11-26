@@ -124,6 +124,26 @@ export function comparisonForms(raw: string): string[] {
   return !romanized || native === romanized ? [native] : [native, romanized];
 }
 
+/**
+ * The native word each token of a {@link comparisonForms} form spells, in the
+ * form's order: the native fold's tokens are their own words, and a romanized
+ * token's word is the native token it romanizes, so `mer mer` from `Мэр Мер`
+ * spells two words and `semyon semen` from `Семён Семен` one. The romanization
+ * maps each letter to letters or to nothing, so its tokens are the native
+ * fold's less the words of `ъ` and `ь` alone. A modifier sign (`ꚜ`) folds to
+ * `ъ` but romanizes as itself, leaving the two unaligned; the form's own
+ * tokens are then its words.
+ */
+export function nativeWords(
+  nativeTokens: readonly string[],
+  formTokens: readonly string[],
+): readonly string[] {
+  const kept = nativeTokens.filter((token) =>
+    [...token].some((letter) => RUSSIAN_LATIN[letter] !== ''),
+  );
+  return kept.length === formTokens.length ? kept : formTokens;
+}
+
 /** Distinct first-four-code-point prefixes and their one-deletion signatures, at least two points long. */
 export function deletionSignatures(tokens: readonly string[]): string[] {
   const signatures = new Set<string>();
@@ -299,23 +319,72 @@ export interface ScoringToken {
   /** Whether it is one of {@link splitOnStoplist}'s distinctive tokens. */
   readonly distinctive: boolean;
   readonly text: string;
+  /** The query word it spells ({@link nativeWords}); {@link queryWords} and {@link holdsEveryWord} count each once. */
+  readonly word: string;
 }
 
-/** A fuzzy query's tokens prepared for {@link scoreTokenPairs}, in query order. */
-export function scoringQuery(queryTokens: readonly string[]): ScoringToken[] {
+/**
+ * A fuzzy query's tokens prepared for {@link scoreTokenPairs}, in query order,
+ * each spelling the word at its position in `words` — itself unless given.
+ */
+export function scoringQuery(
+  queryTokens: readonly string[],
+  words: readonly string[] = queryTokens,
+): ScoringToken[] {
   // splitOnStoplist's rule: a query made only of stoplisted tokens counts every one as distinctive.
   const allDistinctive = queryTokens.every(isStoplistToken);
-  return queryTokens.map((text) => ({
+  return queryTokens.map((text, i) => ({
     text,
     codePoints: codePoints(text),
     distinctive: allDistinctive || !isStoplistToken(text),
+    word: words[i] ?? text,
   }));
 }
 
 /**
- * A folded token's key for matching by sound in {@link scoreTokenPairs}, or
- * undefined when the token never matches by sound. Two tokens sound alike when
- * both have a key and the keys are equal.
+ * The query's distinct distinctive words, each a strict screen's completion
+ * needs a name word for ({@link oneToOneCoverage}), as the first token that
+ * spells it. Identical words are one word, as strict matching reads them, and
+ * two native words a romanization spells alike stay two.
+ */
+export function queryWords(query: readonly ScoringToken[]): ScoringToken[] {
+  return firstTokenPerWord(query.filter((q) => q.distinctive));
+}
+
+/** The first token of each distinct {@link ScoringToken.word}, in query order. */
+function firstTokenPerWord(query: readonly ScoringToken[]): ScoringToken[] {
+  const seen = new Set<string>();
+  return query.filter((q) => !seen.has(q.word) && Boolean(seen.add(q.word)));
+}
+
+/**
+ * Whether a name gives every word of the query a word of its own spelled
+ * exactly as the token that first spells it: each distinct word, legal forms
+ * and function words included, so `el el bank` from `Эль Ель Банк` needs two
+ * `el`, `mer mer` from `Мэр Мер` never reads `mer trading`, and `semyon semen`
+ * from `Семён Семен` needs one `semyon`. No similarity and no sound. A word
+ * pairs only with a name word of its spelling, so a maximum matching seats them
+ * all exactly when the name holds each spelling as often as words take it.
+ */
+export function holdsEveryWord(
+  query: readonly ScoringToken[],
+  nameTokens: readonly string[],
+): boolean {
+  const needed = new Map<string, number>();
+  for (const q of firstTokenPerWord(query)) needed.set(q.text, (needed.get(q.text) ?? 0) + 1);
+  for (const token of nameTokens) {
+    const left = needed.get(token);
+    if (left === undefined) continue;
+    if (left === 1) needed.delete(token);
+    else needed.set(token, left - 1);
+  }
+  return needed.size === 0;
+}
+
+/**
+ * A folded token's key for matching by sound in {@link scoreTokenPairs} and
+ * {@link oneToOneCoverage}, or undefined when the token never matches by sound.
+ * Two tokens sound alike when both have a key and the keys are equal.
  */
 export type SoundKey = (token: string) => string | undefined;
 
@@ -408,6 +477,90 @@ export function scoreTokenPairs(
 }
 
 /**
+ * The least Jaro-Winkler at which a word covered by sound counts toward a
+ * strict screen's completion ({@link oneToOneCoverage}). Sound keys join
+ * transliterations (`qasim`/`kassem` 0.70, `husayn`/`hossein` 0.6786) and words
+ * that share no spelling at all (`ping`/`bank` 0.5, `aqssa`/`acoes` 0.64);
+ * the floor keeps the first. Its known cost: `oleksiy`/`alexei` (0.6429).
+ */
+export const SOUND_MIN_SIMILARITY = 0.65;
+
+/**
+ * How many of the query's distinct distinctive words ({@link queryWords}) a
+ * candidate name covers one to one: the size of a maximum matching between
+ * those words and the name's words, each name word taken by at most one query
+ * word. A strict screen's completion keeps a candidate only when every word
+ * gets one (see `ScreeningService.runFuzzy`). A query word, through the token
+ * that spells it, and a name word pair when:
+ *
+ *  - their Jaro-Winkler clears `threshold`, unless the name word is on
+ *    {@link FUZZY_STOPLIST}, the two differ, and the query word is longer than
+ *    one letter (`an` never takes `and`). A lone letter, which the fold makes of
+ *    `A-Emmeh` or `70.º`, spells only itself and a two-letter word opening with
+ *    it at the default 0.85, often a stoplisted one (`a` takes `al`, `o` takes
+ *    `of`); or
+ *  - they sound alike (`soundKey`) and their Jaro-Winkler is at least
+ *    {@link SOUND_MIN_SIMILARITY} (`gaddafi`/`qadhafi` 0.8095; never `ping`/`bank`).
+ *
+ * {@link scoreTokenPairs} counts each query word on its own, so one name word
+ * can cover several (`yong` covers `young` and `yong`); fuzzy admission and the
+ * surfaced coverage keep that count. Kuhn's augmenting paths bound the
+ * matching: each of the n query words searches the at most n × m pairs once,
+ * O(n² · m) beside the n · m Jaro-Winkler comparisons that build them.
+ */
+export function oneToOneCoverage(
+  query: readonly ScoringToken[],
+  candidateTokens: readonly string[],
+  threshold: number,
+  soundKey: SoundKey,
+): number {
+  const words = queryWords(query);
+  const candidate = candidateTokens.map((text) => ({
+    text,
+    codePoints: codePoints(text),
+    stoplisted: isStoplistToken(text),
+  }));
+  // Each query word's pairable name words, by index into `candidate`.
+  const pairs = words.map((q) => {
+    const key = soundKey(q.text);
+    const letter = q.codePoints.length === 1;
+    const reachable: number[] = [];
+    for (const [j, c] of candidate.entries()) {
+      const score = q.text === c.text ? 1 : jaroWinklerOf(q.codePoints, c.codePoints);
+      const paired =
+        score >= threshold
+          ? q.text === c.text || !c.stoplisted || letter
+          : key !== undefined && score >= SOUND_MIN_SIMILARITY && soundKey(c.text) === key;
+      if (paired) reachable.push(j);
+    }
+    return reachable;
+  });
+
+  // The query word holding each name word, or -1.
+  const holder = new Array<number>(candidate.length).fill(-1);
+  const visited = new Array<boolean>(candidate.length);
+  /** Seats query word `i`, moving the holders in its way along an augmenting path. */
+  const seat = (i: number): boolean => {
+    for (const j of pairs[i] ?? []) {
+      if (visited[j]) continue;
+      visited[j] = true;
+      const current = holder[j] ?? -1;
+      if (current === -1 || seat(current)) {
+        holder[j] = i;
+        return true;
+      }
+    }
+    return false;
+  };
+  let covered = 0;
+  for (const i of pairs.keys()) {
+    visited.fill(false);
+    if (seat(i)) covered++;
+  }
+  return covered;
+}
+
+/**
  * Length ratio of two strings in code points — the shorter length over the longer, in [0, 1].
  * 1.0 means equal-length strings; a small value means one is far shorter than the
  * other. Two empty strings score 1 (identical); empty-vs-nonempty scores 0.
@@ -450,10 +603,11 @@ export function lengthRatio(a: string, b: string): number {
  * still covers its other words, so it keeps its place; the syllable only stops
  * counting toward admission and stops forming a blocking lookup of its own.
  *
- * The list changes the fuzzy admission gate, blocking, and matching by sound
- * only (see `ScreeningService.admitFuzzy`, `poolCandidates`, and
- * {@link soundKeys}). The normalized query, strict matching, the surfaced score,
- * the whole-string arm, and `queryTokenCoverage` by spelling count every token.
+ * The list changes the fuzzy admission gate, blocking, matching by sound, and
+ * the name words a completion pairs a distinctive query word with only (see
+ * `ScreeningService.admitFuzzy`, `poolCandidates`, {@link soundKeys}, and
+ * {@link oneToOneCoverage}). The normalized query, strict matching, the surfaced
+ * score, the whole-string arm, and `queryTokenCoverage` by spelling count every token.
  */
 export const FUZZY_STOPLIST: ReadonlySet<string> = new Set(
   [
@@ -516,8 +670,17 @@ export function splitOnStoplist(tokens: readonly string[]): {
  * row: JSC, PJSC, OJSC, and CJSC are four forms, LLC and Ltd two, Company and
  * Corporation two.
  *
+ * The public-company spellings of PLC ({@link WORD_BY_WORD_SPELLINGS}) are a
+ * semantic call rather than a pairing: the lists publish them beside a
+ * `Limited` or `Ltd` alias of the same entity and never beside `PLC`, and a
+ * public company limited by shares is the PLC form. A name holding one, the
+ * query or a stored name, is also read word by word ({@link legalFormReadings}),
+ * so a `Ltd` query still reaches it, as it reaches the entity's `Limited`
+ * alias, and a query spelling one still reaches a name that holds the same
+ * words but spells no PLC (`X Public Co Ltd`).
+ *
  * Every canonical is on {@link FUZZY_STOPLIST}. The table reaches strict
- * matching only, through {@link foldLegalForms} and
+ * matching only, through {@link legalFormReadings} and
  * {@link buildLegalFormFtsMatch}; the normalized query, the stored name index,
  * and GLEIF name resolution never see it.
  */
@@ -528,7 +691,10 @@ export const LEGAL_FORM_SPELLINGS: ReadonlyMap<string, readonly string[]> = new 
   ['inc', ['inc', 'incorporated']],
   ['llp', ['llp', 'limited liability partnership']],
   ['lp', ['lp', 'limited partnership']],
-  ['plc', ['plc', 'public limited company']],
+  [
+    'plc',
+    ['plc', 'public limited company', 'public company limited', 'public company ltd', 'public ltd'],
+  ],
   ['ag', ['ag', 'aktiengesellschaft']],
   [
     'llc',
@@ -605,10 +771,22 @@ export const LEGAL_FORM_SPELLINGS: ReadonlyMap<string, readonly string[]> = new 
   ],
 ]);
 
-/** One spelling's tokens and its form's canonical token. */
+/**
+ * The spellings of `plc` ({@link LEGAL_FORM_SPELLINGS}) a name is also read
+ * word by word, as `public co ltd` and `public ltd`. `public limited company`
+ * is not among them, so `Ltd` never reads inside it.
+ */
+const WORD_BY_WORD_SPELLINGS: ReadonlySet<string> = new Set([
+  'public company limited',
+  'public company ltd',
+  'public ltd',
+]);
+
+/** One spelling's tokens, its form's canonical token, and whether it is also read word by word. */
 interface LegalFormSpelling {
   readonly canonical: string;
   readonly tokens: readonly string[];
+  readonly wordByWord: boolean;
 }
 
 /** Every spelling, keyed by its first token, the longest first within a key. */
@@ -618,7 +796,7 @@ for (const [canonical, spellings] of LEGAL_FORM_SPELLINGS) {
     // `split` always returns at least one element.
     const tokens = spelling.split(' ') as [string, ...string[]];
     const bucket = SPELLINGS_BY_FIRST_TOKEN.get(tokens[0]) ?? [];
-    bucket.push({ canonical, tokens });
+    bucket.push({ canonical, tokens, wordByWord: WORD_BY_WORD_SPELLINGS.has(spelling) });
     SPELLINGS_BY_FIRST_TOKEN.set(tokens[0], bucket);
   }
 }
@@ -627,34 +805,59 @@ for (const bucket of SPELLINGS_BY_FIRST_TOKEN.values()) {
 }
 
 /**
- * A folded name's tokens with every legal-form spelling replaced by its form's
- * canonical token ({@link LEGAL_FORM_SPELLINGS}). The scan runs left to right
- * and takes the longest spelling that opens at each token, so `limited liability
- * company` is `llc`, never `ltd liability co`, and `public joint stock company`
- * is `pjsc`, never `public jsc`. Linear in the token count: a token tries only
- * the few spellings that open with it, each at most five tokens long.
+ * One left-to-right scan of `tokens`, taking the longest spelling that opens at
+ * each token; with `wordByWord`, a {@link WORD_BY_WORD_SPELLINGS} spelling is
+ * passed over, so its words fold one by one. `tookWordByWord` says whether the
+ * fold took one of those spellings as its form.
  */
-export function foldLegalForms(normalized: string): string[] {
-  const tokens = tokenize(normalized);
+function scanLegalForms(
+  tokens: readonly string[],
+  wordByWord: boolean,
+): { folded: string[]; tookWordByWord: boolean } {
   const folded: string[] = [];
+  let tookWordByWord = false;
   let next = 0;
   for (const [i, token] of tokens.entries()) {
     if (i < next) continue;
-    const spelling = SPELLINGS_BY_FIRST_TOKEN.get(token)?.find((candidate) =>
-      candidate.tokens.every((part, k) => tokens[i + k] === part),
+    const spelling = SPELLINGS_BY_FIRST_TOKEN.get(token)?.find(
+      (candidate) =>
+        !(wordByWord && candidate.wordByWord) &&
+        candidate.tokens.every((part, k) => tokens[i + k] === part),
     );
+    if (spelling?.wordByWord) tookWordByWord = true;
     folded.push(spelling?.canonical ?? token);
     next = i + (spelling?.tokens.length ?? 1);
   }
-  return folded;
+  return { folded, tookWordByWord };
 }
 
 /**
- * The FTS5 `MATCH` expression for a legal-form fold ({@link foldLegalForms}):
- * each distinct token quoted as {@link buildFtsMatch} quotes it, a canonical one
- * widened to any spelling of its form — a multi-word spelling as a phrase, which
- * FTS5 matches on adjacent tokens only. Null when the fold holds no legal form,
- * where the query's own match is the whole strict set.
+ * The readings strict matching gives a name, the query and every stored name
+ * alike. The first is its tokens with every legal-form spelling replaced by its
+ * form's canonical token ({@link LEGAL_FORM_SPELLINGS}): the scan runs left to
+ * right and takes the longest spelling that opens at each token, so `limited
+ * liability company` is `llc`, never `ltd liability co`, and `public joint stock
+ * company` is `pjsc`, never `public jsc`. A second reading follows only when
+ * that scan took a public-company spelling of PLC ({@link WORD_BY_WORD_SPELLINGS}):
+ * the tokens read those words one by one (`public co ltd`). A scan that took
+ * none equals the word-by-word one, since every token then takes the same
+ * spelling in both. Each reading reads every such spelling the same way, so no
+ * reading holds both `plc` and a `ltd` one of them spells. At most two scans,
+ * each linear in the tokens: a token tries only the few spellings that open with
+ * it, each at most five tokens long.
+ */
+export function legalFormReadings(normalized: string): string[][] {
+  const tokens = tokenize(normalized);
+  const { folded, tookWordByWord } = scanLegalForms(tokens, false);
+  return tookWordByWord ? [folded, scanLegalForms(tokens, true).folded] : [folded];
+}
+
+/**
+ * The FTS5 `MATCH` expression for one legal-form reading of a name
+ * ({@link legalFormReadings}): each distinct token quoted as
+ * {@link buildFtsMatch} quotes it, a canonical one widened to any spelling of
+ * its form — a multi-word spelling as a phrase, which FTS5 matches on adjacent
+ * tokens only. Null when the reading holds no legal form.
  */
 export function buildLegalFormFtsMatch(foldTokens: readonly string[]): string | null {
   const distinct = [...new Set(foldTokens)];

@@ -42,6 +42,7 @@ import { traceOwnershipTool } from '@/mcp-server/tools/definitions/trace-ownersh
 import { FIXTURE_DESIGNATIONS, FIXTURE_LEI_ENTITIES } from '@/services/screening/fixtures.js';
 import { loadGleifGoldenCopies, refreshGleif } from '@/services/screening/gleif-sync.js';
 import {
+  designationStoreSpec,
   IDENTIFIER_TABLE,
   LEI_STATUS_INDEX,
   REFERENCE_NUMBER_INDEX,
@@ -795,6 +796,43 @@ describe('a 0.6.1 mirror (schema version 2) opened by the current service', () =
     for (const row of refreshed.sources.filter((source) => source.code !== 'gleif')) {
       expect(row.lastHarvestedAt! >= startedAt!, row.code).toBe(true);
     }
+  });
+});
+
+describe('a 0.7.0 mirror opened by the current service', () => {
+  it('rebuilds neither index on first open after the run that wrote it, and reads that run as it ended', async () => {
+    serveLookupCorpus();
+    await getScreeningService().syncSanctions('refresh', new AbortController().signal);
+    await getScreeningService().close();
+    resetScreeningService();
+
+    // 0.7.0 stamps both indexes after the run's final state, with its start and completion.
+    const store = sqliteMirrorStore({ path, ...designationStoreSpec });
+    const { startedAt, completedAt } = await store.readState();
+    expect(startedAt).toBeDefined();
+    const handle = await store.raw();
+    handle.prepare('UPDATE name_index_stamp SET stamp = ?').run(`v2:${startedAt}|${completedAt}`);
+    handle
+      .prepare('UPDATE designation_identifier_stamp SET stamp = ?')
+      .run(`v1:${startedAt}|${completedAt}`);
+    // Marks only a rebuild erases.
+    handle.prepare("DELETE FROM name WHERE designation_id = 'ofac_sdn:7203'").run();
+    handle.prepare(`DELETE FROM ${IDENTIFIER_TABLE} WHERE designation_id = 'ofac_sdn:4243'`).run();
+    await store.close();
+
+    initScreeningService();
+    const result = await runToolContract(listSourcesTool, {});
+    expect(result.isError).toBeFalsy();
+    const payload = result.structuredContent as SourcesPayload;
+    expect(payload).not.toHaveProperty('lastRefresh');
+    expect(payload.sanctionsAsOf).toBe(completedAt);
+
+    const upgraded = await getScreeningService().designations.raw();
+    const count = (sql: string) => upgraded.prepare<{ n: number }>(sql).get()?.n;
+    expect(count("SELECT COUNT(*) AS n FROM name WHERE designation_id = 'ofac_sdn:7203'")).toBe(0);
+    expect(
+      count(`SELECT COUNT(*) AS n FROM ${IDENTIFIER_TABLE} WHERE designation_id = 'ofac_sdn:4243'`),
+    ).toBe(0);
   });
 });
 
