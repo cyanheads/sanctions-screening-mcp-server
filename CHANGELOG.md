@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.7.1](changelog/0.7.x/0.7.1.md) — 2026-11-25
 
-List and GLEIF text reaches content[] as escaped Markdown, strict completion pairs each query word with its own name word, a strict native-script hit also reads the romanized names of the lists it settled, and Public Company Limited, Public Company Ltd, and Public Ltd read as PLC.
+List and GLEIF text reaches content[] as escaped Markdown, strict completion pairs each query word with its own name word, a strict screen of a Russian-alphabet name also reads the lists it matched for its romanization, and Public Company Limited, Public Company Ltd, and Public Ltd read as PLC.
 
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-11-19 · ⚠️ Breaking
 
